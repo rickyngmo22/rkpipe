@@ -1,0 +1,16 @@
+%YAML:1.0
+---
+# 单目深度估计示例(YOLO26-Depth):输出叠加伪彩深度图,距离标定见 depth_scale 相关配置
+model_path: "model/yolo26n_depth.rknn"
+input_path: "video/demo.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 0
+task: "depth"
+mode: "pipeline"
+thread_count: 6
+gui: 0
+local: 0
+label_path: "assets/labels/coco_80_labels_list.txt"
+obj_class_num: 1
+enable_tracking: 0

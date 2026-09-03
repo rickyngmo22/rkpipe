@@ -1,0 +1,16 @@
+%YAML:1.0
+---
+# 实例分割示例(YOLO26-Seg / YOLOv8-Seg 均可,按实际模型替换)
+model_path: "model/yolo26n_seg.rknn"
+input_path: "video/demo.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 0
+task: "seg"
+mode: "pipeline"
+thread_count: 6
+gui: 0
+local: 0
+label_path: "assets/labels/coco_80_labels_list.txt"
+obj_class_num: 80
+enable_tracking: 0

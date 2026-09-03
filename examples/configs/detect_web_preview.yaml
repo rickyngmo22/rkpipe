@@ -1,0 +1,20 @@
+%YAML:1.0
+---
+# Web 预览示例配置: 启动 HTTP 服务,浏览器直接查看检测/跟踪结果
+# 端口与证书路径按需修改;正式部署请使用受信证书
+model_path: "model/yolo26n.rknn"
+input_path: "video/demo.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 1
+web_preview_bind: "0.0.0.0"
+web_preview_port: 8080
+web_preview_quality: 80
+task: "detect"
+mode: "pipeline"
+thread_count: 6
+gui: 0
+local: 0
+label_path: "assets/labels/coco_80_labels_list.txt"
+obj_class_num: 80
+enable_tracking: 1

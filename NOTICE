@@ -1,0 +1,42 @@
+rkpipe
+Copyright 2026 rkpipe authors
+
+This product includes software developed as part of the rkpipe project.
+
+========================================================================
+预编译组件
+========================================================================
+prebuilt/ 下的 librkpipe_core.a(调度核心)为专有软件,依据
+LEGAL/RKPIPE-CORE-EULA.md 许可分发,不属于 Apache-2.0 授权范围。
+源码层不含该组件的实现。
+
+========================================================================
+第三方组件
+========================================================================
+
+1. RKNN Runtime / 头文件(3rdparty/rknn/)
+   Copyright (C) Rockchip Electronics Co., Ltd
+   依据 Rockchip RKNN-SDK 随附许可分发;请从 Rockchip 官方渠道获取
+   最新版本并遵守其许可条款。
+
+2. OpenCV
+   Copyright (C) OpenCV authors — Apache License 2.0
+
+3. FFmpeg (libavformat/libavcodec/libavutil/libswscale)
+   Copyright (C) FFmpeg authors — LGPL-2.1+(以动态链接方式使用)。
+   FFmpeg 本身不随本仓库分发;运行时使用系统安装的版本。
+   如自行编译 FFmpeg,请注意编解码器开关对 GPL/LGPL 的影响。
+
+4. libturbojpeg (libjpeg-turbo)
+   Copyright (C) libjpeg-turbo authors — IJG / BSD-3-Clause
+
+5. librga / rockchip-mpp
+   Copyright (C) Rockchip Electronics Co., Ltd — 随 Rockchip BSP 分发
+
+6. mediamtx(可选部署组件,文档中提及)
+   Copyright (C) bluenviron — MIT
+   https://github.com/bluenviron/mediamtx
+
+7. Google Test 风格断言的单元测试为本仓库自有代码,无第三方依赖
+
+本产品使用上述开源软件;各组件的完整许可文本以上游发布为准。

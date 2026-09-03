@@ -1,0 +1,16 @@
+%YAML:1.0
+---
+# 旋转框检测示例(YOLOv8-OBB)
+model_path: "model/yolov8_obb.rknn"
+input_path: "video/demo.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 0
+task: "obb"
+mode: "pipeline"
+thread_count: 6
+gui: 0
+local: 0
+label_path: "assets/labels/yolov8_obb_labels_list.txt"
+obj_class_num: 15
+enable_tracking: 0

@@ -1,0 +1,31 @@
+# build artifacts
+build*/
+*.o
+*.a
+!prebuilt/**/*.a
+*.so
+*.so.*
+
+# secrets & local runtime files — 严禁入库
+*.key
+*.crt
+*.pem
+auto.*
+nohup.out
+deploy/
+
+# local data
+model/
+video/
+test_videos/
+test_images/
+test_frames/
+*.rknn
+onnx/
+
+# editors / OS
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.DS_Store

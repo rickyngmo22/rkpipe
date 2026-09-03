@@ -1,0 +1,1 @@
+ef73b27e3d9b26a56ae6b9b31454f09b40e14638397a95f3ede70207aa67ff6a  librkpipe_core.a

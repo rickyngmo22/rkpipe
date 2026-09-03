@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  boundary-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check_open_boundary.py
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libopencv-dev libturbojpeg0-dev
+      - name: Configure (CI mode, no RKNN/RGA/MPP/FFmpeg)
+        run: cmake -B build-ci -DRK_PIPE_CI_BUILD=ON
+      - name: Build
+        run: cmake --build build-ci -j
+      - name: Test
+        run: ctest --test-dir build-ci --output-on-failure
+
+  full-build:
+    # 完整构建需要预编译核心库与 aarch64 硬件库(RKNN/RGA/MPP),
+    # GitHub runner 上仅验证"prebuilt 缺失时给出明确错误"的路径
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure without prebuilt (expect clear failure)
+        run: |
+          if cmake -B build-full 2>err.log; then
+            echo "::error::缺 prebuilt 时不应配置成功"; exit 1
+          else
+            grep -q "预编译核心库不存在" err.log && echo "error message OK" || { cat err.log; exit 1; }
+          fi

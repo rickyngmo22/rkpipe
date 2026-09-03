@@ -1,0 +1,18 @@
+%YAML:1.0
+---
+# 姿态估计示例(YOLO26-Pose / YOLOv8-Pose 均可,按实际模型替换)
+model_path: "model/yolo26n_pose.rknn"
+input_path: "video/demo.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 0
+task: "pose"
+mode: "pipeline"
+thread_count: 6
+gui: 0
+local: 0
+label_path: "assets/labels/coco_80_labels_list.txt"
+obj_class_num: 1
+# 多人场景建议开启:跟踪 ID 为每个人锁定颜色(骨架/框跨帧同色);
+# 关闭时颜色按每帧目标顺序分配,人物进出画面会变色
+enable_tracking: 1

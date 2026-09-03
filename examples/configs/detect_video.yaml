@@ -1,0 +1,17 @@
+%YAML:1.0
+---
+# 最小 detect 示例配置(字段语义与内部配置完全一致,"配置即契约")
+# 模型与视频请替换为本地路径;模型转换见 tools/ 与 docs/build.md
+model_path: "model/yolo26n.rknn"
+input_path: "video/demo.mp4"          # 支持本地文件 / 图片目录 / v4l2 设备
+output_video_path: ""                 # 非空则写文件;为空不写
+output_backend: "ffmpeg"
+web_preview: 0                        # 1 = 启动 HTTP Web 预览(MJPEG/WebRTC)
+task: "detect"
+mode: "pipeline"
+thread_count: 6
+gui: 0
+local: 0
+label_path: "assets/labels/coco_80_labels_list.txt"
+obj_class_num: 80
+enable_tracking: 0
