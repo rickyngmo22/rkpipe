@@ -5,6 +5,7 @@ build*/
 !prebuilt/**/*.a
 *.so
 *.so.*
+!3rdparty/rknn/*.so*
 
 # secrets & local runtime files — 严禁入库
 *.key
