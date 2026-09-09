@@ -64,11 +64,26 @@ cmake -B build-ci -DRK_PIPE_CI_BUILD=ON && cmake --build build-ci && ctest --tes
 
 ### 4. 准备测试素材
 
-`model/` 已随仓库附带四个 YOLO 版本的板端模型(detect / pose / obb / seg / depth),示例配置开箱即用;测试视频不入库,自己生成一个即可:
+测试视频不入库。两个来源二选一：
+
+**来源 A：下载实测用视频（推荐）**
+
+从网盘下载 `test_videos/` 压缩包，解压到仓库根的 `video/` 目录：
+
+> 下载链接：https://pan.quark.cn/s/280ef6b0bc83?pwd=7P6U （提取码：7P6U）
+>
+> 内含 5 个测试视频（1280×720 / 1920×1080），README 精度与速度表格即基于这些视频实测。
+
+```bash
+mkdir -p video && cd video
+unzip /path/to/test_videos.zip
+```
+
+**来源 B：ffmpeg 合成（无网盘/仅验证跑通）**
 
 ```bash
 mkdir -p video
-ffmpeg -y -f lavfi -i testsrc2=duration=60:size=1280x720:rate=30 video/demo.mp4  # 合成测试视频
+ffmpeg -y -f lavfi -i testsrc2=duration=60:size=1280x720:rate=30 video/demo.mp4
 ```
 
 ### 5. 运行
