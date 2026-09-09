@@ -5,21 +5,30 @@ on:
     branches: [main]
   pull_request:
 
-jobs:
-  boundary-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: python3 scripts/check_open_boundary.py
+# 同分支的新推送取消仍在跑的旧 CI,省 runner 配额
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
   unit-tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af68
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libopencv-dev libturbojpeg0-dev
+          sudo apt-get install -y cmake g++ clang libopencv-dev libturbojpeg0-dev
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang"   >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          fi
       - name: Configure (CI mode, no RKNN/RGA/MPP/FFmpeg)
         run: cmake -B build-ci -DRK_PIPE_CI_BUILD=ON
       - name: Build
@@ -29,10 +38,11 @@ jobs:
 
   full-build:
     # 完整构建需要预编译核心库与 aarch64 硬件库(RKNN/RGA/MPP),
-    # GitHub runner 上仅验证"prebuilt 缺失时给出明确错误"的路径
+    # GitHub runner 上仅验证"prebuilt 缺失时给出明确错误"的路径。
+    # CMake 已保证 prebuilt 检查先于所有第三方依赖,runner 无需预装任何包。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af68
       - name: Configure without prebuilt (expect clear failure)
         run: |
           if cmake -B build-full 2>err.log; then

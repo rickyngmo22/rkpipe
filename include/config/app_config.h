@@ -6,19 +6,13 @@ class AppConfig {
 public:
     std::string model_path;
     std::string input_path;
-    // 多任务同路组合（Y5）：主任务 model_path/task 走完整链路，辅助任务只推理+叠加绘制。
-    // aux_model_path 为空 = 不启用辅助任务。
-    std::string aux_model_path;
-    std::string aux_task = "detect";
-    // task="rtmpose"（两阶段姿态）：model_path 为 RTMPose(SimCC) 模型，
-    // person_model_path 为第一阶段人体检测模型。其他 task 忽略。
-    // rtmpose 拆分部署（feat/head 两段）时：model_path=feat（主干），
-    // rtmpose_head_path=head（SimCC 头部）。
-    std::string person_model_path;
-    std::string rtmpose_head_path;
     std::string output_video_path;
     // 非空时：detect 任务逐帧导出检测结果 JSONL（--dump-detections），供 COCO mAP 离线评测
     std::string dump_detections_path;
+    // 注意：AppConfig 与闭源核心按成员布局直接耦合（核心按构建期 sizeof 分配并直接访问
+    // 成员），公开仓库不得增删字段——新增配置键必须随配套核心库 Release 协同发布。
+    // 逐帧结果 JSONL 的过渡配置走环境变量 RK_PIPE_RESULT_JSONL（见 io/result_sink.h），
+    // YAML 键 result_jsonl_path 待配套核心启用。
     std::string output_backend = "ffmpeg";
     std::string task = "detect";
     std::string mode = "sequential";
@@ -52,13 +46,6 @@ public:
     bool push_local = false;
     int npu_core_mask = 0;             // 0=按 NPU core 轮转分配；>0=固定 core mask（见 rknn_api.h）；<0=NPU_CORE_AUTO（驱动按负载动态选核，线程数>3 时的均衡方案）
     int npu_core_start = 0;            // NPU core 轮转起始偏移（0-2）；多路时由编排脚本按流分配，避免全部进程都从 core 0 起
-    int rtmpose_det_core = -1;         // rtmpose 任务：stage1(人体检测) 固定到的 NPU core（mask 值，如 0→RKNN_NPU_CORE_0=1）；-1=跟随 worker 级 core_mask
-    std::string rtmpose_pose_cores;    // rtmpose 任务：stage2(pose) 使用的 NPU core 列表（逗号分隔，如 "1,2"），按 worker 轮转；空=跟随 worker 级 core_mask
-    float rtmpose_target_fps = 0.0f;   // rtmpose 目标帧率（0=不限制/关闭预算）：单帧工作预算 = 1000*thread_count/fps，
-                                       // 超预算只处理 top-K 人，把单帧耗时钳在帧间隔内 → 帧率稳定，密集场景降级不卡顿
-    int rtmpose_stage2_threads = 0;    // rtmpose 二阶段全局工作池线程数（0=关闭/内联）：pool 线程并行做逐人 pose，
-                                       // 一阶段(检测)与二阶段(pose)解耦并行，避免二阶段挤占一阶段线程
-    float rtmpose_box_pad = 1.0f;      // rtmpose 仿射裁剪前框外扩系数：YOLO 框比 RTMDet 紧，精度不够可调 1.1~1.25
     int drop_frames_on_overflow = -1;  // -1=自动(网络输出才丢帧)；0=队列满阻塞(背压)；1=队满丢帧
     // ROI 区域过滤（detect）："x1,y1,x2,y2,..." 多边形，框中心在外的不渲染/不计数/不告警（空=不启用）
     std::string roi;
@@ -97,18 +84,6 @@ public:
     // 周期快照：每 snapshot_interval_s 秒保存一帧到 snapshot_dir（0=关闭）
     double snapshot_interval_s = 0.0;
     std::string snapshot_dir;
-
-    // D3 检测+单目测距（aux_task=depth 时生效）：
-    // depth_dist_text=1 在检测框上标注估计距离（米）；depth_dist_near_m>0 时近距目标
-    // 红框高亮并触发 near_distance 告警；depth_dist_scale 为距离标定系数（实测/模型输出）
-    bool depth_dist_text = false;
-    float depth_dist_near_m = 0.0f;  // 近距阈值（米），0=关闭
-    float depth_dist_scale = 1.0f;
-    // Detect3D 线框投影的 P2 矩阵（3x4 行主序 12 值，逗号分隔，如 KITTI cam2 标定）。
-    // 空 = 不绘制 3D 线框；内参需与实际相机一致，否则线框仅示意
-    std::string detect3d_p2;
-    // Detect3D 深度全局缩放（场景尺度校准：线框/距离整体偏大调大此值，默认 1.0）
-    float detect3d_depth_scale = 1.0f;
 
     // 事件规则引擎（detect+tracking，D1/D2）：绊线穿越/区域入侵/滞留/离岗。
     // 规则命中产生 rule_events 告警（走 alert_* 链路）；enable_tracking 未开时自动为 detect 开启

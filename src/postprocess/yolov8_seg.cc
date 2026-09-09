@@ -1663,8 +1663,6 @@ int post_process_seg(rknn_app_context_t* app_ctx,
     int crop_top = letter_box ? letter_box->crop_y : 0;
     int crop_w = letter_box ? letter_box->crop_w : model_in_w;
     int crop_h = letter_box ? letter_box->crop_h : model_in_h;
-    int crop_right = crop_left + std::max(1, crop_w);
-    int crop_bottom = crop_top + std::max(1, crop_h);
     cv::Rect valid_rect_mask(0, 0, 0, 0);
     float mask_scale_w = 1.0f;
     float mask_scale_h = 1.0f;
@@ -1699,20 +1697,17 @@ int post_process_seg(rknn_app_context_t* app_ctx,
         ++mask_kept;
 
         int n = indexArray[i];
-        float x1 = boxes[n * 4 + 0] - letter_box->x_pad;
-        float y1 = boxes[n * 4 + 1] - letter_box->y_pad;
-        float x2 = x1 + boxes[n * 4 + 2];
-        float y2 = y1 + boxes[n * 4 + 3];
+        const float x1 = boxes[n * 4 + 0];
+        const float y1 = boxes[n * 4 + 1];
+        const float x2 = x1 + boxes[n * 4 + 2];
+        const float y2 = y1 + boxes[n * 4 + 3];
 
-        int left = static_cast<int>(clamp(x1, 0, model_in_w) / letter_box->scale) + crop_left;
-        int top = static_cast<int>(clamp(y1, 0, model_in_h) / letter_box->scale) + crop_top;
-        int right = static_cast<int>(clamp(x2, 0, model_in_w) / letter_box->scale) + crop_left;
-        int bottom = static_cast<int>(clamp(y2, 0, model_in_h) / letter_box->scale) + crop_top;
-
-        left = clamp(left, crop_left, crop_right);
-        top = clamp(top, crop_top, crop_bottom);
-        right = clamp(right, crop_left, crop_right);
-        bottom = clamp(bottom, crop_top, crop_bottom);
+        image_rect_t mapped{};
+        map_box_to_frame(x1, y1, x2, y2, letter_box, model_in_w, model_in_h, &mapped);
+        int left = mapped.left;
+        int top = mapped.top;
+        int right = mapped.right;
+        int bottom = mapped.bottom;
 
         if (right <= left || bottom <= top)
         {

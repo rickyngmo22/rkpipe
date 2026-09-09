@@ -7,7 +7,6 @@
 #include "common.h"
 #include "core/task_result.h"
 #include "postprocess/postprocess.h"
-#include "utils/depth_distance.h"
 
 // 绘制目标检测结果
 void drawDetectionResults(image_buffer_t& frame, const object_detect_result_list& results);
@@ -36,30 +35,7 @@ void drawSegResultsBGR(cv::Mat& frame, const seg_detect_result_list& results, do
 // BGR(CPU)帧上的深度图绘制：depth 为 CV_8UC1（原帧分辨率，近=亮），JET 伪彩 + 混合到帧。
 // RK_PIPE_DEPTH_REPLACE=1 时整帧 replace（alpha 强制 1.0，纯深度视图，不再与原始帧混合）。
 void drawDepthResultsBGR(cv::Mat& frame, const cv::Mat& depth, double alpha = 0.7, const cv::Rect* roi = nullptr);
-// D3 检测+单目测距叠加：每个检测框左上角标注"框内深度中值"估计距离（米）；
-// near_m>0 时距离 ≤ near_m 的目标加红框、文字转红，并写入返回值供近距告警使用。
-// draw_text=false 时只计算不绘制（overlay 关闭但告警开启的场景）。
-// depth 为 CV_8UC1 反相深度图（近=亮），depth_lo/depth_hi 为其归一化范围（米，后处理输出），
-// scale 为距离标定系数。
-std::vector<DepthDistanceTarget> drawDepthDistanceOverlayBGR(
-    cv::Mat& frame, const cv::Mat& depth, const cv::Rect* roi,
-    float depth_lo, float depth_hi, const object_detect_result_list& dets,
-    float near_m = 0.0f, float scale = 1.0f, bool draw_text = true);
 
-// BGR(CPU) 帧上的单目 3D 检测绘制（Detect3D）：2D 框 + 类别/置信度 + 深度距离 + 3D 尺寸
-// + 3D 投影中心十字标记；配置 P2（set_detect3d_p2）后追加 3D 线框投影。
-void drawDetect3DResultsBGR(cv::Mat& frame, const Detect3DTaskResult& results);
-
-// 设置 Detect3D 线框投影的 P2 矩阵（3x4 行主序 12 值，逗号分隔，如 KITTI cam2 标定）。
-// 空串/解析失败 = 不绘制线框。运行时启动阶段调用一次。
-void set_detect3d_p2(const std::string& p2_spec);
-// Detect3D 深度全局缩放（场景尺度校准：单目深度在非训练场景上常有整体偏差，线框过大则调大）
-void set_detect3d_depth_scale(float scale);
-// 语义分割伪彩叠加：class_map 为 CV_8UC1 类别索引图（低分辨率有效区），放大到 roi 并按 alpha 混合。
-// 前 19 类用 Cityscapes 标准色，其余类别用黄金角 HSV 伪彩兜底。
-void drawSemResultsBGR(cv::Mat& frame, const cv::Mat& class_map, int class_num, const cv::Rect* roi = nullptr, double alpha = 0.6);
-
-bool drawOCRResultsZeroCopy(image_buffer_t& frame, const OCRDetectTaskResult& results);
 
 void drawOverlayText(image_buffer_t& frame, const std::string& text, int x, int y, const cv::Scalar& color, int scale = 1,
                      const cv::Scalar& bg_color = cv::Scalar(-1, -1, -1));

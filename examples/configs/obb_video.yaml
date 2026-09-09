@@ -1,16 +1,16 @@
 %YAML:1.0
 ---
-# 旋转框检测示例(YOLOv8-OBB)
-model_path: "model/yolov8_obb.rknn"
-input_path: "video/demo.mp4"
-output_video_path: ""
-output_backend: "ffmpeg"
-web_preview: 0
-task: "obb"
-mode: "pipeline"
-thread_count: 6
-gui: 0
-local: 0
+# 旋转框检测示例(YOLO26-OBB;YOLOv8-OBB 模型同样可用)
+# 运行后浏览器打开 http://<板子IP>:8080 查看实时预览(MJPEG;Ctrl-C 停止)
+model_path: "model/yolo26n_obb.rknn"  # 模型路径(转换见 docs/build.md)
+input_path: "video/test.mp4"          # 输入:本地文件 / 图片目录 / v4l2 / RTSP
+output_video_path: ""                 # 非空则同时写输出视频文件
+task: "obb"                           # 任务:detect/pose/obb/seg/depth
+mode: "pipeline"                      # pipeline=多 worker 并行;sequential=串行
+thread_count: 6                       # 处理线程数(1080p 护栏内最多 9)
 label_path: "assets/labels/yolov8_obb_labels_list.txt"
 obj_class_num: 15
 enable_tracking: 0
+web_preview: 1                        # 启动 Web 预览(0=关闭)
+web_preview_bind: "0.0.0.0"
+web_preview_port: 8080

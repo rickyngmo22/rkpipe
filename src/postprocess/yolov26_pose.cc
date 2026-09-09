@@ -28,21 +28,6 @@ struct Y26PoseCandidate {
     pose_keypoint kpts[KEYPOINT_NUM];
 };
 
-enum class Y26TensorType { kInt8, kFp16, kFp32 };
-
-// 读一个元素为 float（int8 走 zp/scale 反量化，fp16 转 float，fp32 直读）
-static inline float y26p_at(const void* tensor, Y26TensorType ttype, int idx) {
-    switch (ttype) {
-        case Y26TensorType::kInt8:
-            return static_cast<float>(static_cast<const int8_t*>(tensor)[idx]);
-        case Y26TensorType::kFp16:
-            return fp16_to_float(static_cast<const uint16_t*>(tensor)[idx]);
-        case Y26TensorType::kFp32:
-            return static_cast<const float*>(tensor)[idx];
-    }
-    return 0.0f;
-}
-
 // 单尺度解码。ttype 按该输出张量实际类型指定（混合量化下各输出类型可能不同）。
 static int process_y26_pose_scale(const void* tensor, Y26TensorType ttype, int32_t zp, float scale,
                                   bool nhwc, int grid_h, int grid_w, int stride,
@@ -58,7 +43,7 @@ static int process_y26_pose_scale(const void* tensor, Y26TensorType ttype, int32
         if (ttype == Y26TensorType::kInt8) {
             return (static_cast<const int8_t*>(tensor)[idx] - zp) * scale;
         }
-        return y26p_at(tensor, ttype, idx);
+        return y26_tensor_at(tensor, ttype, idx);
     };
 
     for (int i = 0; i < grid_h; ++i) {
@@ -79,7 +64,7 @@ static int process_y26_pose_scale(const void* tensor, Y26TensorType ttype, int32
                 best_logit = (max_q - zp) * scale;
             } else {
                 for (int c = 0; c < class_num; ++c) {
-                    const float v = y26p_at(tensor, ttype, nhwc ? off * channels + 4 + c : (4 + c) * grid_len + off);
+                    const float v = y26_tensor_at(tensor, ttype, nhwc ? off * channels + 4 + c : (4 + c) * grid_len + off);
                     if (v > best_logit) { best_logit = v; bestc = c; }
                 }
                 if (bestc < 0) continue;
@@ -148,14 +133,7 @@ int post_process_yolov26_pose(rknn_app_context_t* app_ctx, void* outputs, letter
     const bool cls_sigmoided = (app_ctx->cls_is_sigmoided == 1);
 
     // 置信度阈值：已 sigmoid → 概率域直接用 conf；logits → 转 logit 域 ln(conf/(1-conf))
-    float logit_thr;
-    if (cls_sigmoided) {
-        logit_thr = conf_threshold;
-    } else {
-        if (conf_threshold <= 0.0f) logit_thr = -1e9f;
-        else if (conf_threshold >= 1.0f) logit_thr = 1e9f;
-        else logit_thr = logf(conf_threshold / (1.0f - conf_threshold));
-    }
+    const float logit_thr = y26_conf_to_logit_threshold(cls_sigmoided, conf_threshold);
 
     for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i) {
         const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
@@ -170,16 +148,7 @@ int post_process_yolov26_pose(rknn_app_context_t* app_ctx, void* outputs, letter
         // 张量解码类型（与 yolo26 detect 一致）：
         //  - is_quant=false（全 FP16/FP32 模型）→ want_float=true，runtime 已反量化为 float32
         //  - is_quant=true（INT8/混合量化）→ want_float=false，各输出保持原生类型，逐张量判断
-        Y26TensorType ttype;
-        if (!app_ctx->is_quant) {
-            ttype = Y26TensorType::kFp32;
-        } else {
-            switch (attr.type) {
-                case RKNN_TENSOR_INT8: ttype = Y26TensorType::kInt8; break;
-                case RKNN_TENSOR_FLOAT16: ttype = Y26TensorType::kFp16; break;
-                default: ttype = Y26TensorType::kFp32; break;
-            }
-        }
+        const Y26TensorType ttype = y26_tensor_type_from_attr(app_ctx->is_quant, attr.type);
         process_y26_pose_scale(_outputs[i].buf, ttype, attr.zp, attr.scale, nhwc,
                                grid_h, grid_w, stride, class_count, kpt_num, logit_thr, cls_sigmoided, cands);
     }
@@ -196,37 +165,17 @@ int post_process_yolov26_pose(rknn_app_context_t* app_ctx, void* outputs, letter
         cands.resize(OBJ_NUMB_MAX_SIZE);
     }
 
-    const int crop_left = letter_box->crop_x;
-    const int crop_top = letter_box->crop_y;
-    const int crop_right = crop_left + std::max(1, letter_box->crop_w);
-    const int crop_bottom = crop_top + std::max(1, letter_box->crop_h);
-
     int count = 0;
     for (const Y26PoseCandidate& d : cands) {
         pose_detect_result* result = &pd_results->results[count];
 
-        const float x1 = d.x1 - letter_box->x_pad;
-        const float y1 = d.y1 - letter_box->y_pad;
-        const float x2 = d.x2 - letter_box->x_pad;
-        const float y2 = d.y2 - letter_box->y_pad;
-
-        const int left = static_cast<int>(clamp(x1, 0, model_in_w) / letter_box->scale) + crop_left;
-        const int top = static_cast<int>(clamp(y1, 0, model_in_h) / letter_box->scale) + crop_top;
-        const int right = static_cast<int>(clamp(x2, 0, model_in_w) / letter_box->scale) + crop_left;
-        const int bottom = static_cast<int>(clamp(y2, 0, model_in_h) / letter_box->scale) + crop_top;
-
-        result->box.left = clamp(left, crop_left, crop_right);
-        result->box.top = clamp(top, crop_top, crop_bottom);
-        result->box.right = clamp(right, crop_left, crop_right);
-        result->box.bottom = clamp(bottom, crop_top, crop_bottom);
+        map_box_to_frame(d.x1, d.y1, d.x2, d.y2, letter_box, model_in_w, model_in_h, &result->box);
         result->box_conf = d.score;
         result->cls_id = 0;
 
         for (int k = 0; k < KEYPOINT_NUM; ++k) {
-            const float kpx = d.kpts[k].x - letter_box->x_pad;
-            const float kpy = d.kpts[k].y - letter_box->y_pad;
-            result->keypoints[k].x = clamp(kpx, 0, model_in_w) / letter_box->scale + crop_left;
-            result->keypoints[k].y = clamp(kpy, 0, model_in_h) / letter_box->scale + crop_top;
+            map_point_to_frame(d.kpts[k].x, d.kpts[k].y, letter_box, model_in_w, model_in_h,
+                               false, &result->keypoints[k].x, &result->keypoints[k].y);
             result->keypoints[k].conf = d.kpts[k].conf;
         }
         ++count;

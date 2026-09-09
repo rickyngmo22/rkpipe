@@ -66,7 +66,16 @@ private:
         bool pre_scaled = false;
     };
 
+    // 客户端连接线程句柄：done 由线程函数最后一动作置位，reap 据此 join 并回收,
+    // 保证 stop() 返回后没有任何线程再引用 this(可安全析构)
+    struct ClientThread {
+        std::thread th;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
     void acceptLoop();
+    void spawnClientThread(int client_fd);
+    void reapClientThreads();
     void handleClient(int client_fd);
     void streamClient(int client_fd);
     void closeClient(int client_fd);
@@ -74,7 +83,7 @@ private:
     void encodeAndPublish(cv::Mat bgr, bool pre_scaled);
     std::string makeStatusJson() const;
 
-    // 并发客户端上限：超过则直接拒绝新连接，防止 detached 线程无限增长
+    // 并发客户端上限：超过则直接拒绝新连接,防止线程无限增长
     static constexpr int kMaxClients = 8;
 
     bool sendAll(int fd, const void* data, std::size_t size);
@@ -109,6 +118,11 @@ private:
 
     mutable std::mutex clients_mutex_;
     std::unordered_set<int> client_fds_;
+
+    // 客户端连接线程登记(stop/join 依据);由 spawnClientThread 压入、reapClientThreads 回收
+    std::mutex client_threads_mutex_;
+    std::vector<ClientThread> client_threads_;
+
     std::mutex fps_mutex_;
     std::chrono::steady_clock::time_point fps_window_start_{};
     int fps_window_count_ = 0;

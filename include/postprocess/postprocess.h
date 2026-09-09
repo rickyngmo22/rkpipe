@@ -91,16 +91,10 @@ int post_process_yolov26_seg(rknn_app_context_t *app_ctx, void *outputs, letterb
 // YOLO26 depth：单输出 [1,1,H,W]，depth=exp(head)，反映射到原帧并归一化为 CV_8UC1（近=亮）。
 // depth_lo/depth_hi 输出归一化范围（米），供距离文字把像素值还原为米制（可传 nullptr）。
 int post_process_yolov26_depth(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, cv::Mat* depth_out, float* depth_lo = nullptr, float* depth_hi = nullptr);
-// YOLO26 sem（语义分割）：单输出 [1,C,H,W]，逐像素 argmax 得 CV_8UC1 类别索引图（0..C-1）
-int post_process_yolov26_sem(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, cv::Mat* class_map_out);
-// YOLO26 Detect3D（单目 3D）：单输出 [1,300,14] 已解码免 NMS，
-// 行布局见 detect3d_decode.h；坐标经 letterbox 逆映射回原帧，conf 阈值过滤
-struct Detect3DTaskResult;  // 定义在 core/task_result.h（此处仅指针形参，前向声明避免循环包含）
-int post_process_yolov26_detect3d(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, Detect3DTaskResult *d3_results);
+// [closed-core] 实现在闭源核心库,本仓库无源码
+// [closed-core] 实现在闭源核心库,本仓库无源码
 int post_process_pose(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, pose_detect_result_list *pd_results);
-// RTMPose SimCC 解码：simcc_x/simcc_y logits → argmax/split_ratio → 逆仿射映射回原图。
-// results 为 rtmpose_decode_job_t*（定义在 model/rtmpose.h，经 run_rknn_inference 透传）
-int post_process_rtmpose(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, void *results);
+// [closed-core] 实现在闭源核心库,本仓库无源码
 int post_process_obb(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, obb_detect_result_list *od_results);
 // YOLOv8 分割后处理接口
 int post_process_seg(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, seg_detect_result_list *seg_results);

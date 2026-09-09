@@ -199,8 +199,12 @@ void updateAndRenderTracking(const AppConfig& options,
                              image_buffer_t& frame_buffer,
                              const object_detect_result_list& detect_results,
                              SimpleObjectTracker& tracker,
-                             std::unordered_map<int, int>& class_counts) {
+                             std::unordered_map<int, int>& class_counts,
+                             std::vector<TrackedDetection>* engine_tracked) {
     std::vector<TrackedDetection> tracked = tracker.update(detect_results, &class_counts);
+    if (engine_tracked) {
+        *engine_tracked = tracked;  // 事件引擎消费本帧跟踪结果（规则评估输入）
+    }
     if (!output_enabled || !overlay_enabled) {
         return;
     }
@@ -288,7 +292,8 @@ void renderPipelinePoseTrackingOutput(const AppConfig& options,
                                       bool output_enabled,
                                       PipelineFrame& frame,
                                       SimpleObjectTracker& tracker,
-                                      std::unordered_map<int, int>& class_counts) {
+                                      std::unordered_map<int, int>& class_counts,
+                                      std::vector<TrackedDetection>* engine_tracked) {
     if (!frame.hasResult) {
         return;
     }
@@ -297,6 +302,9 @@ void renderPipelinePoseTrackingOutput(const AppConfig& options,
         return;
     }
     std::vector<TrackedDetection> tracked = trackPoseResults(tracker, pose->data, &class_counts);
+    if (engine_tracked) {
+        *engine_tracked = tracked;  // 事件引擎消费本帧跟踪结果（规则评估输入）
+    }
     if (std::getenv("RK_PIPE_TRACK_DEBUG") != nullptr) {
         std::fprintf(stderr, "[track][pose] dets=%d ids=", pose->data.count);
         for (int i = 0; i < pose->data.count; ++i) {
@@ -340,7 +348,8 @@ void renderPipelineOBBTrackingOutput(const AppConfig& options,
                                      bool output_enabled,
                                      PipelineFrame& frame,
                                      SimpleObjectTracker& tracker,
-                                     std::unordered_map<int, int>& class_counts) {
+                                     std::unordered_map<int, int>& class_counts,
+                                     std::vector<TrackedDetection>* engine_tracked) {
     if (!frame.hasResult) {
         return;
     }
@@ -349,6 +358,9 @@ void renderPipelineOBBTrackingOutput(const AppConfig& options,
         return;
     }
     std::vector<TrackedDetection> tracked = trackOBBResults(tracker, obb->data, &class_counts);
+    if (engine_tracked) {
+        *engine_tracked = tracked;  // 事件引擎消费本帧跟踪结果（规则评估输入）
+    }
     if (!output_enabled) {
         return;
     }
@@ -365,7 +377,8 @@ void renderPipelineSegTrackingOutput(const AppConfig& options,
                                      bool output_enabled,
                                      PipelineFrame& frame,
                                      SimpleObjectTracker& tracker,
-                                     std::unordered_map<int, int>& class_counts) {
+                                     std::unordered_map<int, int>& class_counts,
+                                     std::vector<TrackedDetection>* engine_tracked) {
     if (!frame.hasResult) {
         return;
     }
@@ -374,6 +387,9 @@ void renderPipelineSegTrackingOutput(const AppConfig& options,
         return;
     }
     std::vector<TrackedDetection> tracked = trackSegResults(tracker, *seg, &class_counts);
+    if (engine_tracked) {
+        *engine_tracked = tracked;  // 事件引擎消费本帧跟踪结果（规则评估输入）
+    }
     if (!output_enabled) {
         return;
     }

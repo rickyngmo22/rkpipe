@@ -1,0 +1,15 @@
+{
+  "_comment": "rknn_eval 网页控制台的模型登记表：文件名 -> 支持的评测任务（detect/pose/seg/obb，可数组）。未登记的板上模型不出现在网页下拉；PC 上传的模型不受限。",
+  "yolo26n.rknn": "detect",
+  "yolo26n_pose.rknn": "pose",
+  "yolo26n_obb.rknn": "obb",
+  "yolo26n_seg.rknn": "seg",
+  "yolov8n.rknn": "detect",
+  "yolov8_pose.rknn": "pose",
+  "yolov8_seg.rknn": "seg",
+  "yolov8_obb.rknn": "obb",
+  "yolo11n.rknn": "detect",
+  "yolo11n_pose.rknn": "pose",
+  "yolo11n_seg.rknn": "seg",
+  "yolov5s.rknn": "detect"
+}

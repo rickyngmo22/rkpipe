@@ -8,8 +8,5 @@ enum class TaskType {
     Pose,
     OBB,
     Seg,
-    OCRDet,
-    Depth,
-    Sem,
-    Detect3D
+    Depth
 };

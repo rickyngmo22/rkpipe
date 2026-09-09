@@ -4,16 +4,19 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <memory>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -29,79 +32,6 @@ constexpr const char* kBoundary = "frame";
 bool replayPaceEnvEnabled() {
     const char* v = std::getenv("RK_PIPE_REPLAY_PACE");
     return v && *v && std::string(v) != "0";
-}
-
-// #region debug-point D:debug-report
-struct DebugEndpoint {
-    std::string host = "127.0.0.1";
-    int port = 7777;
-    std::string path = "/event";
-    std::string session = "web-preview-stall";
-    bool configured = false;
-};
-
-DebugEndpoint loadDebugEndpoint() {
-    DebugEndpoint endpoint;
-
-    // 调试上报为可选能力，默认关闭（避免硬编码路径与无谓的 socket 连接）：
-    //   RK_PIPE_DEBUG_SERVER_URL=http://host:port/path  开启并指定上报端点
-    //   RK_PIPE_DEBUG_SESSION_ID=xxx                   覆盖会话标识
-    //   旧调试文件仍可通过 RK_PIPE_DEBUG_ENV_FILE=<path> 指定（不再硬编码）。
-    const char* url_env = std::getenv("RK_PIPE_DEBUG_SERVER_URL");
-    const char* env_file = std::getenv("RK_PIPE_DEBUG_ENV_FILE");
-    if (!url_env || url_env[0] == '\0') {
-        if (!env_file || env_file[0] == '\0') {
-            return endpoint;
-        }
-        std::ifstream env(env_file);
-        std::string line;
-        while (std::getline(env, line)) {
-            if (line.rfind("DEBUG_SERVER_URL=", 0) == 0) {
-                const std::string url = line.substr(std::strlen("DEBUG_SERVER_URL="));
-                const std::string prefix = "http://";
-                if (url.rfind(prefix, 0) == 0) {
-                    std::string host_port = url.substr(prefix.size());
-                    std::size_t slash = host_port.find('/');
-                    endpoint.path = slash == std::string::npos ? "/event" : host_port.substr(slash);
-                    host_port = slash == std::string::npos ? host_port : host_port.substr(0, slash);
-                    std::size_t colon = host_port.rfind(':');
-                    if (colon != std::string::npos) {
-                        endpoint.host = host_port.substr(0, colon);
-                        endpoint.port = std::atoi(host_port.substr(colon + 1).c_str());
-                    }
-                }
-                endpoint.configured = true;
-            } else if (line.rfind("DEBUG_SESSION_ID=", 0) == 0) {
-                endpoint.session = line.substr(std::strlen("DEBUG_SESSION_ID="));
-            }
-        }
-        return endpoint;
-    }
-
-    const std::string url(url_env);
-    const std::string prefix = "http://";
-    if (url.rfind(prefix, 0) == 0) {
-        std::string host_port = url.substr(prefix.size());
-        std::size_t slash = host_port.find('/');
-        endpoint.path = slash == std::string::npos ? "/event" : host_port.substr(slash);
-        host_port = slash == std::string::npos ? host_port : host_port.substr(0, slash);
-        std::size_t colon = host_port.rfind(':');
-        if (colon != std::string::npos) {
-            endpoint.host = host_port.substr(0, colon);
-            endpoint.port = std::atoi(host_port.substr(colon + 1).c_str());
-        }
-        endpoint.configured = true;
-    }
-    const char* session = std::getenv("RK_PIPE_DEBUG_SESSION_ID");
-    if (session && session[0] != '\0') {
-        endpoint.session = session;
-    }
-    return endpoint;
-}
-
-const DebugEndpoint& debugEndpoint() {
-    static const DebugEndpoint endpoint = loadDebugEndpoint();
-    return endpoint;
 }
 
 std::string jsonEscape(const std::string& value) {
@@ -120,58 +50,112 @@ std::string jsonEscape(const std::string& value) {
     return out;
 }
 
-void reportDebugEvent(const char* hypothesis_id,
-                      const char* location,
-                      const std::string& msg,
-                      const std::string& data_json) {
-    const DebugEndpoint& endpoint = debugEndpoint();
-    if (!endpoint.configured) {
-        return;
-    }
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return;
-    }
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(endpoint.port));
-    if (::inet_pton(AF_INET, endpoint.host.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
-        return;
-    }
-    if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(fd);
-        return;
-    }
-    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::system_clock::now().time_since_epoch())
-                      .count();
-    std::ostringstream body;
-    body << "{\"sessionId\":\"" << jsonEscape(endpoint.session)
-         << "\",\"runId\":\"pre-fix\""
-         << ",\"hypothesisId\":\"" << jsonEscape(hypothesis_id)
-         << "\",\"location\":\"" << jsonEscape(location)
-         << "\",\"msg\":\"" << jsonEscape(msg)
-         << "\",\"data\":" << data_json
-         << ",\"ts\":" << now_ms << "}";
-    const std::string body_str = body.str();
-    std::ostringstream request;
-    request << "POST " << endpoint.path << " HTTP/1.1\r\n"
-            << "Host: " << endpoint.host << ":" << endpoint.port << "\r\n"
-            << "Content-Type: application/json\r\n"
-            << "Content-Length: " << body_str.size() << "\r\n"
-            << "Connection: close\r\n\r\n"
-            << body_str;
-    const std::string request_str = request.str();
-    ::send(fd, request_str.data(), request_str.size(), MSG_NOSIGNAL);
-    ::shutdown(fd, SHUT_RDWR);
-    ::close(fd);
+// ---- 访问令牌鉴权(RK_PIPE_WEB_TOKEN;FAQ 曾自认"明文 HTTP、无鉴权") ----------------
+// 环境变量非空时启用:除 /healthz(探针用,无信息泄露)外所有路径要求令牌,来源二选一:
+//   ?token=<t> 查询参数(浏览器 <img>/fetch 直接可用) 或 X-Auth-Token 请求头。
+// Config 为闭源核心按布局填充的类型,不可加字段,令牌经环境变量下发。
+// 令牌建议使用 URL 安全字符(A-Za-z0-9._-~);嵌入页面时做白名单净化。
+
+const char* webToken() {
+    // 逐次读取:env 视为进程内常量,这里不缓存以便测试在单进程内切换开关
+    return std::getenv("RK_PIPE_WEB_TOKEN");
 }
-// #endregion
+
+// 常时比较(避免逐字节提前返回的时序侧信道;LAN 场景属纵深防御)
+bool constantTimeEquals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    }
+    return diff == 0;
+}
+
+// 请求行/头里取令牌:优先查询参数 ?token=,其次 X-Auth-Token 头
+std::string requestToken(const std::string& request) {
+    // 查询参数:请求行 "GET /path?token=x HTTP/1.1" 的 target 段
+    const std::size_t line_end = request.find("\r\n");
+    const std::string line = line_end == std::string::npos ? request : request.substr(0, line_end);
+    const std::size_t sp1 = line.find(' ');
+    const std::size_t sp2 = sp1 == std::string::npos ? std::string::npos : line.find(' ', sp1 + 1);
+    if (sp1 != std::string::npos && sp2 != std::string::npos) {
+        const std::string target = line.substr(sp1 + 1, sp2 - sp1 - 1);
+        const std::size_t q = target.find('?');
+        if (q != std::string::npos) {
+            const std::string query = target.substr(q + 1);
+            std::size_t pos = 0;
+            while ((pos = query.find("token=", pos)) != std::string::npos) {
+                if (pos == 0 || query[pos - 1] == '&' || query[pos - 1] == ';') {
+                    const std::size_t vstart = pos + 6;
+                    const std::size_t vend = query.find('&', vstart);
+                    return query.substr(vstart,
+                                        vend == std::string::npos ? std::string::npos
+                                                                  : vend - vstart);
+                }
+                ++pos;
+            }
+        }
+    }
+    // 请求头:逐行找 x-auth-token(大小写不敏感前缀)
+    std::size_t pos = 0;
+    while ((pos = request.find('\n', pos)) != std::string::npos) {
+        const std::size_t eol = request.find('\r', pos);
+        const std::size_t len = (eol == std::string::npos ? request.size() : eol) - (pos + 1);
+        if (len > 13) {
+            const std::string hdr = request.substr(pos + 1, len);
+            std::string lower;
+            lower.reserve(13);
+            for (std::size_t i = 0; i < 13; ++i) {
+                lower.push_back(
+                    static_cast<char>(std::tolower(static_cast<unsigned char>(hdr[i]))));
+            }
+            if (lower.compare(0, 13, "x-auth-token:") == 0) {
+                std::string value = hdr.substr(13);
+                while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+                    value.erase(value.begin());
+                }
+                while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+                    value.pop_back();
+                }
+                return value;
+            }
+        }
+        pos = eol;
+    }
+    return std::string();
+}
+
+bool requestAuthorized(const std::string& request) {
+    const char* token = webToken();
+    if (token == nullptr || *token == '\0') {
+        return true;  // 未配置 = 鉴权关闭(向后兼容)
+    }
+    return constantTimeEquals(requestToken(request), token);
+}
+
+// 令牌嵌入页面/JS 前的白名单净化(防经令牌值的 HTML/JS 注入)
+std::string sanitizeTokenForEmbedding(const std::string& token) {
+    std::string out;
+    for (const char ch : token) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-' ||
+                        ch == '~';
+        if (ok) {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
 
 std::string makeHtmlPage(const std::string& title,
                          const std::vector<int>& extra_stream_ports,
-                         const std::vector<std::string>& webrtc_urls) {
+                         const std::vector<std::string>& webrtc_urls,
+                         const std::string& token) {
+    // 页面内端点统一追加令牌(鉴权关闭时为空串,URL 不变)
+    const std::string tok = sanitizeTokenForEmbedding(token);
+    const std::string tokq = tok.empty() ? "" : "?token=" + tok;
     // 窗格媒体元素：有 WebRTC URL 用 iframe（经 MediaMTX 观看推流），否则 MJPEG <img>
     auto pane_media = [&](std::size_t pane_index, const std::string& img_tag) {
         const bool has_wrtc = webrtc_urls.size() > pane_index && !webrtc_urls[pane_index].empty();
@@ -204,7 +188,8 @@ std::string makeHtmlPage(const std::string& title,
          << "<div class=\"card\"><p class=\"label\">stream_1"
          << (webrtc_urls.size() > 0 && !webrtc_urls[0].empty() ? " (WebRTC)" : "")
          << "</p>"
-         << pane_media(0, "<img src=\"/stream.mjpg\" alt=\"rkpipe_preview_stream_1\">")
+         << pane_media(0, std::string("<img src=\"/stream.mjpg") + tokq +
+                              "\" alt=\"rkpipe_preview_stream_1\">")
          << "<p class=\"stat\" id=\"stm_1\">--</p></div>";
     for (std::size_t i = 0; i < extra_stream_ports.size(); ++i) {
         const int port = extra_stream_ports[i];
@@ -221,10 +206,11 @@ std::string makeHtmlPage(const std::string& title,
     }
     html << "</div>"
          << "<script>"
+         << "const tok='" << tok << "';const tokq=tok?('?token='+tok):'';"
          << "const host=window.location.hostname||'127.0.0.1';"
          << "document.querySelectorAll('img.remote-stream').forEach((img)=>{"
          << "const port=img.dataset.port;"
-         << "img.src=`http://${host}:${port}/stream.mjpg`;"
+         << "img.src=`http://${host}:${port}/stream.mjpg${tokq}`;"
          << "});"
          << "function fmtStat(d){"
          << "let s=(d.source_fps>0?'Video '+d.source_fps+' fps \\u00b7 ':'')"
@@ -234,12 +220,12 @@ std::string makeHtmlPage(const std::string& title,
          << "if(d.clients>0)s+=' \\u00b7 '+d.clients+' cli';"
          << "return s;} "
          << "function refreshStats(){"
-         << "fetch('/status.json').then(r=>r.json()).then(d=>{"
+         << "fetch('/status.json'+tokq).then(r=>r.json()).then(d=>{"
          << "const el=document.getElementById('stm_1');if(el)el.textContent=fmtStat(d);"
          << "}).catch(()=>{});"
          << "document.querySelectorAll('[data-port]').forEach((el)=>{"
          << "const port=el.dataset.port;"
-         << "fetch(`http://${host}:${port}/status.json`).then(r=>r.json()).then(d=>{"
+         << "fetch(`http://${host}:${port}/status.json${tokq}`).then(r=>r.json()).then(d=>{"
          << "const id=document.getElementById('stm_'+port);if(id)id.textContent=fmtStat(d);"
          << "}).catch(()=>{});"
          << "});}"
@@ -375,15 +361,7 @@ bool WebPreviewServer::start(const Config& config) {
     encode_thread_ = std::thread(&WebPreviewServer::encodeLoop, this);
     std::printf("[WebPreview] listening on %s (mode=%s fps=%.2f pace=%d)\n", url().c_str(),
                 config_.preview_mode.c_str(), config_.replay_fps, replay_pace_enabled_ ? 1 : 0);
-    // #region debug-point D:start
-    reportDebugEvent("D",
-                     "web_preview_server.cc:start",
-                     "[DEBUG] WebPreview server started",
-                     std::string("{\"bind_address\":\"") + jsonEscape(config_.bind_address) +
-                         "\",\"port\":" + std::to_string(config_.port) +
-                         ",\"jpeg_quality\":" + std::to_string(config_.jpeg_quality) + "}");
-    // #endregion
-    return true;
+        return true;
 }
 
 void WebPreviewServer::stop() {
@@ -415,18 +393,41 @@ void WebPreviewServer::stop() {
         ::close(server_fd_);
         server_fd_ = -1;
     }
+    if (accept_thread_.joinable()) {
+        accept_thread_.join();  // 此后不再产生新的客户端线程
+    }
 
+    // 唤醒阻塞在 recv/send 上的客户端线程(shutdown 使其立即失败返回)。
+    // 这里只 shutdown 不 close:close 由各客户端线程经 closeClient 恰好执行一次,
+    // 避免双重 close(误伤复用后的无关句柄)。
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         for (int fd : client_fds_) {
             ::shutdown(fd, SHUT_RDWR);
+        }
+    }
+    frame_cv_.notify_all();
+
+    // 等待全部客户端线程退出后才允许析构,消除 detached 线程解引用 this 的问题
+    for (;;) {
+        reapClientThreads();
+        {
+            std::lock_guard<std::mutex> lock(client_threads_mutex_);
+            if (client_threads_.empty()) {
+                break;
+            }
+        }
+        frame_cv_.notify_all();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    // 兜底:线程全部退出后,仍登记在册的 fd 已无人持有,统一关闭
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        for (int fd : client_fds_) {
             ::close(fd);
         }
         client_fds_.clear();
-    }
-
-    if (accept_thread_.joinable()) {
-        accept_thread_.join();
     }
 }
 
@@ -549,6 +550,7 @@ void WebPreviewServer::encodeLoop() {
             pending_frames_.pop_front();
         }
         queue_cv_.notify_one();  // 唤醒因原帧率模式排队满而阻塞的生产端
+        reapClientThreads();
 
         // 无 MJPEG 客户端时跳过 JPEG 编码（窗格用 WebRTC iframe / 无人观看时），
         // 释放 CPU 给推理；有人请求 /stream.mjpg 时自动恢复编码。
@@ -604,26 +606,7 @@ void WebPreviewServer::encodeAndPublish(cv::Mat bgr, bool pre_scaled) {
         jpeg_size = latest_jpeg_.size();
         frame_version = frame_version_;
     }
-    // #region debug-point D:publish
-    static std::atomic<int> publish_count{0};
-    const int count = ++publish_count;
-    if ((count % 30) == 1) {
-        int active_clients = 0;
-        {
-            std::lock_guard<std::mutex> lock(clients_mutex_);
-            active_clients = static_cast<int>(client_fds_.size());
-        }
-        reportDebugEvent("D",
-                         "web_preview_server.cc:publish",
-                         "[DEBUG] WebPreview published JPEG",
-                         std::string("{\"publish_count\":") + std::to_string(count) +
-                             ",\"frame_version\":" + std::to_string(frame_version) +
-                             ",\"encode_ms\":" + std::to_string(encode_ms) +
-                             ",\"jpeg_bytes\":" + std::to_string(jpeg_size) +
-                             ",\"active_clients\":" + std::to_string(active_clients) + "}");
-    }
-    // #endregion
-    frame_cv_.notify_all();
+        frame_cv_.notify_all();
 
     {
         std::lock_guard<std::mutex> lock(fps_mutex_);
@@ -641,6 +624,14 @@ void WebPreviewServer::encodeAndPublish(cv::Mat bgr, bool pre_scaled) {
 
 void WebPreviewServer::acceptLoop() {
     while (running_.load()) {
+        // close()/shutdown() 并不能可靠唤醒阻塞在 accept() 的线程,
+        // 改用 poll 超时轮询,让本循环周期性回到循环头检查 running_
+        pollfd pfd{};
+        pfd.fd = server_fd_;
+        pfd.events = POLLIN;
+        if (::poll(&pfd, 1, 200) <= 0) {
+            continue;
+        }
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
         const int client_fd = ::accept(server_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
@@ -654,7 +645,28 @@ void WebPreviewServer::acceptLoop() {
             std::perror("[WebPreview] accept");
             continue;
         }
-        std::thread(&WebPreviewServer::handleClient, this, client_fd).detach();
+        spawnClientThread(client_fd);
+        reapClientThreads();
+    }
+}
+
+void WebPreviewServer::spawnClientThread(int client_fd) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread th([this, client_fd, done]() {
+        handleClient(client_fd);
+        done->store(true);  // 线程函数最后动作:reapClientThreads 据此 join 回收
+    });
+    std::lock_guard<std::mutex> lock(client_threads_mutex_);
+    client_threads_.push_back(ClientThread{std::move(th), std::move(done)});
+}
+
+void WebPreviewServer::reapClientThreads() {
+    std::lock_guard<std::mutex> lock(client_threads_mutex_);
+    for (int i = static_cast<int>(client_threads_.size()) - 1; i >= 0; --i) {
+        if (client_threads_[i].done->load()) {
+            client_threads_[i].th.join();
+            client_threads_.erase(client_threads_.begin() + i);
+        }
     }
 }
 
@@ -668,21 +680,35 @@ void WebPreviewServer::handleClient(int client_fd) {
         client_fds_.insert(client_fd);
     }
 
-    const std::string request = readRequest(client_fd);
-    const std::string path = requestPath(request);
-    // #region debug-point E:client-path
-    reportDebugEvent("E",
-                     "web_preview_server.cc:handle-client",
-                     "[DEBUG] WebPreview client request",
-                     std::string("{\"path\":\"") + jsonEscape(path) +
-                         "\",\"client_fd\":" + std::to_string(client_fd) + "}");
-    // #endregion
+    // 收发超时:静默/慢速连接不能长期占用有限的客户端槽位
+    timeval tv{};
+    tv.tv_sec = 10;
+    ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    const std::string request = readRequest(client_fd);
+    if (request.empty()) {
+        closeClient(client_fd);
+        return;
+    }
+    const std::string path = requestPath(request);
+
+    // 访问令牌鉴权(RK_PIPE_WEB_TOKEN 非空时启用;/healthz 保持开放供存活探针)
+    if (path != "/healthz" && !requestAuthorized(request)) {
+        sendTextResponse(client_fd, "401 Unauthorized", "text/plain; charset=utf-8",
+                         "unauthorized: missing or invalid token\n");
+        closeClient(client_fd);
+        return;
+    }
+    const std::string config_token =
+        sanitizeTokenForEmbedding(webToken() ? webToken() : "");
+    
     if (path == "/" || path == "/index.html") {
         sendTextResponse(client_fd,
                          "200 OK",
                          "text/html; charset=utf-8",
-                         makeHtmlPage(config_.title, config_.extra_stream_ports, config_.webrtc_urls));
+                         makeHtmlPage(config_.title, config_.extra_stream_ports, config_.webrtc_urls,
+                         config_token));
         closeClient(client_fd);
         return;
     }
@@ -762,34 +788,18 @@ void WebPreviewServer::streamClient(int client_fd) {
         }
         last_version = version;
         ++sent_frames;
-        // #region debug-point E:stream-progress
-        if ((sent_frames % 60) == 1) {
-            reportDebugEvent("E",
-                             "web_preview_server.cc:stream-client",
-                             "[DEBUG] WebPreview streamed frame",
-                             std::string("{\"client_fd\":") + std::to_string(client_fd) +
-                                 ",\"sent_frames\":" + std::to_string(sent_frames) +
-                                 ",\"frame_version\":" + std::to_string(version) +
-                                 ",\"jpeg_bytes\":" + std::to_string(jpeg.size()) + "}");
-        }
-        // #endregion
-    }
-    // #region debug-point E:stream-close
-    reportDebugEvent("E",
-                     "web_preview_server.cc:stream-close",
-                     "[DEBUG] WebPreview stream closed",
-                     std::string("{\"client_fd\":") + std::to_string(client_fd) +
-                         ",\"sent_frames\":" + std::to_string(sent_frames) +
-                         ",\"last_version\":" + std::to_string(last_version) + "}");
-    // #endregion
-
+            }
+    
     closeClient(client_fd);
 }
 
 void WebPreviewServer::closeClient(int client_fd) {
+    // erase 的返回值保证 close 恰好发生一次;与 stop() 的 shutdown 扫描互斥
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
-        client_fds_.erase(client_fd);
+        if (client_fds_.erase(client_fd) == 0) {
+            return;
+        }
     }
     ::shutdown(client_fd, SHUT_RDWR);
     ::close(client_fd);

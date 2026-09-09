@@ -27,7 +27,8 @@ void updateAndRenderTracking(const AppConfig& options,
                              image_buffer_t& frame_buffer,
                              const object_detect_result_list& detect_results,
                              SimpleObjectTracker& tracker,
-                             std::unordered_map<int, int>& class_counts);
+                             std::unordered_map<int, int>& class_counts,
+                             std::vector<TrackedDetection>* engine_tracked = nullptr);
 
 // ---- pose / obb / seg 任务的 tracking（完整能力：ID + 平滑框 + 遮挡恢复） ----
 
@@ -48,14 +49,17 @@ void renderPipelinePoseTrackingOutput(const AppConfig& options,
                                       bool output_enabled,
                                       PipelineFrame& frame,
                                       SimpleObjectTracker& tracker,
-                                      std::unordered_map<int, int>& class_counts);
+                                      std::unordered_map<int, int>& class_counts,
+                                      std::vector<TrackedDetection>* engine_tracked = nullptr);
 void renderPipelineOBBTrackingOutput(const AppConfig& options,
                                      bool output_enabled,
                                      PipelineFrame& frame,
                                      SimpleObjectTracker& tracker,
-                                     std::unordered_map<int, int>& class_counts);
+                                     std::unordered_map<int, int>& class_counts,
+                                     std::vector<TrackedDetection>* engine_tracked = nullptr);
 void renderPipelineSegTrackingOutput(const AppConfig& options,
                                      bool output_enabled,
                                      PipelineFrame& frame,
                                      SimpleObjectTracker& tracker,
-                                     std::unordered_map<int, int>& class_counts);
+                                     std::unordered_map<int, int>& class_counts,
+                                     std::vector<TrackedDetection>* engine_tracked = nullptr);

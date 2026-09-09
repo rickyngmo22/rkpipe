@@ -20,12 +20,6 @@ struct PipelineFrame {
     bool isZeroCopy = false;
     bool hasResult = false;
     TaskResult result;
-    // depth 辅助任务结果（CV_8UC1 有效区低分辨率），由输出线程放大 + 伪彩，
-    // 避免每个 worker 每帧做 1080p JET + addWeighted 全帧混合
-    cv::Mat auxDepth;
-    cv::Rect auxDepthRoi = cv::Rect(0, 0, 0, 0);
-    float auxDepthLo = 0.0f;  // 深度 8bit 反相图归一化范围（米），距离文字还原用
-    float auxDepthHi = 0.0f;
     // 本帧源名（图片目录输入 = 文件路径），检测结果导出（--dump-detections）映射 image_id 用
     std::string sourceName;
 

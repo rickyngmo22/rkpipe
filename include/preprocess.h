@@ -18,7 +18,7 @@ int rga_nv12_to_bgr(const image_buffer_t& src, cv::Mat& out_bgr, double scale = 
 // 用 RGA 硬件从 NV12/NV21 源帧裁剪 [src_x,src_y,src_w,src_h]（必须落在帧内）并
 // 缩放到 out_rgb 的 [dst_x,dst_y,dst_w,dst_h] 区域（RGB888）。out_rgb 需为 CV_8UC3
 // 连续 Mat，调用方负责预填背景色（未覆盖区域保留）。
-// 用于 RTMPose 人体 ROI 直裁：一次 RGA 完成 裁剪+缩放+YCbCr→RGB，避免整帧 BGR 转换。
+// 一次 RGA 完成 裁剪+缩放+YCbCr→RGB，避免整帧 BGR 转换。
 // 返回 0 成功；非 NV12/NV21、区域越界或 RGA 失败返回 -1（调用方回退 CPU 路径）。
 int rga_nv12_crop_resize_rgb(const image_buffer_t& src,
                              int src_x, int src_y, int src_w, int src_h,

@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "io/video_reader.h"
+#include "io/result_sink.h"
 #include "utils/draw_utils.h"
 
 void clearReleasedFrame(image_buffer_t& frame) {
@@ -21,6 +22,10 @@ void finalizePipelineFrameOutput(OutputRouter& output_router,
                                  bool output_enabled,
                                  bool overlay_on_output,
                                  PipelineFrame& frame) {
+    // 逐帧结构化结果外发(RK_PIPE_RESULT_JSONL 文件汇,RESULT 事件同格式数据):
+    // 在零拷贝释放路径之前调用,此刻 frame.result 完整;未配置/无结果时内部 no-op
+    writeFrameResult(frame);
+
     // 延迟叠加路径：seg 掩膜由输出线程补画（预览降采样时），坐标按缩放比例换算
     const SegTaskResult* seg_result = frame.hasResult ? std::get_if<SegTaskResult>(&frame.result) : nullptr;
     const seg_detect_result_list* seg_overlay = (seg_result && overlay_on_output) ? &seg_result->data : nullptr;

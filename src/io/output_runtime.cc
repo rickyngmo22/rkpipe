@@ -1,5 +1,7 @@
 #include "../../include/io/output_runtime.h"
 
+#include "io/result_sink.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
@@ -169,6 +171,10 @@ bool isUdpPortAvailable(const std::string& url) {
 }  // namespace
 
 bool shouldEnableOutput(const AppConfig& options) {
+    // 逐帧结果 JSONL 汇初始化(RK_PIPE_RESULT_JSONL,见 io/result_sink.h):
+    // 闭源核心启动阶段会以完整配置回调本函数,这是当前核心下开源侧唯一携带配置的
+    // 启动缝;下个核心 Release 起由核心直接初始化结果汇,本接线点退役。
+    configureFrameResultSink(options);
     if (options.push_local) {
         return true;
     }

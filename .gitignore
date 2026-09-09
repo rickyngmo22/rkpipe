@@ -1,8 +1,11 @@
 # build artifacts
 build*/
 *.o
+# 闭源核心库:本仓库(私库)全量备份入库;发布公库时由 scripts/publish_public.sh 剔除,
+# 公库用户从 Releases 下载(见 README "开源边界")
 *.a
 !prebuilt/**/*.a
+# RKNN Runtime 随仓库分发(遵循 Rockchip 许可,见 NOTICE)
 *.so
 *.so.*
 !3rdparty/rknn/*.so*
@@ -14,15 +17,23 @@ build*/
 auto.*
 nohup.out
 deploy/
+# 私库↔公库内部同步清单,属内部工件,不发布
+scripts/.synced_files.txt
 
-# local data
-model/
-video/
-test_videos/
-test_images/
-test_frames/
-*.rknn
-onnx/
+/video/
+/test_videos/
+/test_images/
+/test_frames/
+/*.rknn
+/onnx/
+/data/
+/coco_eval/
+/eval_runs/
+/web_runs/
+/uploads/
+/datasets/
+# 板端本地演示配置(含本机素材路径),不入库;模板见 examples/configs/
+/demo_*.yaml
 
 # editors / OS
 .vscode/
@@ -30,3 +41,8 @@ onnx/
 __pycache__/
 *.pyc
 .DS_Store
+
+# AI 会话内部工件,不入库
+.zcode/
+multistream_logs/
+results/

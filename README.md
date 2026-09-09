@@ -2,7 +2,7 @@
 
 rkpipe 是一套面向 Rockchip RK3588 的实时视频理解流水线:多路视频输入 → RGA 零拷贝预处理 → NPU 推理 → 后处理/跟踪 → Web 预览 / 推流 / 结构化事件输出。单进程内支持检测、姿态、OBB、实例分割、深度估计等任务。
 
-仓库包含全部功能模块源码、稳定 C ABI 契约头、示例与工具链。**流水线调度核心**(线程编排、任务队列、内存池、零拷贝推理引擎等)以预编译静态库 `librkpipe_core.a` 随 Release 分发,不在本仓库(见 [边界说明](#开源边界))。
+仓库包含功能模块源码、稳定 C ABI 契约头与评测工具。**流水线调度核心**(线程编排、任务队列、内存池、零拷贝推理引擎等)以预编译静态库 `librkpipe_core.a` 随 Release 分发。
 
 ## 任务能力
 
@@ -21,15 +21,14 @@ rkpipe 是一套面向 Rockchip RK3588 的实时视频理解流水线:多路视�
 ├── include/core/            契约头子集(帧数据/任务结果/RKNN 上下文/事件规则…)
 ├── include/{io,model,postprocess,detection,config,utils}/
 ├── src/                     模块层实现(与头文件一一对应)
-├── examples/
-│   ├── rkpipe_cli/          CLI:仅用 C ABI 驱动完整流水线(兼作 ABI 验收)
-│   ├── events_demo/         最小事件回调示例(纯 C)
-│   └── configs/             示例配置
-├── prebuilt/<arch>/         预编译闭源核心库(从 Releases 下载放入)
+├── apps/console_detector/   板端控制台应用:仅用 C ABI 驱动完整流水线(兼作 ABI 验收)
+├── examples/configs/        示例配置
+├── prebuilt/<arch>/         预编译核心库(从 Releases 下载放入)
 ├── 3rdparty/rknn/           RKNN SDK 头与运行库(遵循 Rockchip 许可)
-├── tools/                   标定工具、模型输出探针、板端精度评测(rknn_eval)
-├── convert_*.py 等          ONNX→RKNN 模型转换辅助脚本
-└── scripts/check_open_boundary.py   开源边界自检
+├── tools/
+│   ├── eval/                板端精度评测(rknn_eval)
+│   └── convert/             ONNX→RKNN 模型转换辅助脚本
+└── scripts/multistream.py   多路部署编排器(一路一进程,NPU core 轮转/看护重启)
 ```
 
 ## 快速开始
@@ -42,24 +41,164 @@ rkpipe 是一套面向 Rockchip RK3588 的实时视频理解流水线:多路视�
 prebuilt/aarch64/librkpipe_core.a
 ```
 
-### 2. 构建
+下载后建议校验一致性:`sha256sum -c prebuilt/aarch64/sha256sums.txt`。
+
+### 2. 安装依赖(板端 RK3588,Debian/Ubuntu)
 
 ```bash
-# 板端(RK3588,Debian/Ubuntu):需要 opencv、turbojpeg、rga、rockchip-mpp、ffmpeg
+sudo apt install cmake g++ python3 ffmpeg \
+    libopencv-dev libturbojpeg0-dev \
+    libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+```
+
+RGA 与 rockchip-mpp 多数板厂镜像已自带,缺失时安装 `librga-dev`、`librockchip-mpp-dev`。自编 OpenCV 用 `cmake -B build -DOPENCV_ROOT=<prefix>`(或同名环境变量)替代系统包。完整环境说明见 [docs/build.md](docs/build.md)。
+
+### 3. 构建
+
+```bash
 cmake -B build && cmake --build build -j $(nproc)
 
 # 无硬件环境:纯逻辑单元测试(配置解析/事件规则/ROI 过滤/后处理)
 cmake -B build-ci -DRK_PIPE_CI_BUILD=ON && cmake --build build-ci && ctest --test-dir build-ci
 ```
 
-### 3. 运行
+### 4. 准备测试素材
+
+`model/` 已随仓库附带四个 YOLO 版本的板端模型(detect / pose / obb / seg / depth),示例配置开箱即用;测试视频不入库,自己生成一个即可:
 
 ```bash
-./build/rkpipe_cli examples/configs/detect_video.yaml
-# 浏览器打开 http://<板子IP>:8080 查看 Web 预览(detect_web_preview.yaml)
+mkdir -p video
+ffmpeg -y -f lavfi -i testsrc2=duration=60:size=1280x720:rate=30 video/demo.mp4  # 合成测试视频
 ```
 
-模型文件(.rknn)不随仓库分发:用 [tools/](tools/) 与根目录 `convert_*.py` 脚本从公开的 YOLO26 / YOLOv8 等权重自行转换,详见 [docs/build.md](docs/build.md)。
+### 5. 运行
+
+```bash
+./build/console_detector examples/configs/detect_video.yaml
+# 示例配置默认开启 Web 预览:浏览器打开 http://<板子IP>:8080 查看实时画面
+```
+
+从构建到多路部署的逐项验收清单(全部命令已在 RK3588 板端实测)见 [docs/run_guide.md](docs/run_guide.md)。
+
+多路部署(一路一进程)用编排器统一管理 NPU core 分配、崩溃重启与优雅停止(每路一个 YAML,以 `examples/configs/` 为模板改输入源):
+
+```bash
+python3 scripts/multistream.py run --config cam_a.yaml cam_b.yaml cam_c.yaml --cores auto
+```
+
+## 模型精度评测(rknn_eval)
+
+`rknn_eval` 用一个二进制完成板端评测:**配置校验 → 板端推理导出 → 精度评测(mAP) → 论文风格报告(MD + LaTeX + CSV) → CI 断言**,支持 detect / pose / seg / obb 四任务,可做 INT8 vs FP16 量化损失对比与线程扫描。
+
+先做一次 dry-run(不需要数据集,只校验配置与脚本就位):
+
+```bash
+mkdir -p data/coco && echo '{}' > data/coco/annotations.json
+./build/rknn_eval --task detect --model model/yolo26n.rknn \
+  --images data/coco/val2017 --ann data/coco/annotations.json \
+  --label assets/labels/coco_80_labels_list.txt --obj-num 80 --dry-run
+```
+
+真实评测(COCO val2017,数据集自行准备放在仓库根的 `data/coco/` 与 `coco_eval/` 下):
+
+```bash
+# INT8 主模型 + FP16 对照(自动计算量化损失),4 线程,AP50 低于 40 时退出码 1(CI 断言)
+./build/rknn_eval --task detect \
+  --model model/yolo26n.rknn --compare fp16=model/yolo26n_fp16.rknn \
+  --images data/coco/val2017 \
+  --ann coco_eval/annotations/instances_val2017.json \
+  --label assets/labels/coco_80_labels_list.txt --obj-num 80 \
+  --threads 4 --out-dir eval_runs/detect --assert-ap50 40
+# 产物在 eval_runs/detect/:report.md(主表+量化损失表)、summary_all.json、per_class.csv 等
+```
+
+**网页控制台（亮点）**：板端起一个服务，PC 浏览器直接操作——无需任何 PC 端环境：
+
+```bash
+./tools/eval/eval_web_service.sh start     # 板端启动，默认 :8081
+# PC 浏览器打开 http://<板IP>:8081
+```
+
+网页上完成一切：数据集上传（支持 PC 文件夹增量同步，二次评测只传差异图片）→ 模型下拉/上传 →
+提交评测 → 实时日志与抽帧快照 → 自动出 mAP 报告（MD/CSV/逐类表）→ 历史任务对比。
+
+pose / seg / obb 的标准命令、YOLO 四版本(yolo26n/v8n/11n/v5s)横向对比、自定义数据集转换、
+DOTA 评测、`--conf-sweep`/`--vis-dir`(单图可视化)等进阶用法见 [tools/eval/README.md](tools/eval/README.md)。
+
+## 板端性能与精度（RK3588 实测）
+
+以下数据在 RK3588 板端实测（COCO val2017 5000 张，`thread_count: 9`，`conf=0.001`）。
+
+**推理速度（pipeline 9 线程，视频流 1280×720@60fps）**
+
+| 模型 | 任务 | 测试视频 | 分辨率 | FPS | 推理耗时/帧 |
+|---|---|---|---|---|---|
+| yolov8n | detect | test.mp4 | 1280×720@60 | 177.7 | 50.1ms |
+| yolov5s | detect | test.mp4 | 1280×720@60 | 153.5 | 64.2ms |
+| yolo11n | detect | test.mp4 | 1280×720@60 | 144.7 | 60.6ms |
+| yolo26n | detect | test.mp4 | 1280×720@60 | 127.6 | 77.3ms |
+| yolo26n_pose | pose | baseline9.mp4 | 1280×640@30 | 125.3 | 70.6ms |
+| yolo11n_pose | pose | baseline9.mp4 | 1280×640@30 | 114.6 | 76.6ms |
+| yolov8_obb | obb | baseline11.mp4 | 1280×720@24 | 173.1 | 44.8ms |
+| yolo26n_seg | seg | baseline17_mid30s.mp4 | 1920×1080@30 | 60.2 | 238.6ms |
+
+**INT8 vs FP16 推理速度对比**（yolo26 系列，9 线程）
+
+| 模型 | 量化 | FPS | 推理耗时/帧 |
+|---|---|---|---|
+| yolo26n | INT8 | 127.0 | 79.3ms |
+| yolo26n | FP16 | 58.6 | 218.4ms |
+| yolo26n_obb | INT8 | 132.7 | 51.1ms |
+| yolo26n_obb_fp16 | FP16 | 62.8 | 99.3ms |
+| yolo26n_pose | INT8 | 125.2 | 71.6ms |
+| yolo26n_pose_fp16 | FP16 | 58.1 | 111.5ms |
+| yolo26n_seg | INT8 | 61.2 | 261.3ms |
+| yolo26n_seg_fp16 | FP16 | 34.7 | 435.3ms |
+
+> INT8 量化模型推理速度约为 FP16 的 2 倍以上；精度损失用 `--compare` 参数量化。
+
+**detect 精度（COCO val2017, COCOeval bbox）**
+
+| 模型 | AP | AP50 | AP75 | APs | APm | APl | AR | FPS |
+|---|---|---|---|---|---|---|---|---|
+| yolo26n | 34.2 | 48.7 | 36.9 | 14.5 | 37.9 | 52.6 | 46.7 | 126.9 |
+| yolov8n | 34.0 | 48.5 | 37.0 | 14.3 | 37.7 | 50.1 | 44.5 | 170.8 |
+| yolo11n | 35.9 | 50.8 | 38.9 | 15.5 | 39.3 | 54.5 | 45.9 | 141.7 |
+| yolov5s | 31.2 | 48.4 | 33.8 | 14.3 | 35.9 | 42.5 | 39.5 | 147.5 |
+
+**pose 精度（COCO val2017, COCOeval keypoints）**
+
+| 模型 | AP | AP50 | AP75 | AR | FPS |
+|---|---|---|---|---|---|
+| yolo26n_pose | 49.7 | 77.6 | 53.7 | 47.2 | 126.2 |
+| yolov8_pose | 49.3 | 77.0 | — | — | 121.6 |
+| yolo11n_pose | 46.6 | 78.6 | 48.8 | 46.1 | 114.5 |
+
+**seg 精度（COCO val2017, COCOeval segm）**
+
+| 模型 | AP | AP50 | AP75 | FPS |
+|---|---|---|---|---|
+| yolo26n_seg | 27.0 | 45.5 | 27.6 | 59.6 |
+| yolov8_seg | 12.7 | — | — | 58.5 |
+| yolo11n_seg | 10.1 | 18.5 | 9.9 | 74.1 |
+
+**obb 精度（DOTA v1.0 val, 旋转 IoU）**
+
+| 模型 | mAP50 | mAP50:95 | FPS |
+|---|---|---|---|
+| yolo26n_obb | 63.3 | 33.7 | 107.0 |
+| yolov8_obb | 65.4 | 32.1 | 104.9 |
+
+**depth 推理速度**
+
+| 模型 | FPS |
+|---|---|
+| yolo26n_depth | 63.6 |
+
+> 以上均为 INT8 量化模型在 RK3588 NPU 上的板端实测值（非 PC 模拟）；
+> 精度用 `rknn_eval` 全量 COCO val2017 评测（COCOeval 标准口径，conf=0.001）。
+> FPS 为 9 线程 pipeline 全量推理速度（非单帧推理耗时）。
+> 如需 INT8 vs FP16 量化损失对比，用 `--compare` 参数即可。
 
 ## C ABI 用法(配置即契约)
 
@@ -75,26 +214,22 @@ rkpipe_destroy(h);
 
 **线程契约**:事件回调在库内部线程触发;回调内**不得**调用任何 `rkpipe_*` 接口(会死锁),如需投递请在回调内只做入队。`rkpipe_stop` 为协作式停止,实时流场景以终止输入/进程退出为主。
 
-完整可运行示例见 [examples/events_demo](examples/events_demo)。
+**逐帧结构化结果**:设置环境变量 `RK_PIPE_RESULT_JSONL=<文件路径>` 后,流水线每帧输出一行 schema v1 JSON(字段定义见 [docs/event_payload.md](docs/event_payload.md))。该格式与 `RK_PIPE_EVENT_RESULT` 事件 payload 完全一致;当前核心库即可用文件汇通道(仅 pipeline 模式),事件本身的下发与 YAML 配置键需配套核心库 Release。
 
-## 开源边界
+## 许可
 
-| 层 | 形态 | 内容 |
-|---|---|---|
-| 契约层 | 源码(本仓库) | `rkpipe.h` C ABI、帧/结果数据结构、错误码、回调签名 |
-| 模块层 | 源码(本仓库) | io / model / postprocess / detection / config / utils、事件规则引擎、模型转换工具 |
-| 调度核心 | 预编译 `librkpipe_core.a` | 线程编排与任务队列、帧调度与保序、背压/跳帧策略、线程池与内存池、RKNN 零拷贝推理引擎、C ABI 门面实现 |
-
-核心库不开源、不随源码分发;它通过且仅通过契约头与本仓库对话(链接期互相解析符号,见 CMake 中 `--start-group` 链接组)。`scripts/check_open_boundary.py` 在 CI 中持续自检"开源代码不引用闭源符号、无敏感内容"。
-
-各部分许可不同,见 [LICENSE](LICENSE)(源码,Apache-2.0)、[NOTICE](NOTICE)(第三方组件)与 [LEGAL/RKPIPE-CORE-EULA.md](LEGAL/RKPIPE-CORE-EULA.md)(预编译核心)。
+各部分许可不同,见 [LICENSE](LICENSE)(源码,Apache-2.0)与 [NOTICE](NOTICE)(第三方组件)。
 
 ## 给贡献者
 
-欢迎对模块层的改进:新模型后处理、新输入源、跟踪与事件规则、性能工具等。PR 前请运行 `ctest` 与边界自检;核心层不接受也无法接受源码 PR(它不在本仓库)。见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+欢迎对模块层的改进:新模型后处理、新输入源、跟踪与事件规则、性能工具等。PR 前请运行 `ctest`。见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 文档
 
 - [docs/build.md](docs/build.md) — 环境依赖、模型转换、交叉编译
+- [docs/run_guide.md](docs/run_guide.md) — 运行指南:从构建到多路的逐项验收清单
 - [docs/architecture.md](docs/architecture.md) — 数据流与模块职责(行为级描述)
-- [docs/faq.md](docs/faq.md) — 常见问题(open-core 边界、ABI 兼容、许可)
+- [docs/event_payload.md](docs/event_payload.md) — 逐帧结构化结果 JSONL / RESULT 事件 payload 的 schema
+- [tools/eval/README.md](tools/eval/README.md) — rknn_eval 评测:四任务标准命令、数据准备、进阶选项
+- [docs/benchmark_dota_obb.md](docs/benchmark_dota_obb.md) — OBB 评测指南(DOTA v1.0:切片/命令行/网页控制台/口径)
+- [docs/faq.md](docs/faq.md) — 常见问题(ABI 兼容、许可)

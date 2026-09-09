@@ -338,22 +338,34 @@ int read_data_from_file(const char *path, char **out_data)
         printf("fopen %s fail!\n", path);
         return -1;
     }
-    fseek(fp, 0, SEEK_END);
-    int file_size = ftell(fp);
-    char *data = (char *)malloc(file_size+1);
+    if(fseek(fp, 0, SEEK_END) != 0) {
+        printf("fseek %s fail!\n", path);
+        fclose(fp);
+        return -1;
+    }
+    long file_size = ftell(fp);
+    if(file_size < 0) {
+        printf("ftell %s fail!\n", path);
+        fclose(fp);
+        return -1;
+    }
+    rewind(fp);
+    char *data = (char *)malloc((size_t)file_size + 1);
+    if(data == NULL) {
+        printf("malloc %ld bytes fail for %s!\n", file_size, path);
+        fclose(fp);
+        return -1;
+    }
     data[file_size] = 0;
-    fseek(fp, 0, SEEK_SET);
-    if(file_size != (int)fread(data, 1, file_size, fp)) {
+    if(file_size != (long)fread(data, 1, file_size, fp)) {
         printf("fread %s fail!\n", path);
         free(data);
         fclose(fp);
         return -1;
     }
-    if(fp) {
-        fclose(fp);
-    }
+    fclose(fp);
     *out_data = data;
-    return file_size;
+    return (int)file_size;
 }
 
 int write_data_to_file(const char *path, const char *data, unsigned int size)
@@ -375,32 +387,91 @@ int write_data_to_file(const char *path, const char *data, unsigned int size)
 
 char** read_lines_from_file(const char* filename, int* line_count)
 {
+    *line_count = 0;
     FILE* file = fopen(filename, "r");
     if (file == NULL) {
         printf("Failed to open the file.\n");
         return NULL;
     }
 
-    int num_lines = count_lines(file);
-    printf("num_lines=%d\n", num_lines);
-    char** lines = (char**)malloc(num_lines * sizeof(char*));
-    memset(lines, 0, num_lines * sizeof(char*));
+    // count_lines 只按换行符估计行数；长行会被 fgets 拆成多段，数组按需扩容
+    int capacity = count_lines(file);
+    if (capacity <= 0) {
+        capacity = 16;
+    }
+    char** lines = (char**)malloc(capacity * sizeof(char*));
+    if (lines == NULL) {
+        fclose(file);
+        return NULL;
+    }
+    memset(lines, 0, capacity * sizeof(char*));
 
     char buffer[1024];
+    // 累积缓冲：跨段拼接超过 1023 字符的逻辑行，保持"一个逻辑行一条记录"
+    size_t line_cap = sizeof(buffer);
+    char* line = (char*)malloc(line_cap);
+    if (line == NULL) {
+        free(lines);
+        fclose(file);
+        return NULL;
+    }
+    line[0] = '\0';
+    size_t line_len = 0;
     int line_index = 0;
 
     while (fgets(buffer, sizeof(buffer), file) != NULL) {
-        buffer[strcspn(buffer, "\n")] = '\0';
+        size_t seg_len = strlen(buffer);
+        if (line_len + seg_len + 1 > line_cap) {
+            while (line_len + seg_len + 1 > line_cap) {
+                line_cap *= 2;
+            }
+            char* tmp = (char*)realloc(line, line_cap);
+            if (tmp == NULL) {
+                free(line);
+                free_lines(lines, line_index);
+                fclose(file);
+                return NULL;
+            }
+            line = tmp;
+        }
+        memcpy(line + line_len, buffer, seg_len + 1);
+        line_len += seg_len;
 
-        lines[line_index] = (char*)malloc(strlen(buffer) + 1);
-        strcpy(lines[line_index], buffer);
+        if (!strchr(buffer, '\n') && !feof(file)) {
+            continue;  // 逻辑行未结束，继续读下一段
+        }
 
+        if (line_index >= capacity) {
+            capacity = capacity * 2;
+            char** tmp = (char**)realloc(lines, capacity * sizeof(char*));
+            if (tmp == NULL) {
+                free(line);
+                free_lines(lines, line_index);
+                fclose(file);
+                return NULL;
+            }
+            lines = tmp;
+            memset(lines + line_index, 0, (capacity - line_index) * sizeof(char*));
+        }
+
+        line[strcspn(line, "\n")] = '\0';
+        lines[line_index] = (char*)malloc(strlen(line) + 1);
+        if (lines[line_index] == NULL) {
+            free(line);
+            free_lines(lines, line_index);
+            fclose(file);
+            return NULL;
+        }
+        strcpy(lines[line_index], line);
         line_index++;
+        line_len = 0;
+        line[0] = '\0';
     }
 
+    free(line);
     fclose(file);
 
-    *line_count = num_lines;
+    *line_count = line_index;
     return lines;
 }
 

@@ -39,4 +39,9 @@ LEGAL/RKPIPE-CORE-EULA.md 许可分发,不属于 Apache-2.0 授权范围。
 
 7. Google Test 风格断言的单元测试为本仓库自有代码,无第三方依赖
 
+8. 模型权重(model/*.rknn)
+   由公开 YOLO 检查点(公共版本)经本仓库 tools/convert/ 转换为 RKNN;
+   版权与许可归各上游权重发布方所有(如 Ultralytics 的 AGPL/商用条款),
+   商用部署前请自行确认上游许可。
+
 本产品使用上述开源软件;各组件的完整许可文本以上游发布为准。

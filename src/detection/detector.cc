@@ -1,11 +1,9 @@
 #include "detection/detector.h"
 #include "detection/detection.h"
-#include "ocr_det.h"
 #include "yolov5.h"
 #include "yolov8.h"
 #include "yolov26.h"
 #include "postprocess/postprocess.h"
-#include "core/thread_local_memory_pool.h"
 #include "core/performance.h"
 #include "utils.h"
 #include <filesystem>
@@ -41,12 +39,6 @@ std::unique_ptr<Detector> Detector::createForModel(const std::string& model_path
     std::string lower_task = toLowerCopy(task);
     const bool is_yolo26 = lower_path.find("yolo26") != std::string::npos ||
                            lower_path.find("yolov26") != std::string::npos;
-    // rtmpose 两阶段：model_path 为 RTMPose(SimCC) 模型，第一阶段人体检测模型
-    // 经 setSecondModelPath 注入（见 detector_runtime.cc）。放在最前，
-    // 避免 is_yolo26 文件名启发式误判。
-    if (lower_task == "rtmpose" || lower_task == "rtm-pose") {
-        return std::make_unique<RtmposeDetector>();
-    }
     if (lower_task == "pose") {
         if (is_yolo26) {
             return std::make_unique<YOLOv26PoseDetector>();
@@ -65,17 +57,8 @@ std::unique_ptr<Detector> Detector::createForModel(const std::string& model_path
         }
         return std::make_unique<YOLOv8SegDetector>();
     }
-    if (lower_task == "ocr_det" || lower_task == "ocr-det" || lower_task == "text_det") {
-        return std::make_unique<OCRDetectDetector>();
-    }
     if (lower_task == "depth") {
         return std::make_unique<YOLOv26DepthDetector>();
-    }
-    if (lower_task == "sem") {
-        return std::make_unique<YOLOv26SemDetector>();
-    }
-    if (lower_task == "detect3d" || lower_task == "detect_3d") {
-        return std::make_unique<YOLOv26Detect3DDetector>();
     }
     if (lower_task == "yolo26" || lower_task == "yolov26" || is_yolo26) {
         return std::make_unique<YOLOv26Detector>();
@@ -124,6 +107,7 @@ bool Detector::detect(const cv::Mat& img, void* results) {
 
     performance_->startPreprocessing();
     if (!det.preprocess(img, src, lb, mi_.width, mi_.height)) {
+        releasePreprocessBuffer(src);
         performance_->stopPreprocessing();
         performance_->stopTotal();
         return false;
@@ -144,9 +128,7 @@ bool Detector::detect(const cv::Mat& img, void* results) {
     performance_->stopInference();
 
     performance_->startPostprocessing();
-    if (src.virt_addr && !src.priv_data) {
-        ThreadLocalMemoryManager::deallocate(src.virt_addr);
-    }
+    releasePreprocessBuffer(src);
     performance_->stopPostprocessing();
 
     performance_->stopTotal();
@@ -168,6 +150,7 @@ bool Detector::detect(const image_buffer_t& img, void* results) {
 
     performance_->startPreprocessing();
     if (!det.preprocess(img, src, lb, mi_.width, mi_.height)) {
+        releasePreprocessBuffer(src);
         performance_->stopPreprocessing();
         performance_->stopTotal();
         return false;
@@ -188,9 +171,7 @@ bool Detector::detect(const image_buffer_t& img, void* results) {
     performance_->stopInference();
 
     performance_->startPostprocessing();
-    if (src.virt_addr && !src.priv_data) {
-        ThreadLocalMemoryManager::deallocate(src.virt_addr);
-    }
+    releasePreprocessBuffer(src);
     performance_->stopPostprocessing();
 
     performance_->stopTotal();
@@ -247,6 +228,7 @@ void Detector::warmup(int input_width, int input_height, int times) {
         det.setModelContext(&appCtx_);
 
         if (!det.preprocess(dummy, src, lb, mi_.width, mi_.height)) {
+            releasePreprocessBuffer(src);
             continue;
         }
 
@@ -259,26 +241,15 @@ void Detector::warmup(int input_width, int input_height, int times) {
         } else if (modelIsSeg()) {
             seg_detect_result_list seg_results;
             runInference(&src, &lb, &seg_results);
-        } else if (modelIsOCRDet()) {
-            OCRDetectTaskResult ocr_results;
-            runInference(&src, &lb, &ocr_results);
         } else if (modelIsDepth()) {
             DepthTaskResult depth;
             runInference(&src, &lb, &depth);
-        } else if (modelIsSem()) {
-            SemTaskResult sem;
-            runInference(&src, &lb, &sem);
-        } else if (modelIsDetect3D()) {
-            Detect3DTaskResult d3;
-            runInference(&src, &lb, &d3);
         } else {
             object_detect_result_list obj_results;
             runInference(&src, &lb, &obj_results);
         }
 
-        if (src.virt_addr && !src.priv_data) {
-            ThreadLocalMemoryManager::deallocate(src.virt_addr);
-        }
+        releasePreprocessBuffer(src);
     }
 
     savePreprocess_ = prev_save;
@@ -491,101 +462,6 @@ int YOLOv26DepthDetector::extractResultCount(void* results) const {
     return res->empty() ? 0 : 1;
 }
 
-YOLOv26SemDetector::YOLOv26SemDetector() : Detector(0.4f) {}
-
-int YOLOv26SemDetector::initModel(const std::string& path) {
-    return init_yolov26_sem_model(path.c_str(), &appCtx_);
-}
-
-int YOLOv26SemDetector::releaseModel() {
-    return release_yolov26_model(&appCtx_);
-}
-
-int YOLOv26SemDetector::runInference(image_buffer_t* src, letterbox_t* lb, void* results) {
-    auto* res = static_cast<SemTaskResult*>(results);
-    const int ret = inference_yolov26_sem_model(&appCtx_, src, lb, &res->class_map, conf_, nms_);
-    res->class_num = appCtx_.class_num;
-    // 类别索引图有效区子图在原帧中的目标位置（绘制时放大到该区域）
-    if (lb && lb->scale > 0.0f) {
-        res->roi = cv::Rect(lb->crop_x, lb->crop_y, lb->crop_w, lb->crop_h);
-    } else if (src && src->width > 0) {
-        res->roi = cv::Rect(0, 0, src->width, src->height);
-    } else {
-        res->roi = cv::Rect(0, 0, 0, 0);
-    }
-    return ret;
-}
-
-int YOLOv26SemDetector::extractResultCount(void* results) const {
-    auto* res = static_cast<SemTaskResult*>(results);
-    return res->class_map.empty() ? 0 : 1;
-}
-
-YOLOv26Detect3DDetector::YOLOv26Detect3DDetector() : Detector(0.25f) {}
-
-int YOLOv26Detect3DDetector::initModel(const std::string& path) {
-    return init_yolov26_detect3d_model(path.c_str(), &appCtx_);
-}
-
-int YOLOv26Detect3DDetector::releaseModel() {
-    return release_yolov26_model(&appCtx_);
-}
-
-int YOLOv26Detect3DDetector::runInference(image_buffer_t* src, letterbox_t* lb, void* results) {
-    auto* res = static_cast<Detect3DTaskResult*>(results);
-    const int ret = inference_yolov26_detect3d_model(&appCtx_, src, lb, res, conf_, nms_);
-    if (ret == 0 && !res->items.empty()) {
-        // 后处理保持模型输入坐标，这里做 letterbox 逆映射。
-        // 注意：src 是预处理后的模型尺寸 buffer，原帧尺寸必须从 letterbox 的 crop 字段取
-        // （crop_x/crop_y 为有效区在原帧中的偏移，crop_w/crop_h 为原帧有效区宽高）
-        const int model_w = mi_.width > 0 ? mi_.width : appCtx_.model_width;
-        const int model_h = mi_.height > 0 ? mi_.height : appCtx_.model_height;
-        int frame_w = model_w;
-        int frame_h = model_h;
-        if (lb && lb->crop_w > 0 && lb->crop_h > 0) {
-            frame_w = lb->crop_x + lb->crop_w;
-            frame_h = lb->crop_y + lb->crop_h;
-        } else if (src && src->width > 0) {
-            frame_w = src->width;
-            frame_h = src->height;
-        }
-        static const bool dbg = []() {
-            const char* e = getenv("RK_PIPE_DEBUG_D3D");
-            return e && *e && strcmp(e, "0") != 0;
-        }();
-        if (dbg) {
-            std::printf("[d3d-map] model=%dx%d frame=%dx%d lb(scale=%.4f pad=%.1f,%.1f crop=%d,%d,%d,%d) items=%zu\n",
-                        model_w, model_h, frame_w, frame_h,
-                        lb ? lb->scale : -1.f, lb ? lb->x_pad : -1.f, lb ? lb->y_pad : -1.f,
-                        lb ? lb->crop_x : -1, lb ? lb->crop_y : -1, lb ? lb->crop_w : -1, lb ? lb->crop_h : -1,
-                        res->items.size());
-            for (size_t k = 0; k < res->items.size() && k < 2; ++k) {
-                const auto& it = res->items[k];
-                std::printf("[d3d-map]   pre : box=(%d,%d,%d,%d) d=%.2f hwl=(%.2f,%.2f,%.2f) conf=%.3f cls=%d\n",
-                            it.box.left, it.box.top, it.box.right, it.box.bottom,
-                            (double)it.depth_m, (double)it.h3, (double)it.w3, (double)it.l3,
-                            (double)it.conf, it.cls_id);
-            }
-        }
-        for (auto& item : res->items) {
-            detect3dMapToFrame(item, lb, model_w, model_h, frame_w, frame_h);
-        }
-        if (dbg) {
-            for (size_t k = 0; k < res->items.size() && k < 2; ++k) {
-                const auto& it = res->items[k];
-                std::printf("[d3d-map]   post: box=(%d,%d,%d,%d)\n",
-                            it.box.left, it.box.top, it.box.right, it.box.bottom);
-            }
-        }
-    }
-    return ret;
-}
-
-int YOLOv26Detect3DDetector::extractResultCount(void* results) const {
-    auto* res = static_cast<Detect3DTaskResult*>(results);
-    return static_cast<int>(res->items.size());
-}
-
 YOLOv8SegDetector::YOLOv8SegDetector() : Detector(0.4f) {}
 
 int YOLOv8SegDetector::initModel(const std::string& path) {
@@ -606,22 +482,3 @@ int YOLOv8SegDetector::extractResultCount(void* results) const {
     return static_cast<int>(res->boxes.size());
 }
 
-OCRDetectDetector::OCRDetectDetector() : Detector(0.3f) {}
-
-int OCRDetectDetector::initModel(const std::string& path) {
-    return init_ocr_det_model(path.c_str(), &appCtx_);
-}
-
-int OCRDetectDetector::releaseModel() {
-    return release_ocr_det_model(&appCtx_);
-}
-
-int OCRDetectDetector::runInference(image_buffer_t* src, letterbox_t* lb, void* results) {
-    auto* res = static_cast<OCRDetectTaskResult*>(results);
-    return inference_ocr_det_model(&appCtx_, src, lb, res, conf_, nms_);
-}
-
-int OCRDetectDetector::extractResultCount(void* results) const {
-    auto* res = static_cast<OCRDetectTaskResult*>(results);
-    return static_cast<int>(res->polygons.size());
-}

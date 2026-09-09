@@ -32,6 +32,47 @@ CONTIG80_TO_COCO = [
 ]
 
 
+def resolve_cat_mapping(coco_gt, label_path):
+    """通用类别映射链：模型 dump 的 cls(0..N-1 连续) → 标注 category_id。
+
+    自动判定（宁报错不错评）：
+      1) 标注 categories id 恰为连续 1..N → cls+1 直映射（自定义数据集常态，
+         转换器 convert_dataset.py 保证产物符合此约定）；
+      2) id 集合恰为 COCO 官方 80 类空洞模式 → 内置映射（官方 COCO 数据集）；
+      3) 其他 → 返回 None，调用方报错退出。
+    """
+    cats = sorted(coco_gt.dataset["categories"], key=lambda c: c["id"])
+    ids = [c["id"] for c in cats]
+    names = [c["name"] for c in cats]
+    n = len(ids)
+
+    label_names = None
+    if label_path and os.path.exists(label_path):
+        label_names = [l.strip() for l in open(label_path, encoding="utf-8", errors="ignore")
+                       if l.strip()]
+
+    if ids == list(range(1, n + 1)):
+        msg = "类别映射: 连续 1..%d 直映射 (cls+1)" % n
+        if label_names is not None and n > 1:
+            if label_names == names:
+                msg += "；label 文件与标注类别顺序一致"
+            else:
+                msg += ("；⚠ label 文件与标注 categories 顺序不一致，请核对！\n"
+                        "  label[:5]=%s\n  cats[:5]=%s" % (label_names[:5], names[:5]))
+        return (lambda cls: cls + 1 if 0 <= cls < n else None), msg, n
+
+    if ids == CONTIG80_TO_COCO:
+        msg = "类别映射: COCO 官方 80 类内置映射（空洞 id）"
+        if label_names is not None and label_names != names:
+            msg += ("；⚠ label 文件与 COCO-80 官方顺序不一致！\n"
+                    "  label[:5]=%s\n  official[:5]=%s" % (label_names[:5], names[:5]))
+        return (lambda cls: CONTIG80_TO_COCO[cls] if 0 <= cls < 80 else None), msg, 80
+
+    return None, ("无法判定类别映射：标注 category ids 既非连续 1..%d（%s...）"
+                  "也非 COCO-80 官方模式。请将标注转为连续 id（convert_dataset.py 会保证）。"
+                  % (n, ids[:6])), 0
+
+
 def detect_dump_kind(path):
     with open(path) as f:
         for line in f:
@@ -59,38 +100,40 @@ def load_dump(path):
     return frames, n_items
 
 
-def image_id_from_file(path):
+def image_id_from_file(path, coco_gt=None):
+    """COCO 数字文件名（000000xxxxxx.jpg）→ image_id；
+    非数字名（自定义数据集常见）回退到标注 file_name 反查。"""
     stem = os.path.splitext(os.path.basename(path))[0]
-    return int(stem)  # COCO val2017 文件名 000000xxxxxx.jpg = image_id
+    try:
+        return int(stem)
+    except ValueError:
+        pass
+    if coco_gt is not None:
+        name = os.path.basename(path)
+        m = getattr(coco_gt, "_fname2id", None)
+        if m is None:
+            m = {os.path.basename(v.get("file_name", "")): v["id"]
+                 for v in coco_gt.imgs.values()}
+            coco_gt._fname2id = m
+        if name in m:
+            return m[name]
+        raise SystemExit("图片 %s 无法映射到标注 image_id（文件名非数字且标注无同名 file_name）" % name)
+    raise SystemExit("需要标注对象做文件名反查")
 
 
-def check_label_order(label_path, coco):
-    if not label_path or not os.path.exists(label_path):
-        return "label 文件未提供，按标准 COCO-80 顺序映射"
-    official_all = [c["name"] for c in sorted(coco.dataset["categories"], key=lambda c: c["id"])
-                    if c["id"] in CONTIG80_TO_COCO]
-    if len(official_all) < 80:
-        return "标注类别 %d 个（如 person_keypoints 文件），跳过 label 顺序校验" % len(official_all)
-    names = [l.strip() for l in open(label_path) if l.strip()]
-    if names == official_all:
-        return "label 文件与 COCO-80 官方顺序一致 (80 类)"
-    return ("⚠ label 文件顺序与 COCO-80 官方不一致，映射可能错位！\n"
-            "  label[:5]=%s official[:5]=%s" % (names[:5], official_all[:5]))
-
-
-def build_results_bbox(frames, coco_gt, conf):
+def build_results_bbox(frames, coco_gt, conf, to_cat, n_cls):
     results = []
     for fr in frames:
-        img_id = image_id_from_file(fr["file"])
+        img_id = image_id_from_file(fr["file"], coco_gt)
         if img_id not in coco_gt.imgs:
             continue
         for d in fr["dets"]:
-            if d["score"] < conf or not (0 <= d["cls"] < 80):
+            if d["score"] < conf or not (0 <= d["cls"] < n_cls):
                 continue
             x, y, w, h = d["bbox"]
             if w <= 0 or h <= 0:
                 continue
-            results.append({"image_id": img_id, "category_id": CONTIG80_TO_COCO[d["cls"]],
+            results.append({"image_id": img_id, "category_id": to_cat(d["cls"]),
                             "bbox": [float(x), float(y), float(w), float(h)],
                             "score": float(d["score"])})
     return results
@@ -99,7 +142,7 @@ def build_results_bbox(frames, coco_gt, conf):
 def build_results_kpts(frames, coco_gt, conf):
     results = []
     for fr in frames:
-        img_id = image_id_from_file(fr["file"])
+        img_id = image_id_from_file(fr["file"], coco_gt)
         if img_id not in coco_gt.imgs:
             continue
         for p in fr["poses"]:
@@ -136,15 +179,15 @@ def decode_box_rle(counts, box, frame_w, frame_h):
     return full
 
 
-def build_results_segm(frames, coco_gt, conf):
+def build_results_segm(frames, coco_gt, conf, to_cat, n_cls):
     results, skipped = [], 0
     for fr in frames:
-        img_id = image_id_from_file(fr["file"])
+        img_id = image_id_from_file(fr["file"], coco_gt)
         if img_id not in coco_gt.imgs:
             continue
         W, H = fr["width"], fr["height"]
         for s in fr["segs"]:
-            if s["score"] < conf or not (0 <= s["cls"] < 80):
+            if s["score"] < conf or not (0 <= s["cls"] < n_cls):
                 continue
             if not s.get("rle"):
                 skipped += 1
@@ -155,7 +198,7 @@ def build_results_segm(frames, coco_gt, conf):
                 continue
             rle = maskUtils.encode(np.asfortranarray(m))
             rle["counts"] = rle["counts"].decode("ascii")
-            results.append({"image_id": img_id, "category_id": CONTIG80_TO_COCO[s["cls"]],
+            results.append({"image_id": img_id, "category_id": to_cat(s["cls"]),
                             "segmentation": rle, "score": float(s["score"])})
     if skipped:
         print("(跳过空掩膜 %d 条)" % skipped)
@@ -174,14 +217,30 @@ def main():
 
     kind = detect_dump_kind(args.dump)
     coco_gt = COCO(args.ann)
-    if kind != "bbox":
-        print(check_label_order(args.label, coco_gt))
+    # 空/无效标注防护: 占位 json 或缺 categories/annotations 直接明确报错(不裸抛 KeyError)
+    cats = coco_gt.dataset.get("categories")
+    if not cats:
+        print("[eval_coco] 标注缺少 categories（空标注或非 COCO 格式），无法评测", file=sys.stderr)
+        return 2
+    if not coco_gt.dataset.get("annotations"):
+        print("[eval_coco] 标注 annotations 为空，无法评测", file=sys.stderr)
+        return 2
+
+    # 通用类别映射链：自动判定 cls → category_id（宁报错不错评）
+    to_cat, map_msg, n_cls = resolve_cat_mapping(coco_gt, args.label)
+    print(map_msg)
+    if to_cat is None:
+        return 2
 
     frames, n_items = load_dump(args.dump)
-    builder = {"bbox": build_results_bbox, "kpts": build_results_kpts, "segm": build_results_segm}[kind]
-    results = builder(frames, coco_gt, args.conf)
+    if kind == "bbox":
+        results = build_results_bbox(frames, coco_gt, args.conf, to_cat, n_cls)
+    elif kind == "segm":
+        results = build_results_segm(frames, coco_gt, args.conf, to_cat, n_cls)
+    else:
+        results = build_results_kpts(frames, coco_gt, args.conf)
 
-    dumped_ids = {image_id_from_file(fr["file"]) for fr in frames}
+    dumped_ids = {image_id_from_file(fr["file"], coco_gt) for fr in frames}
     print("类型: %s | 覆盖率: %d/%d 张 val 图 (%.1f%%) | 导出 %d -> 评测 %d 条" %
           (kind, len(dumped_ids), len(coco_gt.imgs),
            100.0 * len(dumped_ids) / len(coco_gt.imgs), n_items, len(results)))

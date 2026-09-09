@@ -288,27 +288,15 @@ int post_process_yolov8(rknn_app_context_t *app_ctx, void *outputs, letterbox_t 
         }
         int n = indexArray[i];
 
-        float x1 = filterBoxes[n * 4 + 0] - letter_box->x_pad;
-        float y1 = filterBoxes[n * 4 + 1] - letter_box->y_pad;
-        float x2 = x1 + filterBoxes[n * 4 + 2];
-        float y2 = y1 + filterBoxes[n * 4 + 3];
+        const float x1 = filterBoxes[n * 4 + 0];
+        const float y1 = filterBoxes[n * 4 + 1];
+        const float x2 = x1 + filterBoxes[n * 4 + 2];
+        const float y2 = y1 + filterBoxes[n * 4 + 3];
         int id = classId[n];
         float obj_conf = objProbs[i];
 
-        int crop_left = letter_box->crop_x;
-        int crop_top = letter_box->crop_y;
-        int crop_right = crop_left + std::max(1, letter_box->crop_w);
-        int crop_bottom = crop_top + std::max(1, letter_box->crop_h);
-
-        int left = (int)(clamp(x1, 0, model_in_w) / letter_box->scale) + crop_left;
-        int top = (int)(clamp(y1, 0, model_in_h) / letter_box->scale) + crop_top;
-        int right = (int)(clamp(x2, 0, model_in_w) / letter_box->scale) + crop_left;
-        int bottom = (int)(clamp(y2, 0, model_in_h) / letter_box->scale) + crop_top;
-
-        od_results->results[last_count].box.left = clamp(left, crop_left, crop_right);
-        od_results->results[last_count].box.top = clamp(top, crop_top, crop_bottom);
-        od_results->results[last_count].box.right = clamp(right, crop_left, crop_right);
-        od_results->results[last_count].box.bottom = clamp(bottom, crop_top, crop_bottom);
+        map_box_to_frame(x1, y1, x2, y2, letter_box, model_in_w, model_in_h,
+                         &od_results->results[last_count].box);
         od_results->results[last_count].prop = obj_conf;
         od_results->results[last_count].cls_id = id;
         last_count++;

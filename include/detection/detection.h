@@ -8,6 +8,13 @@
 // 前向声明Logger类，避免Qt依赖
 class Logger;
 
+// 释放 Detection::preprocess 产出的目标缓冲。缓冲来源由 image_buffer_t::priv_data 约定：
+//   零拷贝（priv_data == rknn input_mem）→ 不释放，归 RKNN 上下文所有；
+//   priv_data == nullptr                  → 线程本地内存池分配；
+//   其他哨兵值                            → malloc 回退分配。
+// 必须用它释放：预处理的 malloc 回退指针交给内存池释放是未定义行为。
+void releasePreprocessBuffer(image_buffer_t &buf);
+
 class Detection {
 public:
     Detection();

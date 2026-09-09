@@ -1,13 +1,38 @@
 #pragma once
 
-// 事件规则引擎（D1 绊线客流 / D2 区域入侵·滞留·离岗 的公共底座）。
+// 事件规则引擎（D1 绊线 / D2 区域规则的公共底座，支持命名多规则）。
 // detect + tracking 输出线程侧逐帧评估，产出结构化规则事件，由 AlertRuntime 上报。
 //
-// 规则（yaml event_* 配置，见 app_config.h）：
-//   line_cross  - 目标轨迹穿越绊线（方向 A->B / B->A，内置双向计数）
-//   intrusion   - 目标进入事件区域（每次进入触发）
-//   dwell       - 目标在区域内持续超过 event_dwell_seconds（每次进入只触发一次）
-//   absence     - 区域出现过人后持续无人超过 event_absence_seconds（离岗，触发一次）
+// 两种配置形态：
+//   1) 扁平键（向后兼容，app_config.h 的 event_* 字段）：event_line/event_line_cross/
+//      event_region/event_intrusion/event_dwell/event_absence/event_classes ——
+//      合成为一条匿名规则（旧行为逐帧一致）；
+//   2) 命名多规则（环境变量 RK_PIPE_EVENT_RULES=<yaml 文件>，当前核心库即可用；
+//      AppConfig 为布局耦合类型不可加字段，event_rules 配置键随核心库 Release 协同）：
+//      注意——当前核心用自己的扁平键检查门控引擎评估，纯命名配置时引擎不被调用；
+//      流水线内生效需同时给扁平键作"唤醒"（如 event_line_cross: 1 + 合法 event_line，
+//      命名模式优先级更高，扁平合成被跳过，唤醒键本身不产生规则事件）。2026-09 板端
+//      gdb 实证：无唤醒键断点 0 命中，带唤醒键 1800/1800 帧评估；告警派发随核心
+//      后续版本提供。叠加可视化（web 预览）同样需唤醒键。
+//        - {id: "gate",  type: "line_cross", line: "x1,y1,x2,y2", direction: "both|A2B|B2A",
+//           ref_point: "center|bottom"}
+//        - {id: "yard",  type: "intrusion",  region: "x1,y1,...", classes: "0"}
+//        - {id: "loiter",type: "dwell",      region: "...", dwell_seconds: 10}
+//        - {id: "post",  type: "absence",    region: "...", absence_seconds: 30}
+//        - {id: "crowd", type: "crowd",      region: "...", min_count: 3}   区域内人数超限
+//        - {id: "left",  type: "abandoned",  region: "...", seconds: 60}    区域内静止遗留物
+//        - {id: "fall",  type: "fall",  [region: "..."], fall_aspect: 1.2, fall_seconds: 2}
+//          跌倒：框宽高比（躺倒形态）持续超阈值即告警，region 可选（缺省全画面）；
+//          建议 classes: "0"（只对人形生效，避免车辆等天然宽扁目标误报）。
+//        - {id: "spd",   type: "speed", [region: "..."], speed_limit: 300,
+//           px_per_meter: 0, speed_seconds: 1}
+//          测速：跟踪框速度（EMA 平滑，px/s）持续超阈值告警；px_per_meter>0 时 detail
+//          换算 km/h（px_per_meter 为像素→米标定系数）。
+//      direction 过滤即逆行/方向合规：只上报指定方向的穿越（计数仍双向累计）。
+//      ref_point（line_cross 可选）："center"（默认，框中心）| "bottom"（脚底中心，
+//      行人跨线检测的行业惯例）。
+//      命名规则的事件经 RuleEvent.detail 前缀 "[规则id] " 携带规则身份（RuleEvent 为
+//      布局耦合类型，字段不可扩展）；同一 YAML 内 llm_hint 字段经 ruleHint() 透出。
 //
 // 纯逻辑 + OpenCV core，无硬件依赖，CI 单测可覆盖（几何/状态机全部可测）。
 
@@ -22,15 +47,26 @@
 #include "detection/simple_object_tracker.h"
 
 struct RuleEvent {
-    std::string type;    // "line_cross" | "intrusion" | "dwell" | "absence"
-    int track_id = 0;    // absence（区域级事件）为 0
+    std::string type;    // "line_cross"|"intrusion"|"dwell"|"absence"|"crowd"|"abandoned"|"fall"|"speed"
+    int track_id = 0;    // absence/crowd（区域级事件）为 0
     int cls_id = -1;
-    std::string detail;  // "A->B"/"B->A" 或 滞留/离岗秒数
+    std::string detail;  // "A->B"/"B->A"、滞留/离岗秒数、聚集人数等；命名规则带 "[id] " 前缀
+};
+
+// 规则计数快照（stats()/takeStats() 透出，供状态接口/周期统计用）；id 为空时用 type 标识
+struct RuleStat {
+    std::string id;
+    std::string type;
+    long cross_ab = 0;
+    long cross_ba = 0;
+    int crowd_now = 0;      // 当前区域内人数（瞬时值，不清零）
+    int abandoned_now = 0;  // 当前静止遗留目标数（瞬时值，不清零）
 };
 
 class EventEngine {
 public:
     explicit EventEngine(const class AppConfig& options);
+    ~EventEngine();
 
     bool active() const { return active_; }
     // 规则需要绊线/区域几何；缺几何的规则在构造时剔除并打一次告警日志
@@ -50,8 +86,15 @@ public:
     std::vector<RuleEvent> update(const std::vector<TrackedDetection>& tracked,
                                   std::chrono::steady_clock::time_point now);
 
-    // 绊线/区域可视化（黄色绊线 + 半透明青色区域 + 双向计数）
+    // 绊线/区域可视化（黄色绊线 + 半透明青色区域 + 双向计数；命名规则逐条绘制并带 id）
     void drawOverlay(cv::Mat& frame) const;
+
+    // 规则计数快照（线程安全：读最近一次 update 后的缓存，可跨线程调用）
+    std::vector<RuleStat> stats() const;
+    // 取快照并清零累计穿越计数（周期统计语义；crowd/abandoned 为瞬时值不清零）
+    std::vector<RuleStat> takeStats();
+    // 规则的 LLM 复检提示（命名规则 YAML 的 llm_hint 字段；仅在输出线程调用）
+    std::string ruleHint(const std::string& rule_id) const;
 
 private:
     struct TrackState {

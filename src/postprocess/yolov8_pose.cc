@@ -168,34 +168,20 @@ int post_process_pose(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *l
 
         int n = indexArray[i];
 
-        float x1 = filterBoxes[n * 5 + 0] - letter_box->x_pad;
-        float y1 = filterBoxes[n * 5 + 1] - letter_box->y_pad;
-        float x2 = x1 + filterBoxes[n * 5 + 2];
-        float y2 = y1 + filterBoxes[n * 5 + 3];
+        const float x1 = filterBoxes[n * 5 + 0];
+        const float y1 = filterBoxes[n * 5 + 1];
+        const float x2 = x1 + filterBoxes[n * 5 + 2];
+        const float y2 = y1 + filterBoxes[n * 5 + 3];
         float obj_conf = objProbs[i];
         int keypoints_index = (int)filterBoxes[n * 5 + 4];
 
         pose_detect_result* result = &pd_results->results[last_count];
-        int crop_left = letter_box->crop_x;
-        int crop_top = letter_box->crop_y;
-        int crop_right = crop_left + std::max(1, letter_box->crop_w);
-        int crop_bottom = crop_top + std::max(1, letter_box->crop_h);
 
-        int left = (int)(clamp(x1, 0, model_in_w) / letter_box->scale) + crop_left;
-        int top = (int)(clamp(y1, 0, model_in_h) / letter_box->scale) + crop_top;
-        int right = (int)(clamp(x2, 0, model_in_w) / letter_box->scale) + crop_left;
-        int bottom = (int)(clamp(y2, 0, model_in_h) / letter_box->scale) + crop_top;
-
-        result->box.left = clamp(left, crop_left, crop_right);
-        result->box.top = clamp(top, crop_top, crop_bottom);
-        result->box.right = clamp(right, crop_left, crop_right);
-        result->box.bottom = clamp(bottom, crop_top, crop_bottom);
+        map_box_to_frame(x1, y1, x2, y2, letter_box, model_in_w, model_in_h, &result->box);
         result->box_conf = obj_conf;
         result->cls_id = 0;
 
         if (has_keypoint_output) {
-            float img_w = (model_in_w - 2.0f * letter_box->x_pad) / letter_box->scale;
-            float img_h = (model_in_h - 2.0f * letter_box->y_pad) / letter_box->scale;
 
             uint16_t *keypoint_data = (uint16_t *)_outputs[keypoint_output_idx].buf;
 
@@ -210,14 +196,8 @@ int post_process_pose(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *l
                 float kp_y = fp16_to_float(raw_y);
                 float kp_conf = fp16_to_float(raw_conf);
 
-                float original_kp_x = (kp_x - letter_box->x_pad) / letter_box->scale;
-                float original_kp_y = (kp_y - letter_box->y_pad) / letter_box->scale;
-
-                original_kp_x = std::max(0.0f, std::min(original_kp_x, img_w));
-                original_kp_y = std::max(0.0f, std::min(original_kp_y, img_h));
-
-                result->keypoints[k].x = original_kp_x + crop_left;
-                result->keypoints[k].y = original_kp_y + crop_top;
+                map_point_to_frame(kp_x, kp_y, letter_box, model_in_w, model_in_h, true,
+                                   &result->keypoints[k].x, &result->keypoints[k].y);
                 result->keypoints[k].conf = kp_conf;
             }
         }

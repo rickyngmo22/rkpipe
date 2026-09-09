@@ -66,6 +66,83 @@ int y26_scan_cls_sigmoided(rknn_app_context_t* app_ctx, const rknn_output* outpu
 int clamp(float val, int min, int max) { return val > min ? (val < max ? val : max) : min; }
 float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+Y26TensorType y26_tensor_type_from_attr(bool is_quant, rknn_tensor_type type) {
+    if (!is_quant) {
+        return Y26TensorType::kFp32;  // runtime want_float 已转换
+    }
+    switch (type) {
+        case RKNN_TENSOR_INT8: return Y26TensorType::kInt8;
+        case RKNN_TENSOR_FLOAT16: return Y26TensorType::kFp16;
+        default: return Y26TensorType::kFp32;
+    }
+}
+
+float y26_tensor_at(const void* tensor, Y26TensorType type, int idx) {
+    switch (type) {
+        case Y26TensorType::kInt8:
+            return static_cast<float>(static_cast<const int8_t*>(tensor)[idx]);
+        case Y26TensorType::kFp16:
+            return fp16_to_float(static_cast<const uint16_t*>(tensor)[idx]);
+        case Y26TensorType::kFp32:
+            return static_cast<const float*>(tensor)[idx];
+    }
+    return 0.0f;
+}
+
+float y26_conf_to_logit_threshold(bool cls_sigmoided, float conf_threshold) {
+    if (cls_sigmoided) {
+        return conf_threshold;
+    }
+    if (conf_threshold <= 0.0f) return -1e9f;
+    if (conf_threshold >= 1.0f) return 1e9f;
+    return logf(conf_threshold / (1.0f - conf_threshold));
+}
+
+void map_box_to_frame(float x1, float y1, float x2, float y2,
+                      const letterbox_t* letter_box, int model_in_w, int model_in_h,
+                      image_rect_t* box) {
+    const int crop_left = letter_box->crop_x;
+    const int crop_top = letter_box->crop_y;
+    const int crop_right = crop_left + std::max(1, letter_box->crop_w);
+    const int crop_bottom = crop_top + std::max(1, letter_box->crop_h);
+
+    const float fx1 = x1 - letter_box->x_pad;
+    const float fy1 = y1 - letter_box->y_pad;
+    const float fx2 = x2 - letter_box->x_pad;
+    const float fy2 = y2 - letter_box->y_pad;
+
+    const int left = static_cast<int>(clamp(fx1, 0, model_in_w) / letter_box->scale) + crop_left;
+    const int top = static_cast<int>(clamp(fy1, 0, model_in_h) / letter_box->scale) + crop_top;
+    const int right = static_cast<int>(clamp(fx2, 0, model_in_w) / letter_box->scale) + crop_left;
+    const int bottom = static_cast<int>(clamp(fy2, 0, model_in_h) / letter_box->scale) + crop_top;
+
+    box->left = clamp(left, crop_left, crop_right);
+    box->top = clamp(top, crop_top, crop_bottom);
+    box->right = clamp(right, crop_left, crop_right);
+    box->bottom = clamp(bottom, crop_top, crop_bottom);
+}
+
+void map_point_to_frame(float x, float y, const letterbox_t* letter_box,
+                        int model_in_w, int model_in_h, bool content_clamp,
+                        float* out_x, float* out_y) {
+    const float tx = (x - letter_box->x_pad) / letter_box->scale;
+    const float ty = (y - letter_box->y_pad) / letter_box->scale;
+    float ux, uy;
+    if (content_clamp) {
+        // 钳到 letterbox 内容区:关键点不会落到填充区(yolov8-pose 行为)
+        const float max_x = (model_in_w - 2.0f * letter_box->x_pad) / letter_box->scale;
+        const float max_y = (model_in_h - 2.0f * letter_box->y_pad) / letter_box->scale;
+        ux = std::max(0.0f, std::min(tx, max_x));
+        uy = std::max(0.0f, std::min(ty, max_y));
+    } else {
+        // 钳到模型画布(yolov26 系行为)
+        ux = std::max(0.0f, std::min(tx, static_cast<float>(model_in_w) / letter_box->scale));
+        uy = std::max(0.0f, std::min(ty, static_cast<float>(model_in_h) / letter_box->scale));
+    }
+    *out_x = ux + letter_box->crop_x;
+    *out_y = uy + letter_box->crop_y;
+}
+
 float fp16_to_float(uint16_t fp16_val) {
     uint32_t sign = (fp16_val >> 15) & 0x1;
     uint32_t exponent = (fp16_val >> 10) & 0x1F;

@@ -30,20 +30,6 @@ struct Y26OBBCandidate {
     int cls;
 };
 
-enum class Y26TensorType { kInt8, kFp16, kFp32 };
-
-static inline float y26o_at(const void* tensor, Y26TensorType ttype, int idx) {
-    switch (ttype) {
-        case Y26TensorType::kInt8:
-            return static_cast<float>(static_cast<const int8_t*>(tensor)[idx]);
-        case Y26TensorType::kFp16:
-            return fp16_to_float(static_cast<const uint16_t*>(tensor)[idx]);
-        case Y26TensorType::kFp32:
-            return static_cast<const float*>(tensor)[idx];
-    }
-    return 0.0f;
-}
-
 static int process_y26_obb_scale(const void* tensor, Y26TensorType ttype, int32_t zp, float scale,
                                  bool nhwc, int grid_h, int grid_w, int stride,
                                  int class_num, float logit_threshold, bool cls_sigmoided,
@@ -58,7 +44,7 @@ static int process_y26_obb_scale(const void* tensor, Y26TensorType ttype, int32_
         if (ttype == Y26TensorType::kInt8) {
             return (static_cast<const int8_t*>(tensor)[idx] - zp) * scale;
         }
-        return y26o_at(tensor, ttype, idx);
+        return y26_tensor_at(tensor, ttype, idx);
     };
 
     for (int i = 0; i < grid_h; ++i) {
@@ -81,7 +67,7 @@ static int process_y26_obb_scale(const void* tensor, Y26TensorType ttype, int32_
             } else {
                 for (int c = 0; c < class_num; ++c) {
                     const int ci = 5 + c;
-                    const float v = y26o_at(tensor, ttype, nhwc ? off * channels + ci : ci * grid_len + off);
+                    const float v = y26_tensor_at(tensor, ttype, nhwc ? off * channels + ci : ci * grid_len + off);
                     if (v > best_logit) { best_logit = v; bestc = c; }
                 }
                 if (bestc < 0) continue;
@@ -180,14 +166,7 @@ int post_process_yolov26_obb(rknn_app_context_t* app_ctx, void* outputs, letterb
     const bool cls_sigmoided = (app_ctx->cls_is_sigmoided == 1);
 
     // 置信度阈值：已 sigmoid → 概率域直接用 conf；logits → 转 logit 域 ln(conf/(1-conf))
-    float logit_thr;
-    if (cls_sigmoided) {
-        logit_thr = conf_threshold;
-    } else {
-        if (conf_threshold <= 0.0f) logit_thr = -1e9f;
-        else if (conf_threshold >= 1.0f) logit_thr = 1e9f;
-        else logit_thr = logf(conf_threshold / (1.0f - conf_threshold));
-    }
+    const float logit_thr = y26_conf_to_logit_threshold(cls_sigmoided, conf_threshold);
 
     for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i) {
         const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
@@ -199,16 +178,7 @@ int post_process_yolov26_obb(rknn_app_context_t* app_ctx, void* outputs, letterb
         const int cls_num = std::min(channels - 5, class_count);
         if (cls_num <= 0) continue;
         const int stride = model_in_h / grid_h;
-        Y26TensorType ttype;
-        if (!app_ctx->is_quant) {
-            ttype = Y26TensorType::kFp32;
-        } else {
-            switch (attr.type) {
-                case RKNN_TENSOR_INT8: ttype = Y26TensorType::kInt8; break;
-                case RKNN_TENSOR_FLOAT16: ttype = Y26TensorType::kFp16; break;
-                default: ttype = Y26TensorType::kFp32; break;
-            }
-        }
+        const Y26TensorType ttype = y26_tensor_type_from_attr(app_ctx->is_quant, attr.type);
         process_y26_obb_scale(_outputs[i].buf, ttype, attr.zp, attr.scale, nhwc,
                               grid_h, grid_w, stride, cls_num, logit_thr, cls_sigmoided, cands);
     }

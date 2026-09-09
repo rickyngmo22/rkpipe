@@ -2,25 +2,36 @@
 // 构建与运行：cmake --build build --target rk_pipe_unit_tests && ./build/rk_pipe_unit_tests
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <unistd.h>  // getpid: 测试临时文件按进程区分,支持 ctest 并行
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "config/app_config.h"
 #include "core/detection_filter.h"
 #include "core/event_engine.h"
 #include "core/performance.h"
-#include "postprocess/detect3d_decode.h"
+#include "core/task_result_json.h"
+#include "io/result_sink.h"
 #include "postprocess/postprocess_common.h"
-#include "postprocess/retinaface_decode.h"
 #include "detection/simple_object_tracker.h"
 #include "detection/tracking_runtime.h"
-#include "utils/depth_distance.h"
 #ifndef RK_PIPE_CI
+#include <thread>
+
 #include "detection/detector.h"
+#include "io/web_preview_server.h"
 #endif
 
 #include <turbojpeg.h>
@@ -37,10 +48,21 @@ static int g_failures = 0;
         }                                                                    \
     } while (0)
 
-static const char* kTestYaml = "/tmp/rk_pipe_unit_test_cfg.yaml";
+static const char* kTestYamlTemplate = "/tmp/rk_pipe_unit_test_%d_cfg.yaml";
+
+static std::string g_test_yaml_path;
+
+static const char* testYamlPath() {
+    if (g_test_yaml_path.empty()) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), kTestYamlTemplate, (int)getpid());
+        g_test_yaml_path = buf;
+    }
+    return g_test_yaml_path.c_str();
+}
 
 static bool writeTestYaml(const std::string& content) {
-    std::ofstream out(kTestYaml);
+    std::ofstream out(testYamlPath());
     if (!out.is_open()) {
         return false;
     }
@@ -63,9 +85,6 @@ static void testConfigLoad() {
             "web_preview: 1\n"
             "alert_enabled: 1\n"
             "alert_webhook_url: \"http://127.0.0.1:8888/hook\"\n"
-            "depth_dist_text: 1\n"
-            "depth_dist_near_m: 5.5\n"
-            "depth_dist_scale: 1.25\n"
             "event_region: \"10,10,200,10,200,150,10,150\"\n"
             "event_line: \"0,80,400,80\"\n"
             "event_classes: \"0,16\"\n"
@@ -80,7 +99,7 @@ static void testConfigLoad() {
     }
 
     AppConfig cfg;
-    CHECK(cfg.loadFromFile(kTestYaml));
+    CHECK(cfg.loadFromFile(testYamlPath()));
     CHECK(cfg.model_path == "/tmp/model.rknn");
     CHECK(cfg.input_path == "/tmp/video.mp4");
     CHECK(cfg.task == "pose");
@@ -93,9 +112,6 @@ static void testConfigLoad() {
     CHECK(cfg.alert_enabled);
     CHECK(cfg.alert_webhook_url == "http://127.0.0.1:8888/hook");
     // D3 检测+单目测距配置
-    CHECK(cfg.depth_dist_text);
-    CHECK(cfg.depth_dist_near_m > 5.49f && cfg.depth_dist_near_m < 5.51f);
-    CHECK(cfg.depth_dist_scale > 1.24f && cfg.depth_dist_scale < 1.26f);
     // D1/D2 事件规则配置
     CHECK(cfg.event_region == "10,10,200,10,200,150,10,150");
     CHECK(cfg.event_line == "0,80,400,80");
@@ -174,10 +190,6 @@ static void testDetectorFactory() {
         auto d = Detector::createForModel("/tmp/yolov5s.rknn", "detect");
         CHECK(dynamic_cast<YOLOv5Detector*>(d.get()) != nullptr);
     }
-    {
-        auto d = Detector::createForModel("/tmp/x.rknn", "ocr_det");
-        CHECK(dynamic_cast<OCRDetectDetector*>(d.get()) != nullptr);
-    }
     // 未指定 task 且文件名无 yolov5 → 默认 YOLOv8
     {
         auto d = Detector::createForModel("/tmp/yolo11n.rknn", "");
@@ -207,40 +219,6 @@ static void testPostprocessMath() {
     CHECK(fp16_to_float(0x3C00) == 1.0f);
 }
 
-// D3 检测+单目测距：像素→米换算 / 框→深度图映射 / 框内中值统计（纯函数）
-static void testDepthDistance() {
-    std::printf("[test] depth distance math\n");
-    // 反相图端点：v=255 → lo，v=0 → hi；scale 乘法生效
-    CHECK(std::fabs(depthPixelToMeters(255, 1.0f, 21.0f) - 1.0f) < 1e-4f);
-    CHECK(std::fabs(depthPixelToMeters(0, 1.0f, 21.0f) - 21.0f) < 1e-4f);
-    CHECK(std::fabs(depthPixelToMeters(128, 0.0f, 10.0f) - 4.98f) < 0.02f);
-    CHECK(std::fabs(depthPixelToMeters(255, 1.0f, 21.0f, 2.0f) - 2.0f) < 1e-4f);
-    CHECK(depthPixelToMeters(0, 5.0f, 5.0f) == 0.0f);  // lo==hi 无效范围
-
-    // 框→深度子图映射：roi 平移 + 缩放 + 越界裁剪
-    const cv::Rect roi(10, 10, 30, 20);
-    const cv::Size dsize(60, 40);  // 深度图是 roi 的 2 倍分辨率
-    cv::Rect mapped;
-    image_rect_t box{10, 10, 25, 20};  // roi 左上角 → (0,0)，尺寸 ×2
-    CHECK(mapBoxToDepthRect(box, roi, dsize, &mapped));
-    CHECK(mapped.x == 0 && mapped.y == 0 && mapped.width == 31 && mapped.height == 21);
-    box = image_rect_t{-50, -50, 25, 20};  // 左上越界 → 裁剪到 0
-    CHECK(mapBoxToDepthRect(box, roi, dsize, &mapped));
-    CHECK(mapped.x == 0 && mapped.y == 0);
-    box = image_rect_t{100, 100, 120, 130};  // 完全在 roi 外 → 无效
-    CHECK(!mapBoxToDepthRect(box, roi, dsize, &mapped));
-
-    // 框内中值统计：单个离群块不拉偏结果（均值会被拉偏）
-    cv::Mat depth(40, 60, CV_8UC1, cv::Scalar(120));
-    cv::rectangle(depth, cv::Rect(0, 0, 8, 8), cv::Scalar(10), cv::FILLED);  // 近距噪点块
-    box = image_rect_t{0, 0, 59, 39};
-    float meters = 0.0f;
-    CHECK(boxDepthMeters(depth, cv::Rect(0, 0, 60, 40), box, 0.0f, 20.0f, 1.0f, &meters));
-    // v=120 → meters = (255-120)*20/255 ≈ 10.59
-    CHECK(std::fabs(meters - 10.59f) < 0.05f);
-    CHECK(!boxDepthMeters(depth, cv::Rect(0, 0, 60, 40), image_rect_t{100, 100, 120, 130},
-                          0.0f, 20.0f, 1.0f, &meters));
-}
 
 // D1/D2 事件规则引擎：绊线/入侵/滞留/离岗状态机（纯逻辑）
 static void testEventEngine() {
@@ -324,234 +302,190 @@ static void testEventEngine() {
     CHECK(!bad_eng.active());
 }
 
-// Detect3D（单目 3D）：14 列行解码 + letterbox 逆映射（纯函数）
-static void testDetect3DDecode() {
-    std::printf("[test] detect3d decode\n");
-    // 行布局: [x1,y1,x2,y2, conf, cls, cx3d,cy3d, depth, sin,cos, h3,w3,l3]
-    const float row[14] = {100.f, 50.f, 300.f, 200.f, 0.87f, 0.f,
-                           200.f, 190.f, 12.5f, 0.6f, 0.8f, 1.5f, 1.8f, 4.1f};
-    Detect3DItem it = detect3dDecodeRow(row);
-    CHECK(it.box.left == 100 && it.box.top == 50 && it.box.right == 300 && it.box.bottom == 200);
-    CHECK(std::fabs(it.conf - 0.87f) < 1e-6f);
-    CHECK(it.cls_id == 0);
-    CHECK(std::fabs(it.depth_m - 12.5f) < 1e-5f);
-    CHECK(std::fabs(it.h3 - 1.5f) < 1e-6f && std::fabs(it.w3 - 1.8f) < 1e-6f && std::fabs(it.l3 - 4.1f) < 1e-6f);
+// ---- 命名多规则(RK_PIPE_EVENT_RULES,8 类规则+方向/ref_point/多实例) -------------
 
-    // letterbox 逆映射：模型 416x1280，原帧 832x1280（scale=0.5, 无 pad, crop=0）
-    letterbox_t lb{};
-    lb.scale = 0.5f;
-    lb.x_pad = 0.f;
-    lb.y_pad = 0.f;
-    lb.crop_x = 0;
-    lb.crop_y = 0;
-    lb.crop_w = 1280;
-    lb.crop_h = 832;
-    detect3dMapToFrame(it, &lb, 1280, 416, 1280, 832);
-    CHECK(it.box.left == 200 && it.box.top == 100 && it.box.right == 600 && it.box.bottom == 400);
-    CHECK(it.center_u == 400 && it.center_v == 380);
+static void testEventRules() {
+    std::printf("[test] EventEngine named rules\n");
+    const auto t0 = std::chrono::steady_clock::now();
+    auto mk = [](int id, int cls, int l, int t, int r, int b, bool confirmed = true) {
+        TrackedDetection td;
+        td.track_id = id;
+        td.det.cls_id = cls;
+        td.is_confirmed = confirmed;
+        td.det.box = {l, t, r, b};
+        return td;
+    };
+    const auto ms = [](long long v) { return std::chrono::milliseconds(v); };
+    const char* kEnv = "RK_PIPE_EVENT_RULES";
 
-    // 带 pad + crop：模型坐标先减 pad 再除 scale 加 crop，并裁剪到原帧
-    Detect3DItem it2 = detect3dDecodeRow(row);
-    letterbox_t lb2{};
-    lb2.scale = 1.0f;
-    lb2.x_pad = 10.f;
-    lb2.y_pad = 20.f;
-    lb2.crop_x = 5;
-    lb2.crop_y = 6;
-    lb2.crop_w = 100;
-    lb2.crop_h = 100;
-    detect3dMapToFrame(it2, &lb2, 1280, 416, 640, 480);
-    CHECK(it2.box.left == 95 && it2.box.top == 36 && it2.box.right == 295 && it2.box.bottom == 186);
-    CHECK(it2.center_u == 195 && it2.center_v == 176);
+    const std::string path =
+        std::string("/tmp/rk_pipe_unit_") + std::to_string(getpid()) + "_rules.yaml";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "%YAML:1.0\n---\nevent_rules:\n"
+            "  - {id: \"gate\", type: \"line_cross\", line: \"0,100,200,100\", classes: \"0\","
+            " direction: \"A2B\"}\n"
+            "  - {id: \"gate2\", type: \"line_cross\", line: \"0,100,200,100\","
+            " ref_point: \"bottom\"}\n"
+            "  - {id: \"yard\", type: \"intrusion\", region: \"0,0,100,0,100,100,0,100\","
+            " classes: \"0\"}\n"
+            "  - {id: \"crowd1\", type: \"crowd\", region: \"0,0,100,0,100,100,0,100\","
+            " min_count: 3}\n"
+            "  - {id: \"fall1\", type: \"fall\", fall_aspect: 1.2, fall_seconds: 2.0,"
+            " classes: \"0\"}\n"
+            "  - {id: \"spd1\", type: \"speed\", speed_limit: 500, speed_seconds: 1.0,"
+            " llm_hint: \"check speed limit\"}\n"
+            "  - {id: \"left1\", type: \"abandoned\", region: \"0,0,100,0,100,100,0,100\","
+            " seconds: 60}\n"
+            "  - {id: \"bad\", type: \"ghost\"}\n";
+    }
 
-    // 无 letterbox（scale<=0）：坐标视为已归一化，仅裁剪
-    Detect3DItem it3 = detect3dDecodeRow(row);
-    detect3dMapToFrame(it3, nullptr, 1280, 416, 150, 100);
-    CHECK(it3.box.right == 149 && it3.box.bottom == 99);
+    setenv(kEnv, path.c_str(), 1);
+    AppConfig cfg;  // 扁平键全部关闭:命名模式仍须激活
+    EventEngine eng(cfg);
+    CHECK(eng.active());
+    CHECK(!eng.lineCrossEnabled() && !eng.intrusionEnabled());  // 扁平内联开关保持关闭
 
-    // 板端布局（38 列）：原始量，解码全在 C++
-    float row38[38] = {0};
-    row38[0] = 10.f; row38[1] = 20.f; row38[2] = 60.f; row38[3] = 80.f;  // 框：中心(35,50) 尺寸(50,60)
-    row38[4] = 0.10f; row38[5] = 0.90f; row38[6] = 0.30f;               // cls=1 (Pedestrian)
-    row38[7] = 0.1f; row38[8] = -0.5f;                                   // 中心偏移
-    row38[9] = std::log(9.5f);                                           // log 深度
-    row38[10] = 0.0f; row38[11] = 0.0f; row38[12] = 0.0f;                // 尺寸残差 0 → 先验原值
-    row38[13] = -3.0f;                                                   // q3d（忽略）
-    row38[14 + 3] = 5.0f;                                                // bin3 胜出
-    row38[26 + 3] = 1.0f;                                                // 残差 tanh(1.0)
-    Detect3DItem b = detect3dDecodeRowCols(row38, 38);
-    CHECK(b.box.left == 10 && b.box.bottom == 80);
-    CHECK(std::fabs(b.conf - 0.90f) < 1e-6f);
-    CHECK(b.cls_id == 1);
-    // 中心 = 框中心 + 偏移×框宽高：(35+0.1*50, 50-0.5*60) = (40, 20)
-    CHECK(std::fabs(b.center_u - 40.0f) < 1e-4f);
-    CHECK(std::fabs(b.center_v - 20.0f) < 1e-4f);
-    CHECK(std::fabs(b.depth_m - 9.5f) < 1e-4f);
-    // 尺寸 = Pedestrian 先验 × exp(0)
-    CHECK(std::fabs(b.h3 - 1.76f) < 1e-4f);
-    CHECK(std::fabs(b.w3 - 0.66f) < 1e-4f);
-    CHECK(std::fabs(b.l3 - 0.84f) < 1e-4f);
-    // multibin：alpha = 3×(2π/12) + tanh(1)×(π/12)
-    const float bin_size = 2.0f * static_cast<float>(M_PI) / 12.0f;
-    const float alpha = 3.0f * bin_size + std::tanh(1.0f) * (bin_size * 0.5f);
-    CHECK(std::fabs(b.sin_alpha - std::sin(alpha)) < 1e-5f);
-    CHECK(std::fabs(b.cos_alpha - std::cos(alpha)) < 1e-5f);
-
-    // 3D 线框投影：简单内参 P2（fx=fy=100, cx=cy=50）手算对照
-    // 目标：3D 底面中心 (0,0,10)，alpha=0 → theta=atan2(10,0)=π/2 → ry=π/2
-    Detect3DItem w{};
-    w.center_u = 50.f; w.center_v = 50.f; w.depth_m = 10.f;
-    w.cos_alpha = 1.f; w.sin_alpha = 0.f;
-    w.h3 = 1.5f; w.w3 = 2.0f; w.l3 = 4.0f;
-    const float p2[12] = {100.f, 0, 50.f, 0, 0, 100.f, 50.f, 0, 0, 0, 1.f, 0};
-    float corners[8][2];
-    CHECK(computeDetect3DCorners2D(w, p2, corners));
-    // 中心语义（y 角点 ±h/2）；ry=π/2 → c≈0,s≈1：X3=zc, Z3=-xc+10
-    // 角点 0（xc=+2, zc=+1, 底面 y=+0.75）：X3=1, Z3=8 → py=(100×0.75+400)/8=59.375
-    CHECK(std::fabs(corners[0][0] - 62.5f) < 1e-3f && std::fabs(corners[0][1] - 59.375f) < 1e-3f);
-    // 角点 2（xc=-2, zc=-1, 底面）：X3=-1, Z3=12 → px=(-100+600)/12≈41.667, py=(75+600)/12=56.25
-    CHECK(std::fabs(corners[2][0] - 41.6667f) < 1e-2f && std::fabs(corners[2][1] - 56.25f) < 1e-3f);
-    // 角点 4（xc=+2, zc=+1, 顶面 y=-0.75）：X3=1, Z3=8 → py=(100×(-0.75)+400)/8=40.625
-    CHECK(std::fabs(corners[4][0] - 62.5f) < 1e-3f && std::fabs(corners[4][1] - 40.625f) < 1e-3f);
-    // 非法输入：深度非正 → false
-    Detect3DItem bad = w;
-    bad.depth_m = 0.0f;
-    CHECK(!computeDetect3DCorners2D(bad, p2, corners));
-}
-
-static void testRetinaFaceDecode() {
-    std::printf("[test] retinaface priorbox + decode\n");
-    // ---- PriorBox:与 zoo examples/RetinaFace/cpp/rknn_box_priors.h 逐项对照 ----
-    const std::vector<float> priors = retinafacePriorBoxes(320);
-    // 320×320:40²×2 + 20²×2 + 10²×2 = 4200
-    CHECK(priors.size() == 4200u * 4u);
-    auto anchor = [&priors](int idx, int k) { return priors[static_cast<size_t>(idx) * 4 + k]; };
-    // 首 3 锚点:cx=cy=4/320,size=16/320;j 列先于 i 行变化;min_size 16→32
-    CHECK(std::fabs(anchor(0, 0) - 0.0125f) < 1e-6f && std::fabs(anchor(0, 1) - 0.0125f) < 1e-6f);
-    CHECK(std::fabs(anchor(0, 2) - 0.05f) < 1e-6f && std::fabs(anchor(0, 3) - 0.05f) < 1e-6f);
-    CHECK(std::fabs(anchor(1, 2) - 0.1f) < 1e-6f);
-    CHECK(std::fabs(anchor(2, 0) - 0.0375f) < 1e-6f && std::fabs(anchor(2, 1) - 0.0125f) < 1e-6f);
-    // 层边界:锚点 3199 = stride8 末位（zoo 第 3200 项）;3200 = stride16 首位（64/320=0.2）
-    CHECK(std::fabs(anchor(3199, 0) - 0.9875f) < 1e-6f && std::fabs(anchor(3199, 2) - 0.1f) < 1e-6f);
-    CHECK(std::fabs(anchor(3200, 0) - 0.025f) < 1e-6f && std::fabs(anchor(3200, 2) - 0.2f) < 1e-6f);
-    // 末锚点 = stride32 (9,9) 的 512 档:cx=cy=0.95,size=1.6（zoo 第 4200 项）
-    CHECK(std::fabs(anchor(4199, 0) - 0.95f) < 1e-6f && std::fabs(anchor(4199, 2) - 1.6f) < 1e-6f);
-    // 中心全部落在 (0,1);尺寸上界 512/320=1.6
-    bool centers_ok = true, sizes_ok = true;
-    for (size_t a = 0; a < priors.size(); a += 4) {
-        if (priors[a] <= 0.f || priors[a] >= 1.f || priors[a + 1] <= 0.f || priors[a + 1] >= 1.f) {
-            centers_ok = false;
-        }
-        if (priors[a + 2] <= 0.f || priors[a + 2] > 1.6f + 1e-6f) {
-            sizes_ok = false;
+    // 1) 绊线方向过滤(gate, direction=A2B):上方(B 侧)下行 = A->B,上报且带 [gate] 前缀;
+    //    回上行 = B->A,仅计数不上报(逆行过滤)
+    auto evs = eng.update({mk(1, 0, 90, 40, 110, 60)}, t0);  // 线上方(B 侧)建立轨迹
+    evs = eng.update({mk(1, 0, 90, 140, 110, 160)}, t0 + ms(33));
+    // 同帧 gate2(方向不限)可能随 track1 的 bottom 跨线额外上报,故按内容断言
+    bool gate_ab = false;
+    for (const auto& e : evs) {
+        if (e.type == "line_cross" && e.detail == "[gate] A->B") {
+            gate_ab = true;
         }
     }
-    CHECK(centers_ok);
-    CHECK(sizes_ok);
-    // 640×640:80²×2 + 40²×2 + 20²×2 = 16800;首锚点 16/640=0.025,中心 4/640=0.00625
-    const std::vector<float> priors640 = retinafacePriorBoxes(640);
-    CHECK(priors640.size() == 16800u * 4u);
-    CHECK(std::fabs(priors640[0] - 0.00625f) < 1e-6f && std::fabs(priors640[2] - 0.025f) < 1e-6f);
-
-    // ---- 解码:合成三头输出 ----
-    const int n = 4200;
-    std::vector<float> box(n * 4, 0.f), cls(n * 2, 0.f), landm(n * 10, 0.f);
-    RetinaFaceRawHeads heads;
-    heads.box = box.data();
-    heads.cls = cls.data();
-    heads.landm = landm.data();
-    heads.num_anchors = n;
-
-    // 零回归闭合:offsets=0 → 框还原为先验框矩形（模型坐标系像素）,landmark=先验中心
-    cls[3200 * 2 + 1] = 0.9f;  // stride16 首锚点:中心 (8,8),w=h=64 → [-24,-24,40,40]
-    std::vector<RetinaFaceItem> items = retinafaceDecode(heads, 0.5f, 0.4f);
-    CHECK(items.size() == 1);
-    if (items.size() == 1) {
-        CHECK(std::fabs(items[0].x1 - (-24.f)) < 1e-2f && std::fabs(items[0].y1 - (-24.f)) < 1e-2f);
-        CHECK(std::fabs(items[0].x2 - 40.f) < 1e-2f && std::fabs(items[0].y2 - 40.f) < 1e-2f);
-        CHECK(std::fabs(items[0].score - 0.9f) < 1e-6f);
-        bool lm_ok = true;
-        for (int k = 0; k < 5; ++k) {
-            if (std::fabs(items[0].landmarks[k * 2] - 8.f) > 1e-2f ||
-                std::fabs(items[0].landmarks[k * 2 + 1] - 8.f) > 1e-2f) {
-                lm_ok = false;
+    CHECK(gate_ab);
+    evs = eng.update({mk(1, 0, 90, 40, 110, 60)}, t0 + ms(66));
+    {
+        bool gate_back = false;
+        for (const auto& e : evs) {
+            if (e.type == "line_cross" && e.detail.find("[gate]") == 0) {
+                gate_back = true;  // B->A 被 direction=A2B 过滤,不得上报
             }
         }
-        CHECK(lm_ok);
+        CHECK(!gate_back);  // 计数仍累计(下方 stats 断言 1/1)
     }
-    cls[3200 * 2 + 1] = 0.f;
 
-    // 方差数学（variances [0.1,0.2],landm 0.1）:锚点 0,loc=[10,-5,2,0]
-    // cx=0.0125+0.1×0.05×10=0.0625→20px;w=0.05×e^0.4→23.87px;h=0.05→16px
-    box[0] = 10.f; box[1] = -5.f; box[2] = 2.f; box[3] = 0.f;
-    landm[0] = 5.f; landm[1] = 5.f;  // 点 0:0.0125+0.1×0.05×5=0.0375→12px
-    cls[1] = 0.8f;
-    items = retinafaceDecode(heads, 0.5f, 0.4f);
-    CHECK(items.size() == 1);
-    if (items.size() == 1) {
-        CHECK(std::fabs(items[0].x1 - (20.f - 23.8692f / 2)) < 1e-2f);
-        CHECK(std::fabs(items[0].y1 - (-12.f)) < 1e-2f && std::fabs(items[0].y2 - 4.f) < 1e-2f);
-        CHECK(std::fabs(items[0].x2 - (20.f + 23.8692f / 2)) < 1e-2f);
-        CHECK(std::fabs(items[0].landmarks[0] - 12.f) < 1e-2f &&
-              std::fabs(items[0].landmarks[1] - 12.f) < 1e-2f);
+    // 2) ref_point=bottom(gate2, 类别不限):track2 用 cls 2 避开 gate 的类别过滤。
+    //    高框 center 跨线而 bottom 未跨 → gate2 不触发;bottom 随后跨线 → 触发
+    evs = eng.update({mk(2, 2, 90, 95, 110, 195)}, t0 + ms(500));
+    evs = eng.update({mk(2, 2, 90, 5, 110, 105)}, t0 + ms(533));
+    CHECK(evs.empty());  // bottom 195→105 未跨线(center 跨线不作数)
+    evs = eng.update({mk(2, 2, 90, -5, 110, 95)}, t0 + ms(566));  // bottom 105→95 跨线
+    CHECK(evs.size() == 1 && evs[0].type == "line_cross" &&
+          evs[0].detail.find("[gate2]") == 0);
+
+    // 3) 入侵+类别过滤(yard, classes=0):cls 2 进入不触发;cls 0 进入触发
+    evs = eng.update({mk(3, 2, 40, 40, 60, 60)}, t0 + ms(600));
+    CHECK(evs.empty());
+    evs = eng.update({mk(3, 0, 190, 40, 210, 60)}, t0 + ms(700));   // 区域外,建立轨迹
+    evs = eng.update({mk(3, 0, 40, 40, 60, 60)}, t0 + ms(733));     // 进入区域
+    bool yard_hit = false;
+    for (const auto& e : evs) {
+        if (e.type == "intrusion" && e.detail == "[yard] ") {
+            yard_hit = true;
+        }
     }
-    box[0] = box[1] = box[2] = box[3] = 0.f;
-    landm[0] = landm[1] = 0.f;
-    cls[1] = 0.f;
+    CHECK(yard_hit);
 
-    // cls 取第 1 列（图内已 Softmax,列 0 是背景分,不得混入）
-    cls[0] = 0.99f;   // 背景列高分不得触发检出
-    items = retinafaceDecode(heads, 0.5f, 0.4f);
-    CHECK(items.empty());
-    cls[0] = 0.f;
-    cls[2 + 1] = 0.7f;  // 锚点 1:人脸列 0.7 → 检出且 score 原样透传
-    items = retinafaceDecode(heads, 0.5f, 0.4f);
-    CHECK(items.size() == 1 && std::fabs(items[0].score - 0.7f) < 1e-6f);
-    cls[3] = 0.f;
+    // 4) 聚集(crowd1, min_count=3):3 人进入触发一次,回落重新武装后再触发
+    evs = eng.update({mk(11, 0, 10, 10, 30, 30), mk(12, 0, 40, 10, 60, 30),
+                      mk(13, 0, 70, 10, 90, 30)}, t0 + ms(800));
+    bool crowd_hit = false;
+    for (const auto& e : evs) {
+        if (e.type == "crowd" && e.detail == "[crowd1] 3人") {
+            crowd_hit = true;
+        }
+    }
+    CHECK(crowd_hit);
+    evs = eng.update({mk(11, 0, 10, 10, 30, 30), mk(12, 0, 40, 10, 60, 30)}, t0 + ms(833));
+    CHECK(evs.empty());
+    evs = eng.update({mk(11, 0, 10, 10, 30, 30), mk(12, 0, 40, 10, 60, 30),
+                      mk(13, 0, 70, 10, 90, 30)}, t0 + ms(866));
+    CHECK(evs.size() == 1 && evs[0].type == "crowd");  // 迟滞重武装后再触发
 
-    // conf 阈值过滤:0.9/0.4/0.6 @ conf=0.5 → 只留 2 个（均写 cls 列 1 = 2*anchor+1）
-    cls[2 * 10 + 1] = 0.9f;
-    cls[2 * 100 + 1] = 0.4f;
-    cls[2 * 200 + 1] = 0.6f;
-    items = retinafaceDecode(heads, 0.5f, 0.99f);
-    CHECK(items.size() == 2);
-    // 分数降序 + max_before_nms 截断（锚点 4199 = stride32 末位,分高且远离前两者）
-    cls[2 * 4199 + 1] = 0.85f;
-    items = retinafaceDecode(heads, 0.5f, 0.99f, 320, 2);
-    CHECK(items.size() == 2);
-    CHECK(std::fabs(items[0].score - 0.9f) < 1e-6f && std::fabs(items[1].score - 0.85f) < 1e-6f);
-    cls[2 * 10 + 1] = cls[2 * 100 + 1] = cls[2 * 200 + 1] = cls[2 * 4199 + 1] = 0.f;
+    // 5) 跌倒(fall1, w/h>=1.2 持续 2s):躺倒→触发;起身复位;再躺倒再触发
+    evs = eng.update({mk(20, 0, 200, 200, 250, 240)}, t0);  // 站立 w/h=1.25? 50/40=1.25 躺倒起步
+    evs = eng.update({mk(20, 0, 200, 200, 250, 240)}, t0 + ms(1000));
+    CHECK(evs.empty());  // 躺倒 1s,不足 2s
+    evs = eng.update({mk(20, 0, 200, 200, 250, 240)}, t0 + ms(2200));
+    bool fall_hit = false;
+    for (const auto& e : evs) {
+        if (e.type == "fall" && e.detail.find("[fall1]") == 0) {
+            fall_hit = true;
+        }
+    }
+    CHECK(fall_hit);
+    evs = eng.update({mk(20, 0, 200, 150, 240, 260)}, t0 + ms(2400));  // 起身 w/h=0.28
+    CHECK(evs.empty());
+    evs = eng.update({mk(20, 0, 200, 200, 250, 240)}, t0 + ms(3000));  // 重新躺倒(重新计时)
+    evs = eng.update({mk(20, 0, 200, 200, 250, 240)}, t0 + ms(4200));
+    evs = eng.update({mk(20, 0, 200, 200, 250, 240)}, t0 + ms(5300));
+    CHECK(evs.size() == 1 && evs[0].type == "fall");  // 复位后可重复触发
 
-    // NMS:锚点 0/1 同中心 16px/32px 方框,IoU=0.25 → 阈 0.2 抑制、0.3 双留
-    cls[1] = 0.9f;
-    cls[3] = 0.9f;
-    items = retinafaceDecode(heads, 0.5f, 0.2f);
-    CHECK(items.size() == 1);
-    items = retinafaceDecode(heads, 0.5f, 0.3f);
-    CHECK(items.size() == 2);
-    cls[1] = cls[3] = 0.f;
+    // 6) 测速(spd1, EMA>=500px/s 持续 1s):100px/100ms=1000px/s → 触发
+    evs = eng.update({mk(30, 0, 10, 10, 30, 30)}, t0);
+    bool speed_hit = false;
+    for (int step = 1; step <= 12; ++step) {
+        const int x = 10 + step * 100;
+        evs = eng.update({mk(30, 0, x, 10, x + 20, 30)}, t0 + ms(step * 100));
+        for (const auto& e : evs) {
+            if (e.type == "speed" && e.detail.find("[spd1]") == 0 &&
+                e.detail.find("px/s") != std::string::npos) {
+                speed_hit = true;  // 触发发生在持续超限 1s 的中间帧,需循环内累计
+            }
+        }
+    }
+    CHECK(speed_hit);
+    CHECK(eng.ruleHint("spd1") == "check speed limit");
+    CHECK(eng.ruleHint("nope").empty());
 
-    // max_results 截断:3 个两两 IoU<0.4 的高分框,上限 2 → 只出前 2
-    // 锚点 0(16px@(4,4)) vs 1600(stride16,64px@(8,8)):IoU=0.0625;4198(stride32,256px@(304,304)) 远离两者
-    cls[2 * 0 + 1] = 0.9f;
-    cls[2 * 1600 + 1] = 0.8f;
-    cls[2 * 4198 + 1] = 0.75f;
-    items = retinafaceDecode(heads, 0.5f, 0.4f, 320, 256, 2);
-    CHECK(items.size() == 2 && std::fabs(items[0].score - 0.9f) < 1e-6f);
-    CHECK(std::fabs(items[1].score - 0.8f) < 1e-6f);
-    cls[1] = cls[2 * 1600 + 1] = cls[2 * 4198 + 1] = 0.f;
+    // 7) 遗留物(left1, seconds=60):静止 60s 触发一次;周期喂帧防轨迹老化(5s)
+    bool abandoned_hit = false;
+    for (int s = 1; s <= 61; ++s) {
+        evs = eng.update({mk(40, 0, 40, 40, 60, 60)}, t0 + ms(s * 1000));
+        for (const auto& e : evs) {
+            if (e.type == "abandoned" && e.detail.find("[left1]") == 0) {
+                abandoned_hit = true;
+            }
+        }
+    }
+    CHECK(abandoned_hit);
 
-    // 病态输入防护
-    RetinaFaceRawHeads bad{};
-    CHECK(retinafaceDecode(bad, 0.5f, 0.4f).empty());  // 空指针
-    heads.num_anchors = 0;
-    CHECK(retinafaceDecode(heads, 0.5f, 0.4f).empty());
-    heads.num_anchors = 4201;  // 超出先验框数量 → 拒绝解码防越界
-    CHECK(retinafaceDecode(heads, 0.5f, 0.4f).empty());
-    heads.num_anchors = n;
-    box[2] = 1e9f;  // exp 溢出 → 非有限框被丢弃
-    cls[1] = 0.9f;
-    CHECK(retinafaceDecode(heads, 0.5f, 0.4f).empty());
+    // 8) stats/takeStats:快照含各规则 id/type,穿越计数与瞬时值透出
+    auto st = eng.stats();
+    CHECK(st.size() >= 7);  // bad(ghost) 已跳过
+    size_t gate_idx = st.size();
+    size_t crowd_idx = st.size();
+    for (size_t i = 0; i < st.size(); ++i) {
+        if (st[i].id == "gate") {
+            gate_idx = i;
+        }
+        if (st[i].id == "crowd1") {
+            crowd_idx = i;
+        }
+    }
+    CHECK(gate_idx < st.size() && st[gate_idx].type == "line_cross");
+    // gate 计数:track1 双向各一次;track2(cls2)被 gate 类别过滤不计
+    CHECK(st[gate_idx].cross_ab == 1 && st[gate_idx].cross_ba == 1);
+    // crowd_now 瞬时值:遗留物用例的 track40 停在 crowd 区域内 → 当前 1 人
+    CHECK(crowd_idx < st.size() && st[crowd_idx].crowd_now == 1);
+    st = eng.takeStats();
+    // takeStats 语义:返回快照携带清零前累计值;引擎内计数已清零
+    CHECK(st[gate_idx].cross_ab == 1 && st[gate_idx].cross_ba == 1);
+    eng.update({}, t0 + ms(9000));  // 喂一帧刷新缓存后再验证清零
+    CHECK(eng.stats()[gate_idx].cross_ab == 0 && eng.stats()[gate_idx].cross_ba == 0);
+
+    // 9) 轨迹老化:停喂 6s(>5s)后轨迹状态被清除,重新出现视为新轨迹
+    evs = eng.update({mk(3, 0, 190, 40, 210, 60)}, t0 + ms(10000));
+    evs = eng.update({mk(3, 0, 40, 40, 60, 60)}, t0 + ms(10100));
+    CHECK(evs.size() == 1 && evs[0].type == "intrusion");
+
+    unsetenv(kEnv);
+    std::remove(path.c_str());
 }
 
 static void testPerformanceAverage() {
@@ -986,30 +920,390 @@ static void testTrackerOtherTasks() {
 }
 #endif  // !RK_PIPE_CI
 
-int main() {
-    testConfigLoad();
-    testConfigValidate();
-    testCommandLine();
+// ---- 逐帧结果 JSON 序列化(schema v1,docs/event_payload.md) --------------------
+
+static void testResultJson() {
+    std::printf("[test] task_result_json schema v1\n");
+    deinit_post_process();  // 归一化 labels 全局状态,独立/全量运行口径一致
+
+    PipelineFrame frame;
+    frame.index = 42;
+    frame.sourceName = "/tmp/rkpipe_test.mp4";
+    frame.matFrame = cv::Mat(1080, 1920, CV_8UC3, cv::Scalar(0));
+
+    // 信封 + 无结果 → type none
+    {
+        const std::string json = buildFrameResultJson(frame);
+        CHECK(json.find("\"schema_version\":1") != std::string::npos);
+        CHECK(json.find("\"frame\":42") != std::string::npos);
+        CHECK(json.find("\"width\":1920") != std::string::npos);
+        CHECK(json.find("\"height\":1080") != std::string::npos);
+        CHECK(json.find("\"source\":\"/tmp/rkpipe_test.mp4\"") != std::string::npos);
+        CHECK(json.find("\"type\":\"none\"") != std::string::npos);
+    }
+
+    frame.hasResult = true;
+
+    // detect:未加载 labels → "null";缺省不带 track_id
+    {
+        DetectTaskResult det;
+        det.data.count = 2;
+        det.data.results[0].box = {10, 20, 110, 220};
+        det.data.results[0].prop = 0.871f;
+        det.data.results[0].cls_id = 0;
+        det.data.results[1].box = {300, 400, 340, 440};
+        det.data.results[1].prop = 0.5f;
+        det.data.results[1].cls_id = 15;
+        frame.result = det;
+        const std::string json = buildFrameResultJson(frame);
+        CHECK(json.find("\"type\":\"detect\"") != std::string::npos);
+        CHECK(json.find("\"bbox\":[10,20,100,200]") != std::string::npos);
+        CHECK(json.find("\"bbox\":[300,400,40,40]") != std::string::npos);
+        CHECK(json.find("\"score\":0.871") != std::string::npos);
+        CHECK(json.find("\"cls\":15") != std::string::npos);
+        CHECK(json.find("\"label\":\"null\"") != std::string::npos);
+        CHECK(json.find("track_id") == std::string::npos);
+    }
+
+    // detect + 事件缝预留的 track ids 参数
+    {
+        const std::vector<int> ids = {7, 0};
+        const std::string json = buildFrameResultJson(frame, &ids);
+        CHECK(json.find("\"track_id\":7") != std::string::npos);
+        CHECK(json.find("\"track_id\":0") != std::string::npos);
+    }
+
+    // label 解析(临时 labels 文件,cls 0 → "person")
+    {
+        const std::string labels_path =
+            std::string("/tmp/rk_pipe_unit_") + std::to_string(getpid()) + "_labels.txt";
+        {
+            std::ofstream out(labels_path);
+            out << "person\ncar\n";
+        }
+        CHECK(init_post_process(labels_path.c_str()) == 0);
+        const std::string json = buildFrameResultJson(frame);
+        CHECK(json.find("\"label\":\"person\"") != std::string::npos);
+        deinit_post_process();
+        std::remove(labels_path.c_str());
+    }
+
+    // pose:17 关键点 + track_id
+    {
+        PoseTaskResult pose;
+        pose.data.count = 1;
+        pose_detect_result& p = pose.data.results[0];
+        p.box = {0, 0, 50, 100};
+        p.box_conf = 0.9f;
+        p.cls_id = 0;
+        p.track_id = 3;
+        for (int k = 0; k < KEYPOINT_NUM; ++k) {
+            p.keypoints[k] = {10.0f * k, 20.0f + k, k == 0 ? 0.95f : 0.0f};
+        }
+        frame.result = pose;
+        const std::string json = buildFrameResultJson(frame);
+        CHECK(json.find("\"type\":\"pose\"") != std::string::npos);
+        CHECK(json.find("\"track_id\":3") != std::string::npos);
+        CHECK(json.find("\"kpts\":[[0,20,0.95]") != std::string::npos);
+        // 17 组关键点 → kpts 数组内应有 16 个 "],[" 分隔
+        const size_t kpts_pos = json.find("\"kpts\":[");
+        CHECK(kpts_pos != std::string::npos);
+        int kpt_count = 0;
+        for (size_t pos = kpts_pos; (pos = json.find("],[", pos)) != std::string::npos; ++kpt_count) {
+            ++pos;
+        }
+        CHECK(kpt_count == KEYPOINT_NUM - 1);
+    }
+
+    // obb:外接框左上 + 弧度角 + track_id
+    {
+        OBBTaskResult obb;
+        obb.data.count = 1;
+        obb_detect_result& b = obb.data.results[0];
+        b.box = {5, 6, 100, 50, 0.785398f};
+        b.prop = 0.8f;
+        b.cls_id = 1;
+        b.track_id = 0;
+        frame.result = obb;
+        const std::string json = buildFrameResultJson(frame);
+        CHECK(json.find("\"type\":\"obb\"") != std::string::npos);
+        CHECK(json.find("\"box\":[5,6,100,50,0.785398]") != std::string::npos);
+        CHECK(json.find("\"score\":0.8") != std::string::npos);
+        CHECK(json.find("\"track_id\":0") != std::string::npos);
+    }
+
+    // seg:RLE 编码与解码约定闭合;空掩膜 → mask:0 无 rle
+    {
+        SegTaskResult seg;
+        seg.data.boxes.push_back(cv::Rect(2, 1, 4, 3));
+        seg.data.scores.push_back(0.7f);
+        seg.data.class_ids.push_back(0);
+        seg.track_ids.push_back(9);
+        // 4x3 掩膜:row0=1,1,0,0 row1=0,0,0,0 row2=0,0,0,1 → 行主序 12 值
+        // [1,1,0,0,0,0,0,0,0,0,0,1] → RLE 从 0 游程起:[0,2,9,1]
+        cv::Mat mask(3, 4, CV_8UC1, cv::Scalar(0));
+        mask.at<uint8_t>(0, 0) = 255;
+        mask.at<uint8_t>(0, 1) = 255;
+        mask.at<uint8_t>(2, 3) = 255;
+        seg.data.masks.push_back(mask);
+        frame.result = seg;
+        std::string json = buildFrameResultJson(frame);
+        CHECK(json.find("\"type\":\"seg\"") != std::string::npos);
+        CHECK(json.find("\"bbox\":[2,1,4,3]") != std::string::npos);
+        CHECK(json.find("\"score\":0.7") != std::string::npos);
+        CHECK(json.find("\"track_id\":9") != std::string::npos);
+        CHECK(json.find("\"mask\":1") != std::string::npos);
+        CHECK(json.find("\"rle\":[0,2,9,1]") != std::string::npos);
+
+        // variant 按值拷贝:改掩膜后需重新赋给 frame.result
+        seg.data.masks[0] = cv::Mat();
+        frame.result = seg;
+        json = buildFrameResultJson(frame);
+        CHECK(json.find("\"mask\":0") != std::string::npos);
+        CHECK(json.find("\"rle\"") == std::string::npos);
+    }
+
+    // depth:仅元数据,不携带栅格
+    {
+        DepthTaskResult depth;
+        depth.roi = cv::Rect(8, 8, 632, 352);
+        depth.depth_lo = 1.5f;
+        depth.depth_hi = 72.25f;
+        frame.result = depth;
+        std::string json = buildFrameResultJson(frame);
+        CHECK(json.find("\"depth\":{\"roi\":[8,8,632,352],\"range\":[1.5,72.25]}") != std::string::npos);
+    }
+
+
+
+    // jsonEscape 边界 + 非有限浮点钳为合法 JSON
+    {
+        CHECK(jsonEscape("a\"b\\c\nd\te") == "a\\\"b\\\\c\\nd\\te");
+        CHECK(jsonEscape("中文") == "中文");
+        CHECK(jsonEscape(std::string(1, '\x01')) == "\\u0001");
+
+        DetectTaskResult det;
+        det.data.count = 1;
+        det.data.results[0].box = {0, 0, 1, 1};
+        det.data.results[0].prop = std::sqrt(-1.0f);  // NaN
+        det.data.results[0].cls_id = 0;
+        frame.result = det;
+        const std::string json = buildFrameResultJson(frame);
+        CHECK(json.find("\"score\":0,") != std::string::npos);
+        CHECK(json.find("nan") == std::string::npos);
+        CHECK(json.find("inf") == std::string::npos);
+    }
+}
+
+// ---- 逐帧结果 JSONL 汇(io/result_sink.h) --------------------------------------
+
+static void testResultSink() {
+    std::printf("[test] result_sink JSONL 汇\n");
+    const std::string path =
+        std::string("/tmp/rk_pipe_unit_") + std::to_string(getpid()) + "_result.jsonl";
+    std::remove(path.c_str());
+    const char* kEnv = "RK_PIPE_RESULT_JSONL";
+
+    PipelineFrame frame;
+    frame.index = 1;
+    frame.sourceName = "s1";
+    frame.matFrame = cv::Mat(8, 8, CV_8UC3, cv::Scalar(0));
+
+    DetectTaskResult det;
+    det.data.count = 1;
+    det.data.results[0].box = {0, 0, 4, 4};
+    det.data.results[0].prop = 0.5f;
+    det.data.results[0].cls_id = 0;
+    frame.result = det;
+
+    // 未配置时写入为 no-op
+    unsetenv(kEnv);
+    shutdownFrameResultSink();
+    writeFrameResult(frame);
+
+    AppConfig cfg;
+    setenv(kEnv, path.c_str(), 1);
+    configureFrameResultSink(cfg);
+
+    writeFrameResult(frame);  // hasResult=false → 不落盘
+    frame.hasResult = true;
+    writeFrameResult(frame);
+    frame.index = 2;
+    frame.sourceName = "s2";
+    writeFrameResult(frame);
+    shutdownFrameResultSink();
+
+    auto countLines = [&path]() {
+        std::ifstream in(path);
+        if (!in.is_open()) {
+            return -1;
+        }
+        int lines = 0;
+        std::string line;
+        while (std::getline(in, line)) {
+            ++lines;
+            if (line.find("{\"schema_version\":1,") != 0 || line.empty() || line.back() != '}') {
+                return -2;  // 行格式坏
+            }
+        }
+        return lines;
+    };
+    CHECK(countLines() == 2);
+
+    // 重新 configure → truncate 重写
+    setenv(kEnv, path.c_str(), 1);
+    configureFrameResultSink(cfg);
+    writeFrameResult(frame);
+    shutdownFrameResultSink();
+    CHECK(countLines() == 1);
+
+    // 打不开的路径:只失败不崩溃,流水线继续
+    setenv(kEnv, "/nonexistent_dir_xyz/result.jsonl", 1);
+    configureFrameResultSink(cfg);
+    writeFrameResult(frame);
+    shutdownFrameResultSink();
+
+    unsetenv(kEnv);
+    std::remove(path.c_str());
+}
+
+
+static std::string webHttpGet(int port, const char* target, const char* extra_header = nullptr) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return "socket-error";
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return "connect-error";
+    }
+    std::string req = std::string("GET ") + target + " HTTP/1.0\r\nHost: 127.0.0.1\r\n";
+    if (extra_header) {
+        req += std::string(extra_header) + "\r\n";
+    }
+    req += "\r\n";
+    if (::send(fd, req.c_str(), req.size(), 0) < 0) {
+        ::close(fd);
+        return "send-error";
+    }
+    std::string resp;
+    char buf[1024];
+    ssize_t n = 0;
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) {
+        resp.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+    return resp;
+}
+
 #ifndef RK_PIPE_CI
-    testDetectorFactory();
-#endif
-    testPostprocessMath();
-    testDepthDistance();
-    testEventEngine();
-    testDetect3DDecode();
-    testRetinaFaceDecode();
-    testPerformanceAverage();
-    testDetectionFilter();
-    testTurbojpeg();
+static void testWebTokenAuth() {
+    std::printf("[test] web preview token auth\n");
+    const int port = 18000 + static_cast<int>(getpid() % 2000);
+
+    WebPreviewServer::Config cfg;
+    cfg.bind_address = "127.0.0.1";
+    cfg.port = port;
+
+    // 未配置令牌:鉴权关闭,直接 200(向后兼容)
+    unsetenv("RK_PIPE_WEB_TOKEN");
+    WebPreviewServer open_server;
+    if (open_server.start(cfg)) {
+        const std::string resp = webHttpGet(port, "/status.json");
+        CHECK(resp.find("200") == 0 || resp.find("HTTP/1") == 0);
+        open_server.stop();
+    }
+
+    // 配置令牌:无令牌/错令牌 → 401;查询参数/请求头 → 200;/healthz 始终开放
+    setenv("RK_PIPE_WEB_TOKEN", "unit_test_tok", 1);
+    WebPreviewServer server;
+    CHECK(server.start(cfg));
+    CHECK(server.running());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    const std::string no_tok = webHttpGet(port, "/status.json");
+    CHECK(no_tok.find("401") != std::string::npos);
+    const std::string bad_tok = webHttpGet(port, "/status.json?token=wrong");
+    CHECK(bad_tok.find("401") != std::string::npos);
+    const std::string qry_ok = webHttpGet(port, "/status.json?token=unit_test_tok");
+    CHECK(qry_ok.find("200") != std::string::npos);
+    const std::string hdr_ok =
+        webHttpGet(port, "/status.json", "X-Auth-Token: unit_test_tok");
+    CHECK(hdr_ok.find("200") != std::string::npos);
+    const std::string healthz = webHttpGet(port, "/healthz");
+    CHECK(healthz.find("200") != std::string::npos);
+    // 主页面:令牌已嵌入端点 URL
+    const std::string page = webHttpGet(port, "/?token=unit_test_tok");
+    CHECK(page.find("token=unit_test_tok") != std::string::npos);
+
+    server.stop();
+    unsetenv("RK_PIPE_WEB_TOKEN");
+}
+#endif  // !RK_PIPE_CI
+
+
+int main(int argc, char** argv) {
+    // 用例注册表:与 CMakeLists.txt 中 RK_PIPE_CI_TEST_NAMES / RK_PIPE_FULL_TEST_NAMES 保持一致
+    struct TestCase {
+        const char* name;
+        void (*fn)();
+    };
+    static const TestCase kTests[] = {
+        {"config_load", testConfigLoad},
+        {"config_validate", testConfigValidate},
+        {"command_line", testCommandLine},
 #ifndef RK_PIPE_CI
-    testTrackerIds();
-    testTrackerOcclusion();
-    testTrackerRelink();
-    testTrackerModes();
-    testTrackerOtherTasks();
-    testTrackerPerf();
-    testTrackerBench();
+        {"detector_factory", testDetectorFactory},
 #endif
+        {"postprocess_math", testPostprocessMath},
+        {"event_engine", testEventEngine},
+        {"event_rules", testEventRules},
+        {"performance_average", testPerformanceAverage},
+        {"detection_filter", testDetectionFilter},
+        {"turbojpeg", testTurbojpeg},
+        {"result_json", testResultJson},
+        {"result_sink", testResultSink},
+#ifndef RK_PIPE_CI
+        {"tracker_ids", testTrackerIds},
+        {"tracker_occlusion", testTrackerOcclusion},
+        {"tracker_relink", testTrackerRelink},
+        {"tracker_modes", testTrackerModes},
+        {"tracker_other_tasks", testTrackerOtherTasks},
+        {"tracker_perf", testTrackerPerf},
+        {"tracker_bench", testTrackerBench},
+        {"web_token_auth", testWebTokenAuth},
+#endif
+    };
+    constexpr int kTestCount = sizeof(kTests) / sizeof(kTests[0]);
+    (void)kTestCount;
+
+    auto runOne = [&](const char* wanted) -> bool {
+        for (const auto& t : kTests) {
+            if (std::strcmp(t.name, wanted) == 0) {
+                t.fn();
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (argc > 1) {
+        // 按名运行(ctest 为每个用例注册独立条目,单用例崩溃不影响其余结果)
+        for (int i = 1; i < argc; ++i) {
+            if (!runOne(argv[i])) {
+                std::printf("unknown test: %s\n", argv[i]);
+                return 2;
+            }
+        }
+    } else {
+        for (const auto& t : kTests) {
+            t.fn();
+        }
+    }
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

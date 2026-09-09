@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "postprocess/postprocess.h"
+#include "postprocess/postprocess_common.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -41,19 +42,6 @@ const int anchor[3][6] = {{10, 13, 16, 30, 33, 23},
     {30, 61, 62, 45, 59, 119},
     {116, 90, 156, 198, 373, 326}
 };
-
-inline static int clamp(float val, int min, int max) {
-    return val > min ? (val < max ? val : max) : min;
-}
-
-[[maybe_unused]] static float CalculateOverlap(float xmin0, float ymin0, float xmax0, float ymax0, float xmin1, float ymin1, float xmax1,
-                              float ymax1) {
-    float w = fmax(0.f, fmin(xmax0, xmax1) - fmax(xmin0, xmin1) + 1.0);
-    float h = fmax(0.f, fmin(ymax0, ymax1) - fmax(ymin0, ymin1) + 1.0);
-    float i = w * h;
-    float u = (xmax0 - xmin0 + 1.0) * (ymax0 - ymin0 + 1.0) + (xmax1 - xmin1 + 1.0) * (ymax1 - ymin1 + 1.0) - i;
-    return u <= 0.f ? 0.f : (i / u);
-}
 
 
 std::vector<float> rbbox_to_corners(const std::vector<float> &rbbox) {
@@ -356,51 +344,8 @@ static int nms(int validCount, const std::vector<float> &outputLocations, const 
     return 0;
 }
 
-static int quick_sort_indice_inverse(std::vector<float> &input, int left, int right, std::vector<int> &indices) {
-    float key;
-    int key_index;
-    int low = left;
-    int high = right;
-    if (left < right) {
-        key_index = indices[left];
-        key = input[left];
-        while (low < high) {
-            while (low < high && input[high] <= key) {
-                high--;
-            }
-            input[low] = input[high];
-            indices[low] = indices[high];
-            while (low < high && input[low] >= key) {
-                low++;
-            }
-            input[high] = input[low];
-            indices[high] = indices[low];
-        }
-        input[low] = key;
-        indices[low] = key_index;
-        quick_sort_indice_inverse(input, left, low - 1, indices);
-        quick_sort_indice_inverse(input, low + 1, right, indices);
-    }
-    return low;
-}
-
-static float sigmoid(float x) {
-    return 1.0 / (1.0 + expf(-x));
-}
-
 static float unsigmoid(float y) {
     return -1.0 * logf((1.0 / y) - 1.0);
-}
-
-inline static int32_t __clip(float val, float min, float max) {
-    float f = val <= min ? min : (val >= max ? max : val);
-    return f;
-}
-
-static int8_t qnt_f32_to_affine(float f32, int32_t zp, float scale) {
-    float dst_val = (f32 / scale) + zp;
-    int8_t res = (int8_t)__clip(dst_val, -128, 127);
-    return res;
 }
 
 static uint8_t qnt_f32_to_affine_u8(float f32, int32_t zp, float scale) {
@@ -409,9 +354,6 @@ static uint8_t qnt_f32_to_affine_u8(float f32, int32_t zp, float scale) {
     return res;
 }
 
-static float deqnt_affine_to_f32(int8_t qnt, int32_t zp, float scale) {
-    return ((float)qnt - (float)zp) * scale;
-}
 static float deqnt_affine_u8_to_f32(uint8_t qnt, int32_t zp, float scale) {
     return ((float)qnt - (float)zp) * scale;
 }
@@ -446,7 +388,7 @@ static int process_i8(int8_t *input, int8_t *angle_feature, int grid_h, int grid
         for (int w = 0; w < grid_w; w++) {
             for (int a = 0; a < class_num; a++) {
                 if(input[(input_loc_len + a)*grid_w * grid_h + h * grid_w + w ] >= thres_i8) {
-                    float box_conf_f32 = sigmoid(deqnt_affine_to_f32(input[(input_loc_len + a) * grid_w * grid_h + h * grid_w + w ],
+                    float box_conf_f32 = sigmoidf(deqnt_affine_to_f32(input[(input_loc_len + a) * grid_w * grid_h + h * grid_w + w ],
                                                  zp, scale));
                     float loc[input_loc_len];
                     for (int i = 0; i < input_loc_len; ++i) {
@@ -513,7 +455,7 @@ static int process_i8(int8_t *input, int8_t *angle_feature, int grid_h, int grid
         for (int w = 0; w < grid_w; w++) {
             for (int a = 0; a < class_num; a++) {
                 if(input[(input_loc_len + a)*grid_w * grid_h + h * grid_w + w ] >= thres_i8) {
-                    float box_conf_f32 = sigmoid(deqnt_affine_u8_to_f32(input[(input_loc_len + a) * grid_w * grid_h + h * grid_w + w ],
+                    float box_conf_f32 = sigmoidf(deqnt_affine_u8_to_f32(input[(input_loc_len + a) * grid_w * grid_h + h * grid_w + w ],
                                                  zp, scale));
                     float loc[input_loc_len];
                     for (int i = 0; i < input_loc_len; ++i) {

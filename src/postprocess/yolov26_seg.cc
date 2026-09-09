@@ -18,19 +18,8 @@
 
 namespace {
 
-static inline float y26s_at(const void* tensor, int type, int idx) {
-    switch (type) {
-        case 0:  // int8
-            return static_cast<float>(static_cast<const int8_t*>(tensor)[idx]);
-        case 1:  // fp16
-            return fp16_to_float(static_cast<const uint16_t*>(tensor)[idx]);
-        default:  // fp32
-            return static_cast<const float*>(tensor)[idx];
-    }
-}
-
 // 每尺度解码：ch0-3 box 直接距离，ch4..4+class_num-1 cls logit，ch4+class_num.. mask 系数
-static int process_y26_seg_scale(const void* tensor, int ttype, int32_t zp, float scale,
+static int process_y26_seg_scale(const void* tensor, Y26TensorType ttype, int32_t zp, float scale,
                                  bool nhwc, int grid_h, int grid_w, int stride,
                                  int class_num, int mask_dim, float logit_threshold, bool cls_sigmoided,
                                  std::vector<float>& boxes, std::vector<float>& scores,
@@ -44,10 +33,10 @@ static int process_y26_seg_scale(const void* tensor, int ttype, int32_t zp, floa
 
     auto read_ch = [&](int ci, int off) -> float {
         const int idx = nhwc ? off * channels + ci : ci * grid_len + off;
-        if (ttype == 0) {
+        if (ttype == Y26TensorType::kInt8) {
             return (static_cast<const int8_t*>(tensor)[idx] - zp) * scale;
         }
-        return y26s_at(tensor, ttype, idx);
+        return y26_tensor_at(tensor, ttype, idx);
     };
 
     for (int i = 0; i < grid_h; ++i) {
@@ -56,7 +45,7 @@ static int process_y26_seg_scale(const void* tensor, int ttype, int32_t zp, floa
             int bestc = -1;
             float best_logit = -1e9f;
 
-            if (ttype == 0) {
+            if (ttype == Y26TensorType::kInt8) {
                 const int8_t* qptr = static_cast<const int8_t*>(tensor);
                 int8_t max_q = -128;
                 for (int c = 0; c < class_num; ++c) {
@@ -68,7 +57,7 @@ static int process_y26_seg_scale(const void* tensor, int ttype, int32_t zp, floa
                 best_logit = (max_q - zp) * scale;
             } else {
                 for (int c = 0; c < class_num; ++c) {
-                    const float v = y26s_at(tensor, ttype, nhwc ? off * channels + cls_start + c
+                    const float v = y26_tensor_at(tensor, ttype, nhwc ? off * channels + cls_start + c
                                                                 : (cls_start + c) * grid_len + off);
                     if (v > best_logit) { best_logit = v; bestc = c; }
                 }
@@ -202,14 +191,7 @@ int post_process_yolov26_seg(rknn_app_context_t* app_ctx, void* outputs, letterb
     const bool cls_sigmoided = (app_ctx->cls_is_sigmoided == 1);
 
     // 置信度阈值：已 sigmoid → 概率域直接用 conf；logits → 转 logit 域 ln(conf/(1-conf))
-    float logit_thr;
-    if (cls_sigmoided) {
-        logit_thr = conf_threshold;
-    } else {
-        if (conf_threshold <= 0.0f) logit_thr = -1e9f;
-        else if (conf_threshold >= 1.0f) logit_thr = 1e9f;
-        else logit_thr = logf(conf_threshold / (1.0f - conf_threshold));
-    }
+    const float logit_thr = y26_conf_to_logit_threshold(cls_sigmoided, conf_threshold);
 
     for (int i = 0; i < proto_index; ++i) {
         const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
@@ -221,16 +203,7 @@ int post_process_yolov26_seg(rknn_app_context_t* app_ctx, void* outputs, letterb
         const int cur_mask_dim = std::min(channels - 4 - class_count, mask_dim);
         if (cur_mask_dim <= 0) continue;
         const int stride = model_in_h / grid_h;
-        int ttype;
-        if (!app_ctx->is_quant) {
-            ttype = 2;  // fp32（runtime want_float 已转换）
-        } else {
-            switch (attr.type) {
-                case RKNN_TENSOR_INT8: ttype = 0; break;
-                case RKNN_TENSOR_FLOAT16: ttype = 1; break;
-                default: ttype = 2; break;
-            }
-        }
+        const Y26TensorType ttype = y26_tensor_type_from_attr(app_ctx->is_quant, attr.type);
         process_y26_seg_scale(_outputs[i].buf, ttype, attr.zp, attr.scale, nhwc,
                               grid_h, grid_w, stride, class_count, cur_mask_dim, logit_thr, cls_sigmoided,
                               boxes, scores, classIds, maskCoeffs);
@@ -254,10 +227,6 @@ int post_process_yolov26_seg(rknn_app_context_t* app_ctx, void* outputs, letterb
 
     const int crop_left = letter_box ? letter_box->crop_x : 0;
     const int crop_top = letter_box ? letter_box->crop_y : 0;
-    const int crop_w = letter_box ? letter_box->crop_w : model_in_w;
-    const int crop_h = letter_box ? letter_box->crop_h : model_in_h;
-    const int crop_right = crop_left + std::max(1, crop_w);
-    const int crop_bottom = crop_top + std::max(1, crop_h);
 
     // 掩膜有效区（去掉 letterbox 黑边）
     cv::Rect valid_rect_mask(0, 0, 0, 0);
@@ -284,19 +253,17 @@ int post_process_yolov26_seg(rknn_app_context_t* app_ctx, void* outputs, letterb
         ++mask_kept;
 
         const int n = nms_order[i];
-        const float x1 = boxes[n * 4 + 0] - letter_box->x_pad;
-        const float y1 = boxes[n * 4 + 1] - letter_box->y_pad;
+        const float x1 = boxes[n * 4 + 0];
+        const float y1 = boxes[n * 4 + 1];
         const float x2 = x1 + boxes[n * 4 + 2];
         const float y2 = y1 + boxes[n * 4 + 3];
 
-        const int left = static_cast<int>(clamp(x1, 0, model_in_w) / letter_box->scale) + crop_left;
-        const int top = static_cast<int>(clamp(y1, 0, model_in_h) / letter_box->scale) + crop_top;
-        const int right = static_cast<int>(clamp(x2, 0, model_in_w) / letter_box->scale) + crop_left;
-        const int bottom = static_cast<int>(clamp(y2, 0, model_in_h) / letter_box->scale) + crop_top;
-        const int box_left = clamp(left, crop_left, crop_right);
-        const int box_top = clamp(top, crop_top, crop_bottom);
-        const int box_right = clamp(right, crop_left, crop_right);
-        const int box_bottom = clamp(bottom, crop_top, crop_bottom);
+        image_rect_t mapped{};
+        map_box_to_frame(x1, y1, x2, y2, letter_box, model_in_w, model_in_h, &mapped);
+        const int box_left = mapped.left;
+        const int box_top = mapped.top;
+        const int box_right = mapped.right;
+        const int box_bottom = mapped.bottom;
         if (box_right <= box_left || box_bottom <= box_top) continue;
 
         seg_results->boxes.emplace_back(cv::Rect(cv::Point(box_left, box_top), cv::Point(box_right, box_bottom)));

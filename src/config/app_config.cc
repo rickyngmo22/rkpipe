@@ -96,10 +96,6 @@ bool AppConfig::loadFromFile(const std::string& filename) {
     config_path = filename;
 
     readStringFromAnyKey(fs, {"model_path"}, model_path);
-    readStringFromAnyKey(fs, {"aux_model_path", "aux_model"}, aux_model_path);
-    readStringFromAnyKey(fs, {"aux_task"}, aux_task);
-    readStringFromAnyKey(fs, {"person_model_path", "person_model"}, person_model_path);
-    readStringFromAnyKey(fs, {"rtmpose_head_path", "head_model_path"}, rtmpose_head_path);
     readStringFromAnyKey(fs, {"input_path"}, input_path);
     // 非空时逐帧导出检测结果 JSONL(同 --dump-detections),供 C ABI 门面路径离线评测
     readStringFromAnyKey(fs, {"dump_detections_path", "dump_detections"}, dump_detections_path);
@@ -134,11 +130,6 @@ bool AppConfig::loadFromFile(const std::string& filename) {
     readDoubleFromAnyKey(fs, {"web_preview_scale"}, web_preview_scale);
     readIntFromAnyKey(fs, {"npu_core_mask"}, npu_core_mask);
     readIntFromAnyKey(fs, {"npu_core_start"}, npu_core_start);
-    readIntFromAnyKey(fs, {"rtmpose_det_core"}, rtmpose_det_core);
-    readStringFromAnyKey(fs, {"rtmpose_pose_cores"}, rtmpose_pose_cores);
-    readFloatFromAnyKey(fs, {"rtmpose_target_fps"}, rtmpose_target_fps);
-    readIntFromAnyKey(fs, {"rtmpose_stage2_threads"}, rtmpose_stage2_threads);
-    readFloatFromAnyKey(fs, {"rtmpose_box_pad"}, rtmpose_box_pad);
     readIntFromAnyKey(fs, {"drop_frames_on_overflow"}, drop_frames_on_overflow);
     readStringFromAnyKey(fs, {"roi"}, roi);
     readStringFromAnyKey(fs, {"mask_classes"}, mask_classes);
@@ -168,12 +159,6 @@ bool AppConfig::loadFromFile(const std::string& filename) {
     readStringFromAnyKey(fs, {"alert_dedup_state_dir"}, alert_dedup_state_dir);
     readDoubleFromAnyKey(fs, {"snapshot_interval_s", "snapshot_interval"}, snapshot_interval_s);
     readStringFromAnyKey(fs, {"snapshot_dir"}, snapshot_dir);
-    // D3 检测+单目测距（需 aux_task=depth）
-    readBoolFromAnyKey(fs, {"depth_dist_text"}, depth_dist_text);
-    readFloatFromAnyKey(fs, {"depth_dist_near_m", "depth_dist_near"}, depth_dist_near_m);
-    readFloatFromAnyKey(fs, {"depth_dist_scale"}, depth_dist_scale);
-    readStringFromAnyKey(fs, {"detect3d_p2"}, detect3d_p2);
-    readFloatFromAnyKey(fs, {"detect3d_depth_scale"}, detect3d_depth_scale);
     // 事件规则引擎（D1/D2）
     readStringFromAnyKey(fs, {"event_region"}, event_region);
     readStringFromAnyKey(fs, {"event_line"}, event_line);
@@ -209,47 +194,6 @@ bool AppConfig::validate(std::string* error_message) const {
     if (model_path.empty()) {
         if (error_message) {
             *error_message = "Error: --model is required argument (or via config file)";
-        }
-        return false;
-    }
-    // rtmpose 两阶段：person_model_path 为第一阶段人体检测模型，必填
-    {
-        std::string lower_task = task;
-        for (auto& ch : lower_task) {
-            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        }
-        if (lower_task == "rtmpose" && person_model_path.empty()) {
-            if (error_message) {
-                *error_message =
-                    "Error: task=rtmpose requires person_model_path (stage-1 person detection model)";
-            }
-            return false;
-        }
-    }
-    if (!aux_model_path.empty()) {
-        std::string aux = aux_task;
-        for (auto& ch : aux) {
-            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        }
-        const bool aux_ok = aux == "detect" || aux == "pose" || aux == "obb" ||
-                            aux == "seg" || aux == "depth" || aux == "sem" || aux == "ocr_det";
-        if (!aux_ok) {
-            if (error_message) {
-                *error_message =
-                    "Error: --aux-task must be one of detect/pose/obb/seg/depth/sem/ocr_det";
-            }
-            return false;
-        }
-    }
-    if (depth_dist_near_m < 0.0f) {
-        if (error_message) {
-            *error_message = "Error: depth_dist_near_m must be >= 0 (meters, 0=off)";
-        }
-        return false;
-    }
-    if (depth_dist_scale <= 0.0f) {
-        if (error_message) {
-            *error_message = "Error: depth_dist_scale must be > 0";
         }
         return false;
     }
@@ -405,15 +349,6 @@ void AppConfig::printSummary() const {
     std::printf("  output_backend: %s\n", output_backend.c_str());
     std::printf("  output_video_path: %s\n", output_video_path.empty() ? "<empty>" : output_video_path.c_str());
     std::printf("  task: %s\n", task.c_str());
-    std::printf("  aux_task: %s\n", aux_model_path.empty() ? "<disabled>" : aux_task.c_str());
-    std::printf("  aux_model_path: %s\n", aux_model_path.empty() ? "<empty>" : aux_model_path.c_str());
-    std::printf("  person_model_path: %s\n", person_model_path.empty() ? "<empty>" : person_model_path.c_str());
-    std::printf("  rtmpose_head_path: %s\n", rtmpose_head_path.empty() ? "<empty>" : rtmpose_head_path.c_str());
-    std::printf("  depth_dist_text: %d\n", depth_dist_text ? 1 : 0);
-    std::printf("  depth_dist_near_m: %.2f\n", depth_dist_near_m);
-    std::printf("  depth_dist_scale: %.3f\n", depth_dist_scale);
-    std::printf("  detect3d_p2: %s\n", detect3d_p2.empty() ? "<empty>" : "configured");
-    std::printf("  detect3d_depth_scale: %.3f\n", detect3d_depth_scale);
     std::printf("  event_region: %s\n", event_region.empty() ? "<empty>" : event_region.c_str());
     std::printf("  event_line: %s\n", event_line.empty() ? "<empty>" : event_line.c_str());
     std::printf("  event_classes: %s\n", event_classes.empty() ? "<all>" : event_classes.c_str());
@@ -532,13 +467,6 @@ void AppConfig::warnConflicts() const {
     if (web_preview && web_preview_mode == "live" && !input_path.empty() && !isStreamLikeInput(input_path)) {
         warn("conflict-live-file", "web_preview_mode=live 用于实时流；当前输入像本地文件，replay 模式通常更合适");
     }
-    if ((depth_dist_text || depth_dist_near_m > 0.0f) &&
-        (aux_model_path.empty() || lowerAscii(aux_task) != "depth")) {
-        warn("conflict-depth-dist",
-             "depth_dist_text/depth_dist_near_m 需要 aux_model_path + aux_task=depth 的辅助模型；"
-             "当前未启用 depth 辅助任务，距离标注与近距告警不会生效");
-    }
-
     if (any_warning) {
         std::printf("--------------------------------------------------------------------------------\n");
     }
@@ -550,14 +478,6 @@ void AppConfig::printUsage(const char* program_name) {
     std::printf("  --model <path>       Path to model file\n");
     std::printf("  --input/--video <path> Path to input video\n");
     std::printf("  --output-video <path> Path to output video\n");
-    std::printf("  --task <detect/pose/obb/seg/ocr_det/depth/sem/detect3d/rtmpose> Detection task type\n");
-    std::printf("  --person-model <path> Stage-1 person detection model for task=rtmpose\n");
-    std::printf("  --rtmpose-head <path> Split-deploy head model for task=rtmpose (model_path=feat)\n");
-    std::printf("  --aux-model <path>  Auxiliary model for multi-task combo (detect+depth/pose etc., Y5)\n");
-    std::printf("  --aux-task <task>   Auxiliary task type (default: detect)\n");
-    std::printf("  --depth-dist-text   Annotate estimated distance (m) per box (requires --aux-task depth)\n");
-    std::printf("  --depth-dist-near <m>   Near-distance threshold in meters: red box + near_distance alert (0=off)\n");
-    std::printf("  --depth-dist-scale <f>  Distance calibration factor, applied to model output (default 1.0)\n");
     std::printf("  --dump-detections <file> Export per-frame detect results as JSONL (COCO mAP eval)\n");
     std::printf("  --mode <sequential/pipeline> Processing mode\n");
     std::printf("  --threads <num>      Number of processing threads (default: 4)\n");
@@ -640,13 +560,6 @@ AppConfig AppConfig::fromCommandLine(int argc, char** argv) {
         {"track-max-tracks", required_argument, 0, 'T'},
         {"track-algorithm", required_argument, 0, 'A'},
         {"disable-count-overlay", no_argument, 0, 'Q'},
-        {"aux-model", required_argument, 0, 1000},
-        {"aux-task", required_argument, 0, 1001},
-        {"person-model", required_argument, 0, 1005},
-        {"rtmpose-head", required_argument, 0, 1006},
-        {"depth-dist-text", no_argument, 0, 1002},
-        {"depth-dist-near", required_argument, 0, 1003},
-        {"depth-dist-scale", required_argument, 0, 1004},
         {"dump-detections", required_argument, 0, 1007},
         {0, 0, 0, 0}
     };
@@ -666,27 +579,6 @@ AppConfig AppConfig::fromCommandLine(int argc, char** argv) {
                 break;
             case 't':
                 config.task = optarg;
-                break;
-            case 1000:
-                config.aux_model_path = optarg;
-                break;
-            case 1001:
-                config.aux_task = optarg;
-                break;
-            case 1005:
-                config.person_model_path = optarg;
-                break;
-            case 1006:
-                config.rtmpose_head_path = optarg;
-                break;
-            case 1002:
-                config.depth_dist_text = true;
-                break;
-            case 1003:
-                config.depth_dist_near_m = std::stof(optarg);
-                break;
-            case 1004:
-                config.depth_dist_scale = std::stof(optarg);
                 break;
             case 1007:
                 config.dump_detections_path = optarg;

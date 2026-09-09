@@ -42,7 +42,11 @@ typedef enum {
 /* 事件类型；payload_json 为对应 JSON 文本 */
 typedef enum {
     RK_PIPE_EVENT_STARTED = 0,   /* 流水线已启动：{"task":"detect","mode":"pipeline"} */
-    RK_PIPE_EVENT_RESULT = 1,    /* 逐帧结构化结果（v0.2 预留，暂不触发） */
+    RK_PIPE_EVENT_RESULT = 1,    /* 逐帧结构化结果：payload 为 schema v1 JSON（字段定义见
+                                    docs/event_payload.md）。当前版本预留不触发：获取逐帧结果
+                                    请先用环境变量 RK_PIPE_RESULT_JSONL=<file> 落盘同格式
+                                    JSONL；事件下发需配套核心库 Release（闭源门面逐帧调用
+                                    开源序列化器 buildFrameResultJson 后回调） */
     RK_PIPE_EVENT_COMPLETED = 2, /* 自然结束：{"exit_code":0} */
     RK_PIPE_EVENT_ERROR = 3      /* 运行错误：{"error":"..."} */
 } rkpipe_event_t;

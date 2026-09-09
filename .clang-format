@@ -1,0 +1,14 @@
+# rkpipe C/C++ 代码格式约定
+# 应用: clang-format -i <file> (LLVM 14+)
+# 说明: 存量代码以 4 空格缩进、约 100 列为主;新代码请保持一致或先跑本配置。
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 100
+UseTab: Never
+AccessModifierOffset: -4
+PointerAlignment: Right
+DerivePointerAlignment: false
+SortIncludes: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false

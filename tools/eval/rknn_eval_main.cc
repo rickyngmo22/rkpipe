@@ -213,6 +213,21 @@ static std::string read_file(const std::string& p) {
     ss << f.rdbuf();
     return ss.str();
 }
+// 流式查找文本 token（标注 JSON 可达数百 MB，不全量载入内存）
+static bool file_contains_token(const std::string& path, const std::string& token) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    const size_t keep = token.size() - 1;
+    std::string buf(keep, '\0');
+    std::vector<char> chunk(1 << 20);
+    while (f.read(chunk.data(), chunk.size()) || f.gcount() > 0) {
+        size_t n = static_cast<size_t>(f.gcount());
+        std::string window = buf + std::string(chunk.data(), n);
+        if (window.find(token) != std::string::npos) return true;
+        buf = window.substr(window.size() - keep);
+    }
+    return false;
+}
 static std::string exec_capture(const std::string& cmd) {
     std::string out;
     FILE* fp = ::popen(cmd.c_str(), "r");
@@ -292,6 +307,7 @@ static const TaskSpec& task_spec(Task t) {
 struct Config {
     Task task = Task::Detect;
     Dataset dataset = Dataset::Coco;
+    std::string task_str;        // 透传给推理器的 task 字符串
     std::string model;
     std::string images;
     std::string ann;
@@ -311,6 +327,10 @@ struct Config {
     double assert_ap50 = -1.0;
     std::string reuse_dump;      // 跳过主模型推理，直接用已有 dump 评测
     std::string vis_dir;         // 非空时：渲染主模型检测结果图（单图即"开图出图"）
+    int vis_sample = 0;          // >0 时可视化抽帧（每 N 帧渲 1 张），0=全渲
+    bool preview = false;        // 推理时打开引擎 Web MJPEG 预览（带叠加，不影响 dump 正确性）
+    int preview_port = 8090;     // 预览端口（--compare 串行复用）
+    bool dump_only = false;      // 只推理导出 dump+metrics，跳过评测/报告（远程模式用）
     bool dry_run = false;
     std::string scripts_dir;
 };
@@ -351,6 +371,10 @@ static void usage_and_exit() {
         "  --assert-ap50 X       CI 断言: AP50 x100 >= X\n"
         "  --reuse-dump FILE     跳过推理，直接评测已有 dump\n"
         "  --vis-dir DIR         渲染主模型检测结果图到该目录（单图输入 = 开图出图）\n"
+        "  --vis-sample N        可视化抽帧：每 N 帧渲 1 张（0=全渲，默认 0）\n"
+        "  --preview             推理时打开板端 Web MJPEG 实时预览（带叠加，不影响 dump）\n"
+        "  --preview-port N      预览端口（默认 8090；--compare 串行复用）\n"
+        "  --dump-only           只推理导出 dump+metrics，跳过评测/报告（远程模式用）\n"
         "  --out-dir DIR         产物目录（默认 eval_runs）\n"
         "  --name STR            主模型 tag（默认模型文件名主干）\n"
         "  --config FILE         key=value 配置文件（# 注释；CLI 参数覆盖）\n"
@@ -359,7 +383,7 @@ static void usage_and_exit() {
     std::exit(0);
 }
 
-static Task parse_task(const std::string& s) {
+static Task parse_task(const std::string& s, std::string* task_str_out = nullptr) {
     if (s == "detect") return Task::Detect;
     if (s == "pose") return Task::Pose;
     if (s == "seg") return Task::Seg;
@@ -380,7 +404,11 @@ static std::vector<std::string> split_csv(const std::string& s) {
 }
 
 static void apply_arg(Config& cfg, const std::string& k, const std::string& v) {
-    if (k == "task") cfg.task = parse_task(v);
+    if (k == "task") {
+        cfg.task_str.clear();
+        cfg.task = parse_task(v, &cfg.task_str);
+        if (cfg.task_str.empty()) cfg.task_str = v;  // 常规任务也记录（pose/detect/...）
+    }
     else if (k == "dataset") cfg.dataset = (v == "dota") ? Dataset::Dota : Dataset::Coco;
     else if (k == "model") cfg.model = v;
     else if (k == "images") cfg.images = v;
@@ -411,12 +439,23 @@ static void apply_arg(Config& cfg, const std::string& k, const std::string& v) {
     else if (k == "assert-ap50" || k == "assert_ap50") cfg.assert_ap50 = std::atof(v.c_str());
     else if (k == "reuse-dump" || k == "reuse_dump") cfg.reuse_dump = v;
     else if (k == "vis-dir" || k == "vis_dir") cfg.vis_dir = v;
+    else if (k == "vis-sample" || k == "vis_sample") cfg.vis_sample = std::atoi(v.c_str());
+    else if (k == "preview") cfg.preview = (v == "1" || v == "true");
+    else if (k == "preview-port" || k == "preview_port") cfg.preview_port = std::atoi(v.c_str());
+    else if (k == "dump-only" || k == "dump_only") cfg.dump_only = (v == "1" || v == "true");
     else if (k == "scripts-dir" || k == "scripts_dir") cfg.scripts_dir = v;
     else if (k == "dry-run" || k == "dry_run") cfg.dry_run = (v == "1" || v == "true");
     else {
         std::fprintf(stderr, "[rknn_eval] 未知参数: --%s\n", k.c_str());
         std::exit(2);
     }
+}
+
+// 无值开关（出现即置 "1"），不消费下一个 argv
+static bool is_valueless_flag(const std::string& k) {
+    return k == "dry-run" || k == "dry_run" ||
+           k == "dump-only" || k == "dump_only" ||
+           k == "preview";
 }
 
 static Config parse_args(int argc, char** argv) {
@@ -433,7 +472,7 @@ static Config parse_args(int argc, char** argv) {
         auto eq = body.find('=');
         if (eq != std::string::npos) {
             args.emplace_back(body.substr(0, eq), body.substr(eq + 1));
-        } else if (body == "dry-run" || body == "dry_run") {
+        } else if (is_valueless_flag(body)) {
             args.emplace_back(body, "1");  // 无值开关
         } else {
             if (i + 1 >= argc) { std::fprintf(stderr, "[rknn_eval] --%s 缺值\n", body.c_str()); std::exit(2); }
@@ -490,7 +529,8 @@ static bool run_inference(const Config& cfg, const std::string& model,
         std::string y = "%YAML:1.0\n---\n";
         y += "model_path: \"" + model + "\"\n";
         y += "input_path: \"" + cfg.images + "\"\n";
-        y += std::string("task: \"") + task_spec(cfg.task).name + "\"\n";
+        y += std::string("task: \"") +
+             (cfg.task_str.empty() ? task_spec(cfg.task).name : cfg.task_str) + "\"\n";
         y += "mode: \"pipeline\"\n";
         y += "thread_count: " + std::to_string(cfg.threads) + "\n";
         y += "label_path: \"" + cfg.label + "\"\n";
@@ -503,7 +543,12 @@ static bool run_inference(const Config& cfg, const std::string& model,
         y += "nms_threshold: " + std::string(nms_buf) + "\n";
         // 评测口径：关闭一切输出/追踪（配置缺省即关，显式声明防漂移）
         y += "output_video_path: \"\"\n";
-        y += "web_preview: 0\n";
+        y += std::string("web_preview: ") + (cfg.preview ? "1" : "0") + "\n";
+        if (cfg.preview) {
+            // 实时预览：MJPEG 带叠加渲染；dump 在叠加之前写，不影响评测正确性
+            y += "web_preview_bind: \"0.0.0.0\"\n";
+            y += "web_preview_port: " + std::to_string(cfg.preview_port) + "\n";
+        }
         y += "enable_tracking: 0\n";
         std::ofstream f(yaml_path);
         if (!f) {
@@ -662,14 +707,73 @@ static std::string det_tag(const std::vector<std::string>& names, int cls, doubl
 }
 
 static void render_vis(const Config& cfg, const TaskSpec& spec, const std::string& dump,
-                       const std::string& vis_dir) {
+                       const std::string& vis_dir, int vis_sample) {
     mkdirs(vis_dir);
     std::vector<std::string> names = load_label_names(cfg.label);
-    std::ifstream f(dump);
-    std::string line;
+
+    // ---- 选帧 ----
+    // pose 任务优先渲"有人"的图：单人/多人交替覆盖，无人帧兜底补齐，
+    // 输出密度与原 every-N 抽帧一致；其余任务保持固定间隔抽帧。
+    struct FrameRef { std::streamoff off; int cnt; };
+    std::vector<FrameRef> refs;  // 全部有效帧（按文件顺序）
+    if (spec.task == Task::Pose) {
+        std::ifstream fr(dump);
+        std::string ln;
+        while (std::getline(fr, ln)) {
+            if (ln.size() < 5 || ln.back() != '}') continue;
+            std::streamoff off = (std::streamoff)fr.tellg() -
+                                 (std::streamoff)ln.size() - 1;
+            int cnt = 0;
+            try {
+                JValue x = mini_json::parse(ln);
+                if (const JValue* arr = x.find("poses")) cnt = (int)arr->arr.size();
+            } catch (const std::exception&) {
+                continue;
+            }
+            refs.push_back({off, cnt});
+        }
+    }
+    std::vector<std::string> sel;  // 待渲染的 dump 行
+    if (spec.task == Task::Pose && vis_sample > 0) {
+        int target = (int)((refs.size() + vis_sample - 1) / vis_sample);
+        std::vector<FrameRef> one, multi, none;
+        for (auto& r : refs) {
+            if (r.cnt >= 2) multi.push_back(r);
+            else if (r.cnt == 1) one.push_back(r);
+            else none.push_back(r);
+        }
+        std::vector<FrameRef> pick;
+        size_t a = 0, b = 0, c = 0;
+        bool turn = true;  // 单人/多人交替
+        while ((int)pick.size() < target &&
+               (a < one.size() || b < multi.size() || c < none.size())) {
+            if (turn && a < one.size()) pick.push_back(one[a++]);
+            else if (!turn && b < multi.size()) pick.push_back(multi[b++]);
+            else if (a < one.size()) pick.push_back(one[a++]);
+            else if (b < multi.size()) pick.push_back(multi[b++]);
+            else if (c < none.size()) pick.push_back(none[c++]);
+            turn = !turn;
+        }
+        std::ifstream fr(dump);
+        for (auto& p : pick) {
+            std::string ln;
+            fr.seekg(p.off);
+            if (std::getline(fr, ln)) sel.push_back(ln);
+        }
+    } else {
+        std::ifstream fr(dump);
+        std::string ln;
+        int frame_no = -1;
+        while (std::getline(fr, ln)) {
+            ++frame_no;
+            if (vis_sample > 0 && (frame_no % vis_sample) != 0) continue;
+            if (ln.size() < 5 || ln.back() != '}') continue;
+            sel.push_back(ln);
+        }
+    }
+
     int rendered = 0;
-    while (std::getline(f, line)) {
-        if (line.size() < 5 || line.back() != '}') continue;  // 跳过截断尾行
+    for (const auto& line : sel) {
         JValue fr;
         try {
             fr = mini_json::parse(line);
@@ -827,7 +931,7 @@ static double metric_value(const JValue& s, Task task, const std::string& col) {
 
 static void write_report(const Config& cfg, const TaskSpec& spec,
                          const std::vector<RunResult>& runs, const std::string& path) {
-    std::ostringstream md, tex;
+    std::ostringstream md;
     time_t now = ::time(nullptr);
     char tbuf[64];
     strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", localtime(&now));
@@ -903,28 +1007,8 @@ static void write_report(const Config& cfg, const TaskSpec& spec,
     }
     md << "- 导出: 每帧检测/关键点/掩膜经后处理逆映射回原图坐标后落盘\n";
 
-    // LaTeX 主表
-    tex << "\\begin{table}[t]\n\\centering\n\\caption{"
-        << spec.name << " on RK3588 (" << tbuf << ").}\n"
-        << "\\label{tab:rknn_eval}\n"
-        << "\\begin{tabular}{l" << std::string(spec.cols.size(), 'c') << "}\n\\toprule\n"
-        << "Model & ";
-    for (size_t i = 0; i < spec.cols.size(); ++i) {
-        tex << spec.cols[i] << (i + 1 < spec.cols.size() ? " & " : " \\\\\n");
-    }
-    tex << "\\midrule\n";
-    for (auto& r : runs) {
-        tex << r.tag << " & ";
-        for (size_t i = 0; i < spec.cols.size(); ++i) {
-            const std::string& c = spec.cols[i];
-            tex << (c == "FPS" ? fmt_fps(r.fps) : fmt1(metric_value(r.summary, cfg.task, c)))
-                << (i + 1 < spec.cols.size() ? " & " : " \\\\\n");
-        }
-    }
-    tex << "\\bottomrule\n\\end{tabular}\n\\end{table}\n";
-
     std::ofstream f(path);
-    f << md.str() << "\n## LaTeX\n\n```tex\n" << tex.str() << "```\n";
+    f << md.str() << "\n";
 }
 
 static void write_summary_json(const Config& cfg, const TaskSpec& spec,
@@ -972,27 +1056,42 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[rknn_eval] 模型不存在: %s\n", cfg.model.c_str());
         return 2;
     }
-    if (!cfg.images.empty() && cfg.images.find('/') == std::string::npos) {
+    // 只有需要推理时才强制 images 含 '/'；--reuse-dump 模式可省略
+    if (!cfg.reuse_dump.empty() && cfg.images.empty()) {
+        // reuse 模式不推理：images 仅用于报告展示，可缺省
+    } else if (!cfg.images.empty() && cfg.images.find('/') == std::string::npos) {
         std::fprintf(stderr, "[rknn_eval] --images 路径必须包含 '/'（输入源把无斜杠路径当单文件）: %s\n",
                      cfg.images.c_str());
         return 2;
+    } else if (cfg.images.empty()) {
+        std::fprintf(stderr, "[rknn_eval] 需要 --images（图片目录，须含 '/'）\n");
+        return 2;
     }
-    if (cfg.task != Task::Obb) {
+    if (cfg.dump_only) {
+        // 远程模式：标注/评测脚本在 PC 端，板端只推理导出
+    } else if (cfg.task != Task::Obb) {
         if (cfg.ann.empty() || !file_exists(cfg.ann)) {
             std::fprintf(stderr, "[rknn_eval] --ann 不存在: %s\n", cfg.ann.c_str());
             return 2;
         }
-        if (cfg.task == Task::Pose && cfg.ann.find("person_keypoints") == std::string::npos) {
-            std::fprintf(stderr, "[rknn_eval] pose 任务必须用 person_keypoints_val2017.json（当前: %s）\n",
-                         cfg.ann.c_str());
-            return 2;
+        if (cfg.task == Task::Pose) {
+            // 内容校验而非文件名：COCO 关键点标注的 annotation/category 带
+            // "keypoints" 字段，instances 标注没有；网页上传等流程可能把文件
+            // 存成 ann.json，按文件名判断会误伤合法标注。
+            if (!file_contains_token(cfg.ann, "\"keypoints\"")) {
+                std::fprintf(stderr,
+                             "[rknn_eval] pose 任务的标注不含 keypoints 字段（%s）——"
+                             "请用 person_keypoints 类 COCO 标注，而不是 instances 标注\n",
+                             cfg.ann.c_str());
+                return 2;
+            }
         }
     } else if (cfg.gt.empty() && cfg.dota_labels.empty()) {
         std::fprintf(stderr, "[rknn_eval] obb 需要 --gt <patches_gt.jsonl> 或 --dota-labels <labelTxt目录>\n");
         return 2;
     }
     std::string scripts = resolve_scripts_dir(cfg);
-    if (!file_exists(scripts + "/" + std::string(spec.evaluator))) {
+    if (!cfg.dump_only && !file_exists(scripts + "/" + std::string(spec.evaluator))) {
         std::fprintf(stderr, "[rknn_eval] 评测脚本缺失: %s/%s（可用 --scripts-dir 或 RK_EVAL_SCRIPTS 指定）\n",
                      scripts.c_str(), spec.evaluator);
         return 2;
@@ -1025,22 +1124,26 @@ int main(int argc, char** argv) {
 
     // ---- 逐模型：推理 + 评测 ----
     std::vector<RunResult> runs;
-    struct Job { std::string tag, model; };
+    struct Job { std::string tag, model, dump_override; };
     std::vector<Job> jobs;
     if (!cfg.reuse_dump.empty()) {
-        jobs.push_back({cfg.name, ""});
+        jobs.push_back({cfg.name, "", ""});
+        // --compare tag=dump:PATH：评测已拉回的 dump（远程模式 PC 端汇总），不推理
+        for (auto& [tag, m] : cfg.compare) {
+            if (m.rfind("dump:", 0) == 0) jobs.push_back({tag, "", m.substr(5)});
+        }
     } else {
-        jobs.push_back({cfg.name, cfg.model});
-        for (auto& [tag, m] : cfg.compare) jobs.push_back({tag, m});
+        jobs.push_back({cfg.name, cfg.model, ""});
+        for (auto& [tag, m] : cfg.compare) jobs.push_back({tag, m, ""});
     }
 
     for (auto& job : jobs) {
         RunResult r;
         r.tag = job.tag;
         r.model = job.model;
-        r.dump = cfg.reuse_dump.empty()
-                     ? cfg.out_dir + "/dump_" + job.tag + ".jsonl"
-                     : cfg.reuse_dump;
+        r.dump = !job.dump_override.empty() ? job.dump_override
+                 : !cfg.reuse_dump.empty()  ? cfg.reuse_dump
+                                            : cfg.out_dir + "/dump_" + job.tag + ".jsonl";
         r.summary_path = cfg.out_dir + "/summary_" + job.tag + ".json";
         std::string metrics = cfg.out_dir + "/metrics_" + job.tag + ".json";
         if (!cfg.reuse_dump.empty() || job.model.empty()) {
@@ -1065,6 +1168,13 @@ int main(int argc, char** argv) {
                 return 3;
             }
         }
+        if (cfg.dump_only) {
+            // 远程模式：只推理导出 dump+metrics，评测/报告由 PC 端完成
+            std::printf("[rknn_eval][dump-only] %s done: fps=%.1f infer=%.1fms dump=%s\n",
+                        job.tag.c_str(), r.fps, r.infer_ms, r.dump.c_str());
+            runs.push_back(std::move(r));
+            continue;
+        }
         std::printf("[rknn_eval] 评测: %s\n", job.tag.c_str());
         std::string log;
         if (!run_evaluator(cfg, spec, scripts, r.dump, r.summary_path, cfg.conf, &r.summary, &log)) {
@@ -1073,6 +1183,16 @@ int main(int argc, char** argv) {
         // 摘要行
         std::printf("[rknn_eval] %s done: fps=%.1f infer=%.1fms\n", job.tag.c_str(), r.fps, r.infer_ms);
         runs.push_back(std::move(r));
+    }
+
+    if (cfg.dump_only) {
+        // dump-only 也允许 --vis-dir（板端本地出图场景）
+        if (!cfg.vis_dir.empty()) {
+            render_vis(cfg, spec, runs[0].dump, cfg.vis_dir, cfg.vis_sample);
+        }
+        std::printf("\n[rknn_eval] dump-only 完成: %d 个模型导出于 %s\n",
+                    (int)runs.size(), cfg.out_dir.c_str());
+        return 0;
     }
 
     // ---- conf 扫描（主模型 dump 离线重评，不重推理）----
@@ -1105,9 +1225,9 @@ int main(int argc, char** argv) {
             thread_sweep.emplace_back(t, r.fps);
     }
 
-    // ---- 可视化（主模型 dump -> 检测结果图）----
+    // ---- 可视化（主模型 dump -> 检测结果图；vis-sample >0 时抽帧）----
     if (!cfg.vis_dir.empty()) {
-        render_vis(cfg, spec, runs[0].dump, cfg.vis_dir);
+        render_vis(cfg, spec, runs[0].dump, cfg.vis_dir, cfg.vis_sample);
     }
 
     // ---- 报告 ----

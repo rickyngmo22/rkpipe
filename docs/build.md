@@ -2,12 +2,14 @@
 
 ## 环境依赖(板端 RK3588,Debian/Ubuntu)
 
+构建要求 CMake ≥ 3.20。
+
 | 依赖 | 用途 | 安装 |
 |---|---|---|
 | OpenCV ≥ 4.5 | 图像处理/视频 IO | 系统包或 `-DOPENCV_ROOT=<prefix>` 指定自编前缀 |
 | libturbojpeg | Web 预览 JPEG 编码 | `apt install libturbojpeg0-dev` |
-| RGA (librga) | 零拷贝格式转换/缩放 | 系统自带 `rga` 头与库 |
-| rockchip-mpp | 视频编解码 | 系统自带 |
+| RGA (librga) | 零拷贝格式转换/缩放 | 板厂镜像一般自带;缺失时 `apt install librga-dev` |
+| rockchip-mpp | 视频编解码 | 板厂镜像一般自带;缺失时 `apt install librockchip-mpp-dev` |
 | FFmpeg (libav*) | 视频封装推流 | `apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev` |
 | RKNN Runtime | NPU 推理 | 本仓库 `3rdparty/rknn/`(librknnrt.so,遵循 Rockchip 许可) |
 
@@ -28,15 +30,14 @@ ctest --test-dir build-ci --output-on-failure
 
 ## 模型准备
 
-仓库不分发模型权重。以公开权重为起点:
+`model/` 已附带常用 YOLO 版本的板端模型(从公开权重经 `tools/convert/` 转换),示例配置可直接使用。需要换模型/量化版本时,以公开权重为起点自己转:
 
-1. 用 Ultralytics / 官方仓库导出 ONNX(检测头含解码或裸输出均可,见各 `convert_yolo26_*.py` 的注释);
-2. 按任务运行根目录转换脚本,例如:
-   - `python3 convert_yolo26_fp16.py --onnx yolo26n.onnx --out model/yolo26n.rknn`
-   - 量化版本参考 `convert_yolo26_cls_sigmoid_int8.py`(cls 输出 Sigmoid 收窄值域,保住 INT8 分数)
+1. 用 Ultralytics / 官方仓库导出 ONNX(检测头含解码或裸输出均可,见 `tools/convert/` 各脚本注释);
+2. 运行转换脚本(`tools/convert/`)。**脚本不含命令行参数**:运行前先编辑脚本头部的"按需修改"常量块(onnx 路径、输出名、量化 dataset 等),然后在脚本所在目录直接运行,例如:
+   - `python3 tools/convert/convert_yolo26_fp16.py`(FP16 转换)
+   - 量化版本参考 `tools/convert/convert_yolo26_cls_sigmoid_int8.py`(cls 输出 Sigmoid 收窄值域,保住 INT8 分数)
 3. 把得到的 `.rknn` 与 labels 文本路径填入示例配置。
 
-各脚本的 `--help` 与头部注释为权威说明;`tools/probes/` 下的探针程序用于在板上核对单模型输出,排查量化掉点问题时很好用。
 
 ## 示例素材
 
@@ -52,7 +53,7 @@ ffmpeg -f lavfi -i testsrc2=duration=30:size=1280x720:rate=30 video/demo.mp4
 
 也可以直接用摄像头(`input_path: "/dev/video0"`)、RTSP 地址或任意本地 mp4。
 
-**模型**:按上一节从公开权重转换,产物放到 `model/` 目录(与示例配置中的相对路径对应)。
+**模型**:已随仓库附带;换新模型时按上一节从公开权重转换,产物放到 `model/` 目录(与示例配置中的相对路径对应)。
 
 ## 模型精度/性能评测(rknn_eval)
 
@@ -79,4 +80,4 @@ target_link_libraries(myapp PRIVATE
     ${OpenCV_LIBS} rknnrt rga turbojpeg rockchip_mpp avformat avcodec avutil swscale)
 ```
 
-直接构建本仓库的 `rkpipe_cli` / `events_demo` 并抄 `examples/*/CMake` 片段是更快的起步方式。
+`console_detector` / `rknn_eval` 由仓库根目录的 `CMakeLists.txt` 统一构建,`console_detector` 的源码即最简的 C ABI 调用范例;给自有应用接入时,直接参考该源文件与上文的链接方式即可。

@@ -1,0 +1,13 @@
+# rknn_eval 多板注册表（Web 控制台与 run_eval.py 共用）
+# 用法：把本文件放在 rknn_eval_web.py 的启动目录（或 tools/eval/）。
+# 同一块板同时只跑一个评测任务（max_jobs 预留），不同板之间并行。
+
+boards:
+  - name: rk3588-01
+    ssh: user@192.168.1.101          # ssh 目标（需免密；示例）
+    eval_bin: ~/rkpipe/build/rknn_eval
+    model_dir: ~/rkpipe/model
+  # - name: rk3588-02
+  #   ssh: user@192.168.1.102
+  #   eval_bin: ~/rkpipe/build/rknn_eval
+  #   model_dir: ~/rkpipe/model
