@@ -166,11 +166,10 @@ overflow:auto;max-height:380px;border-radius:8px;margin:8px 0}
 .shots img{width:100%;border-radius:8px;border:1px solid var(--line);background:#000;
 min-height:110px;object-fit:contain}
 .shots img.empty{visibility:hidden}
-/* 实时画面：反代板端 MJPEG 长连接（/job/<id>/live.mjpg），浏览器原生滚动播放。
-   注意不能给这个 img 加 ?t= 破缓存（会断流重连），刷新靠流本身推帧。 */
-.live{width:100%;max-width:640px;border-radius:8px;border:1px solid var(--line);
-background:#000;display:block;margin:0 auto 10px;min-height:120px;object-fit:contain}
-.livehint{text-align:center;margin:-4px 0 10px}
+/* 推理画面只展示抽帧存档。板端 /stream.mjpg 是 100+ fps 的满速流（无节流），
+   直接嵌进 <img> 只能按到帧顺序狂刷、观感是"倍速快进"，所以不再嵌实时流：
+   由服务端常驻长连接抽帧落盘（stream_shots，每 SHOT_INTERVAL 秒 1 张），
+   页面轮询 shots_total 增量刷新。 */
 .pcmp{display:flex;gap:12px;flex-wrap:wrap}
 .pcol{flex:1;min-width:190px}
 .pcol img{width:100%;border-radius:8px;border:1px solid var(--line);background:#000;
@@ -717,14 +716,6 @@ def _preview_targets(job):
     if "--preview" in cmd:
         return [("", "8090", "")]
     return []
-
-
-def preview_port_of(job, tag=None):
-    """任务预览端口（反代 /job/<id>/live.mjpg 用）；tag 指定时取对比里的某个模型。"""
-    for t, port, _sub in _preview_targets(job):
-        if tag is None or t == tag:
-            return port
-    return ""
 
 
 PREVIEW_LAST = {}  # 快照目录 -> 上一帧 md5（同帧不重复落盘、不推进轮转位）
@@ -1871,41 +1862,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _proxy_mjpeg(self, port, path="/stream.mjpg"):
-        """把板端 MJPEG 长连接原样字节转发给浏览器（零缓冲、零解码、低延迟）。
-
-        板端 streamHeader 是 HTTP/1.1 + Connection: close + boundary=frame
-        （src/io/web_preview_server.cc:252-261），这里照搬——HTTP/1.0 下部分
-        浏览器不会滚动播放 multipart/x-mixed-replace。
-        这样 8081 页面对板端就是"一个长连接客户端"，正是驱动板端编码的条件。
-        """
-        url = "http://127.0.0.1:%s%s" % (port, path)
-        try:
-            resp = urllib.request.urlopen(url, timeout=10)
-        except Exception:
-            self._send(404, "preview stream not up", "text/plain")
-            return
-        self.close_connection = True
-        try:
-            self.wfile.write(
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY +
-                b"\r\nCache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
-                b"Pragma: no-cache\r\nConnection: close\r\n"
-                b"Access-Control-Allow-Origin: *\r\n\r\n")
-            while True:
-                chunk = resp.read(32768)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-        except Exception:
-            pass          # 用户关页面 / 任务结束 → BrokenPipe 等，静默收尾
-        finally:
-            try:
-                resp.close()
-            except Exception:
-                pass
-
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/":
@@ -2033,21 +1989,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, data, "image/jpeg")
             else:
                 self._send(404, "no preview", "text/plain")
-        elif u.path.startswith("/job/") and (u.path.endswith("/live.mjpg")
-                                             or "/live/" in u.path):
-            # 实时画面反代（同源，不受板 IP 变化影响）：
-            #   /job/<jid>/live.mjpg        → 单模型
-            #   /job/<jid>/live/<tag>.mjpg  → 并行对比按模型分列
-            parts = u.path.split("/")
-            tag = None
-            if len(parts) == 5 and parts[3] == "live" and parts[4].endswith(".mjpg"):
-                tag = parts[4][:-5]
-            port = preview_port_of(JOBS[parts[2]], tag) if len(parts) >= 4 \
-                and JOBS.get(parts[2]) else ""
-            if port:
-                self._proxy_mjpeg(port)
-            else:
-                self._send(404, "no live stream", "text/plain")
         elif u.path.startswith("/vis/"):
             # 任务可视化：/vis/<jid>/<file> 或并行对比的 /vis/<jid>/<tag>/<file>
             parts = u.path.split("/")
@@ -2080,7 +2021,7 @@ class Handler(BaseHTTPRequestHandler):
             if not j:
                 self._send(404, "no job", "text/plain"); return
             self._send(200, tail(j["log_path"]).encode(), "text/plain; charset=utf-8")
-        elif u.path.startswith("/job/"):
+        elif u.path.startswith("/job/") and u.path.count("/") == 2:
             jid = u.path.split("/")[2]
             j = JOBS.get(jid)
             if not j:
@@ -2136,9 +2077,8 @@ class Handler(BaseHTTPRequestHandler):
             running_pv = j["state"] == "running" and (
                 bool(ports) or "--preview" in j.get("cmd", ""))
             if running_pv and ports:
-                # 并行对比：每模型一列。画面区走反代长连接实时流（板端满速编码），
-                # 下面单独一块抽帧存档 —— 两者分开 DOM，局部刷新才不会重建 <img> 断流。
-                cols_live, cols_shot = "", ""
+                # 并行对比：每模型一列，只展示抽帧存档（不再嵌板端实时流）
+                cols = ""
                 for tag, _port in ports:
                     pvt = os.path.join(pv_dir, tag)
                     imgs = "".join(
@@ -2146,22 +2086,15 @@ class Handler(BaseHTTPRequestHandler):
                         % (jid, quote(tag), i) for i in range(SHOT_SLOTS)
                         if os.path.exists(os.path.join(pvt, "shot_%d.jpg" % i)))
                     if not imgs:
-                        imgs = "<div class=small style='color:#888'>尚无存档帧</div>"
-                    head = "<b class=small>%s</b>" % html.escape(tag)
-                    cols_live += ("<div class=pcol>%s"
-                                  "<img class=live src='/job/%s/live/%s.mjpg'></div>"
-                                  % (head, jid, quote(tag, safe="")))
-                    cols_shot += "<div class=pcol>%s%s</div>" % (head, imgs)
-                shots = ("<div class=card><h2>推理画面（多模型实时对比）"
-                         "<span class=small>（每模型一列，板端 MJPEG 实时流）</span></h2>"
-                         "<div class=pcmp>%s</div>"
-                         "<h3>抽帧存档（每 %d 秒 1 张）</h3>"
+                        imgs = ("<div class=small style='color:#888'>"
+                                "尚无存档帧（推理刚开始或批数据同步中）</div>")
+                    cols += ("<div class=pcol><b class=small>%s</b>%s</div>"
+                             % (html.escape(tag), imgs))
+                shots = ("<div class=card><h2>推理画面（多模型对比）"
+                         "<span class=small>（抽帧存档，每 %d 秒 1 张）</span></h2>"
                          "<div class=pcmp id=shots>%s</div></div>"
-                         % (cols_live, SHOT_INTERVAL, cols_shot))
+                         % (SHOT_INTERVAL, cols))
             elif running_pv:
-                live = ("<img class=live src='/job/%s/live.mjpg'>"
-                        "<p class='small livehint'>板端 MJPEG 实时流（满速编码）；"
-                        "下方为每 %d 秒一张的抽帧存档</p>" % (jid, SHOT_INTERVAL))
                 slots = "".join(
                     "<img src='/files/%s/preview/shot_%d.jpg'>"
                     % (jid, i) for i in range(SHOT_SLOTS)
@@ -2170,9 +2103,9 @@ class Handler(BaseHTTPRequestHandler):
                     slots = ("<div class=small style='padding:8px;color:#888'>"
                              "尚无存档帧（推理刚开始或批数据同步中）</div>")
                 shots = ("<div class=card><h2>推理画面"
-                         "<span class=small>（实时流 + 抽帧存档）</span></h2>"
-                         "<div>%s</div><div class=shots id=shots>%s</div></div>"
-                         % (live, slots))
+                         "<span class=small>（抽帧存档，每 %d 秒 1 张）</span></h2>"
+                         "<div class=shots id=shots>%s</div></div>"
+                         % (SHOT_INTERVAL, slots))
             elif j["state"] in ("done", "error", "canceled") and sub_tags:
                 # 运行结束也保留快照流（否则页面刷新后画面消失，像"没拍过"）
                 cols = ""
