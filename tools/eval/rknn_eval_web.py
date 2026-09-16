@@ -1355,11 +1355,17 @@ def _write_batch_script(out_dir, task, models, ds_root, ann_arg, ann, label, obj
     tags = [t for t, _ in models]
 
     # 每批内的推理命令（多模型串行；线程数不降，预览端口按序分配）
+    # 必须带 ann_arg+ann：传了 --gt/--ann 二进制就不走 DOTA 切片路径 —— 否则切片输出
+    # 会给图名追加 "_行_列" 后缀，dump 名与用户标注名错位，最终评测匹配 0 → 全 0 报告
+    # （实测 f1747b6a：上传图 P0003_0_0.jpg 被切成 P0003_0_0_0_0.jpg）。dump-only 模式
+    # 下带 GT 只影响命名/可视化，不会触发逐批评测。
     infer_cmds = []
     for k, (mtag, mpath) in enumerate(models):
         c = [q(eval_bin), "--task", task, "--model", q(mpath),
              '--images "$BD"', "--conf", str(conf), "--threads", str(threads),
              "--dump-only", '--out-dir "$OUT/parts/b$i"', "--name", q(mtag)]
+        if ann:
+            c += [ann_arg, q(ann)]
         if label:
             c += ["--label", q(label)]
         if obj_num:
