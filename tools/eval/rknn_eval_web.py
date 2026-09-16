@@ -115,6 +115,9 @@ DEFAULTS = dict(
     conf="0.25",
     threads="4",
     batch="500",
+    # 数据缓存默认保留（表单里的 keep_ds 复选框默认勾选）：同一文件夹二次评测
+    # 只传差异图片（增量），失败任务也能断点续跑；取消勾选则任务完成后自动清缓存。
+    keep_ds="checked",
     model_dir="model",
 )
 
@@ -228,8 +231,8 @@ FORM = """
 <label>类别数</label><input name="obj_num" value="%(obj_num)s" size="6"><br>
 <label>conf / threads</label><input name="conf" value="%(conf)s" size="6">
 <input name="threads" value="%(threads)s" size="4"><br>
-<label>数据缓存</label><input type="checkbox" name="keep_ds"> 评测完成后保留上传的数据
-（默认<b>用完即删</b>防爆板端存储；勾选后同一文件夹二次评测只传差异图片）<br>
+<label>数据缓存</label><input type="checkbox" name="keep_ds" %(keep_ds)s> 评测完成后保留上传的数据
+（默认<b>保留</b>：同一文件夹二次评测只传差异图片、失败任务可断点续跑；取消勾选则用完即删，省板端空间）<br>
 <label>对比模型</label><span id="cmp_rows"><select name="cmp" id="cmp_main" onchange="onCmpChange()"><option value="">不对比（单模型）</option>%(model_options)s</select></span>
 <input class="btn sub" type="button" id="cmp_add" value="＋添加" onclick="addCmpRow()" style="width:auto;padding:4px 10px" disabled><span class="small">可加多个：N 模型并行对比，线程均分</span><br>
 <h3>输出</h3>
