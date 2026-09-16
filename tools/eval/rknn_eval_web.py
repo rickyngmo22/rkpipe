@@ -2337,12 +2337,15 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0) or 0)
         return parse_form_body(self.headers.get("Content-Type"), self.rfile.read(n))
 
-    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+    def _send(self, code, body, ctype="text/html; charset=utf-8", dl=None):
         if isinstance(body, str):
             body = body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if dl:  # 附件下载（浏览器直接保存而非内联展示）
+            self.send_header("Content-Disposition",
+                             "attachment; filename=\"%s\"" % dl)
         if ctype.startswith("text/html") or "javascript" in ctype:
             self.send_header("Cache-Control", "no-store")  # 页面/JS 迭代频繁,禁缓存防旧脚本
         self.end_headers()
@@ -2517,8 +2520,12 @@ class Handler(BaseHTTPRequestHandler):
                 if fp.startswith(base + os.sep) and os.path.isfile(fp):
                     ctype = ("image/jpeg" if fp.endswith((".jpg", ".jpeg")) else
                              "image/png" if fp.endswith(".png") else
+                             "application/json" if fp.endswith((".json", ".jsonl")) else
                              "text/plain; charset=utf-8")
-                    self._send(200, open(fp, "rb").read(), ctype)
+                    # ?dl=1 → 作为附件下载（结果导出）；否则内联展示
+                    dl = (os.path.basename(fp)
+                          if parse_qs(u.query).get("dl") else None)
+                    self._send(200, open(fp, "rb").read(), ctype, dl=dl)
                     return
             self._send(404, "no file", "text/plain")
         elif u.path.endswith("/log.txt"):
@@ -2538,6 +2545,20 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.exists(rep):
                     extra = ("<div class=card><h2>评测报告</h2>"
                               + mdish(open(rep, errors="replace").read()) + "</div>")
+                    # 结果下载：报告 / 各模型指标 / 各模型逐帧导出 / 运行日志
+                    dls = (["report.md"]
+                           + sorted(os.path.basename(p) for p in
+                                    glob.glob(os.path.join(j["out_dir"], "metrics_*.json")))
+                           + sorted(os.path.basename(p) for p in
+                                    glob.glob(os.path.join(j["out_dir"], "dump_*.jsonl")))
+                           + ["run.log"])
+                    links = "".join(
+                        "<a href='/files/%s/%s?dl=1' style='margin-right:16px'>⬇ %s</a>"
+                        % (jid, quote(f), html.escape(f)) for f in dls
+                        if os.path.isfile(os.path.join(j["out_dir"], f)))
+                    extra += ("<div class=card><h2>结果下载</h2><p>%s</p>"
+                              "<span class=small>dump_*.jsonl = 逐帧检测导出（离线评测/二次分析），"
+                              "metrics_*.json = 耗时/FPS 汇总，run.log = 完整运行日志</span></div>" % links)
                     vis_dir = os.path.join(j["out_dir"], "vis")
                     if os.path.isdir(vis_dir):
                         vis_subs = sorted(d for d in os.listdir(vis_dir)
