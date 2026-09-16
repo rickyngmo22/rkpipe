@@ -33,6 +33,7 @@ import email
 import email.policy
 import glob
 import hashlib
+import tarfile
 import html
 import json
 import os
@@ -190,6 +191,13 @@ min-height:110px;object-fit:contain}
 display:block;margin-top:4px;min-height:90px;object-fit:contain}
 .visgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
 .visgrid img{width:100%;border-radius:8px;border:1px solid var(--line)}
+/* 结果可视化九宫格（3×3 固定）+ 点击浮窗放大 */
+.grid9{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.grid9 img{width:100%;border-radius:8px;border:1px solid var(--line);background:#000;
+object-fit:contain;cursor:zoom-in;display:block}
+#lb{position:fixed;inset:0;background:rgba(13,17,26,.9);display:none;align-items:center;
+justify-content:center;z-index:99;cursor:zoom-out}
+#lb img{max-width:92vw;max-height:92vh;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.5)}
 details.cmd{margin:8px 0}
 details.cmd summary{cursor:pointer;color:var(--sub);font-size:12px}
 </style></head><body>
@@ -198,7 +206,26 @@ details.cmd summary{cursor:pointer;color:var(--sub);font-size:12px}
 <span class="small">RK3588 板端精度 / 性能</span></header>
 <main>
 <!--BODY-->
-</main></body></html>"""
+</main>
+<div id="lb"><img id="lb_img" alt=""></div>
+<script>
+/* 浮窗看图：点击带 data-lb 的缩略图弹出大图，点浮窗/ESC 关闭（事件委托，兼容局部刷新） */
+document.addEventListener('click', function(e) {
+  var im = e.target.closest('img[data-lb]');
+  if (!im) return;
+  e.preventDefault();
+  document.getElementById('lb_img').src = im.getAttribute('data-lb');
+  document.getElementById('lb').style.display = 'flex';
+});
+document.getElementById('lb').addEventListener('click', function() {
+  this.style.display = 'none';
+  document.getElementById('lb_img').src = '';
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') { var lb = document.getElementById('lb'); lb.style.display = 'none'; }
+});
+</script>
+</body></html>"""
 
 
 def render_page(body):
@@ -848,6 +875,42 @@ def _mjpeg_frames(resp, boundary=MJPEG_BOUNDARY, maxbuf=16 << 20):
                 yield data
 
 
+def _pose_has_person(job):
+    """pose 任务：查当前模型 dump 的最新进度，最近帧有人才值得抽帧存档。
+
+    dump 与推理流同序（逐帧落盘），读文件尾部最近几行判断；从后往前找第一条
+    完整写入的行（尾行可能被写到一半，json 解析失败就跳过上一条）。找不到
+    dump / 解析异常时返回 True —— 宁可多抽不漏抽。
+    """
+    od = job["out_dir"]
+    cands = glob.glob(os.path.join(od, "dump_*.jsonl"))
+    if not cands:  # 分批任务：逐批落在 parts/b*/
+        cands = glob.glob(os.path.join(od, "parts", "b*", "dump_*.jsonl"))
+    if not cands:
+        return True
+    p = max(cands, key=os.path.getmtime)   # 多模型对比时 = 正在推理的那个模型
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 16384))
+            lines = [l for l in f.read().decode("utf-8", "replace").splitlines()
+                     if l.strip()]
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if "poses" not in row:
+                return True        # 非 pose 行（混跑其他任务类型）→ 不拦
+            for ps in row.get("poses") or []:
+                if ps.get("kpts"):
+                    return True
+            return False           # 最新完整帧无人 → 不抽
+    except Exception:
+        return True
+    return True
+
+
 def stream_shots(job, port, stop, sub=""):
     """长期连接板端 /stream.mjpg 抽帧存档。
 
@@ -875,6 +938,9 @@ def stream_shots(job, port, stop, sub=""):
                 PREVIEW_CACHE[key] = (now, data)   # 最新帧（/job/<id>/preview.jpg 兜底）
                 if now - last >= SHOT_INTERVAL:    # 111fps 的流按时间抽样，别把盘写爆
                     last = now
+                    # pose 任务：最近帧没检测到人就不占存档槽（尽量抽有人的画面）
+                    if job.get("task") == "pose" and not _pose_has_person(job):
+                        continue
                     try:
                         if _rotating_write(dst, PREVIEW_IDX.get(key, 0), data):
                             PREVIEW_IDX[key] = PREVIEW_IDX.get(key, 0) + 1
@@ -2417,6 +2483,10 @@ class Handler(BaseHTTPRequestHandler):
                     act = ("<form method=post action=/retry style='display:inline'>"
                            "<input type=hidden name=jid value=%s>"
                            "<input class='btn sub' type=submit value=重试></form>" % jid)
+                if j["state"] == "done":
+                    act += ("<a class='btn sub' href='/archive/%s' "
+                            "style='text-decoration:none;padding:4px 10px;width:auto;display:inline-block'>⬇ 下载</a>"
+                            % jid)
                 if j["state"] not in ("queued", "running"):
                     act += ("<form method=post action=/delete style='display:inline' "
                             "onsubmit=\"return confirm('删除该任务的全部产物？')\">"
@@ -2510,6 +2580,37 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, open(f, "rb").read(), "image/jpeg")
                     return
             self._send(404, "no image", "text/plain")
+        elif u.path.startswith("/archive/"):
+            # 任务结果打包下载：报告/metrics/dump/日志/可视化 → 一个 tar.gz
+            jid = u.path.split("/")[2] if u.path.count("/") >= 2 else ""
+            j = JOBS.get(jid)
+            od = j["out_dir"] if j else ""
+            if not j or not os.path.isdir(od):
+                self._send(404, "no job", "text/plain"); return
+            tgz = "/tmp/webres_%s.tar.gz" % jid
+            try:
+                with tarfile.open(tgz, "w:gz") as tf:
+                    for name in ("report.md", "run.log", "labels_auto.txt"):
+                        p = os.path.join(od, name)
+                        if os.path.isfile(p):
+                            tf.add(p, arcname="%s/%s" % (jid, name))
+                    for pat in ("metrics_*.json", "dump_*.jsonl"):
+                        for p in glob.glob(os.path.join(od, pat)):
+                            tf.add(p, arcname="%s/%s" % (jid, os.path.basename(p)))
+                    vd = os.path.join(od, "vis")
+                    if os.path.isdir(vd):
+                        for p in (glob.glob(os.path.join(vd, "*", "*_vis.jpg"))
+                                  + glob.glob(os.path.join(vd, "*_vis.jpg"))):
+                            tf.add(p, arcname="%s/vis/%s" % (jid, os.path.relpath(p, vd)))
+                self._send(200, open(tgz, "rb").read(), "application/gzip",
+                           dl="%s_results.tar.gz" % jid)
+            except Exception as e:
+                self._send(500, "archive 失败: %s" % e, "text/plain")
+            finally:
+                try:
+                    os.remove(tgz)
+                except OSError:
+                    pass
         elif u.path.startswith("/files/"):
             # 任务产物通用访问：/files/<jid>/<相对路径>（快照流/报告附件等，支持多级）
             parts = u.path.split("/")
@@ -2545,52 +2646,46 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.exists(rep):
                     extra = ("<div class=card><h2>评测报告</h2>"
                               + mdish(open(rep, errors="replace").read()) + "</div>")
-                    # 结果下载：报告 / 各模型指标 / 各模型逐帧导出 / 运行日志
-                    dls = (["report.md"]
-                           + sorted(os.path.basename(p) for p in
-                                    glob.glob(os.path.join(j["out_dir"], "metrics_*.json")))
-                           + sorted(os.path.basename(p) for p in
-                                    glob.glob(os.path.join(j["out_dir"], "dump_*.jsonl")))
-                           + ["run.log"])
-                    links = "".join(
-                        "<a href='/files/%s/%s?dl=1' style='margin-right:16px'>⬇ %s</a>"
-                        % (jid, quote(f), html.escape(f)) for f in dls
-                        if os.path.isfile(os.path.join(j["out_dir"], f)))
-                    extra += ("<div class=card><h2>结果下载</h2><p>%s</p>"
-                              "<span class=small>dump_*.jsonl = 逐帧检测导出（离线评测/二次分析），"
-                              "metrics_*.json = 耗时/FPS 汇总，run.log = 完整运行日志</span></div>" % links)
+                    # 结果打包下载：报告/metrics/dump/日志/可视化一个压缩包
+                    extra += ("<div class=card><h2>结果下载</h2>"
+                              "<p><a class=btn href='/archive/%s' "
+                              "style='text-decoration:none'>⬇ 打包下载全部结果（tar.gz）</a></p>"
+                              "<span class=small>含评测报告、各模型 metrics_*.json 与 dump_*.jsonl、"
+                              "run.log、全部可视化结果图；也可用 /files/%s/&lt;文件&gt;?dl=1 取单个文件"
+                              "</span></div>" % (jid, jid))
                     vis_dir = os.path.join(j["out_dir"], "vis")
                     if os.path.isdir(vis_dir):
                         vis_subs = sorted(d for d in os.listdir(vis_dir)
                                           if os.path.isdir(os.path.join(vis_dir, d)))
                         if vis_subs:
-                            # 并行对比：每个模型一列检测结果图（同数据不同模型）
+                            # 并行对比：每个模型一个 3×3 九宫格（同数据不同模型）
                             cols = ""
                             for t in vis_subs:
-                                imgs = sorted(glob.glob(os.path.join(vis_dir, t, "*_vis.jpg")))[:6]
+                                imgs = sorted(glob.glob(os.path.join(vis_dir, t, "*_vis.jpg")))[:9]
                                 if imgs:
                                     cell = "".join(
-                                        "<a href='/vis/%s/%s/%s'><img src='/vis/%s/%s/%s'></a>"
+                                        "<img src='/vis/%s/%s/%s' data-lb='/vis/%s/%s/%s'>"
                                         % (jid, t, html.escape(os.path.basename(i)),
                                            jid, t, html.escape(os.path.basename(i)))
                                         for i in imgs)
-                                    cols += ("<div class=pcol><b class=small>%s</b>%s</div>"
+                                    cols += ("<div class=pcol><b class=small>%s</b>"
+                                             "<div class=grid9>%s</div></div>"
                                              % (html.escape(t), cell))
                             if cols:
-                                extra += ("<div class=card><h2>检测结果对比（同数据不同模型，每模型前 6 张）</h2>"
+                                extra += ("<div class=card><h2>检测结果对比（同数据不同模型，每模型 9 张）</h2>"
                                           "<div class=pcmp>%s</div></div>" % cols)
                         else:
-                            imgs = sorted(glob.glob(os.path.join(vis_dir, "*_vis.jpg")))[:8]
+                            imgs = sorted(glob.glob(os.path.join(vis_dir, "*_vis.jpg")))[:9]
                             if imgs:
                                 cell = "".join(
-                                    "<a href='/vis/%s/%s'><img src='/vis/%s/%s'></a>"
+                                    "<img src='/vis/%s/%s' data-lb='/vis/%s/%s'>"
                                     % (j["id"], html.escape(os.path.basename(i)),
                                        j["id"], html.escape(os.path.basename(i)))
                                     for i in imgs)
-                                extra += ("<div class=card><h2>检测可视化（前 %d 张，共 %d 张）</h2>"
-                                          "<div class=visgrid>%s</div></div>"
-                                          % (len(imgs),
-                                             len(glob.glob(os.path.join(vis_dir, "*_vis.jpg"))), cell))
+                                extra += ("<div class=card><h2>检测可视化（九宫格，共 %d 张）</h2>"
+                                          "<div class=grid9>%s</div>"
+                                          "<span class=small>点击任意图片浮窗放大，ESC 或点击空白处关闭</span></div>"
+                                          % (len(glob.glob(os.path.join(vis_dir, "*_vis.jpg"))), cell))
                 else:
                     extra = ("<div class=card><h2>结果</h2><pre>"
                              + html.escape(tail(j["log_path"], 30)) + "</pre></div>")
