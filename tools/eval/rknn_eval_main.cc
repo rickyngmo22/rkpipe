@@ -1175,8 +1175,10 @@ int main(int argc, char** argv) {
         runs.push_back(std::move(r));
     }
 
-    // 全部模型评测失败 → 报告没有任何可用指标，按失败退出；部分失败则继续出报告
-    {
+    // 全部模型评测失败 → 报告没有任何可用指标，按失败退出；部分失败则继续出报告。
+    // 注意：dump-only（分批推理）模式根本不评测，r.ok 恒为 false，不能参与此判定
+    //（917e8e46 教训：误判"全部失败"rc=3，把推理成功的分批任务整单打断）。
+    if (!cfg.dump_only) {
         bool any_eval_ok = false;
         for (auto& r : runs) any_eval_ok = r.ok || any_eval_ok;
         if (!runs.empty() && !any_eval_ok) {
