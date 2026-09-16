@@ -48,3 +48,7 @@ multistream_logs/
 results/
 web_runs_archive_*.tar.gz
 *.bak.*
+
+# rk_pipe_daemon 运行时产物（任务 yaml/log/snapshot）
+daemon_runs/
+daemon_smoke.log

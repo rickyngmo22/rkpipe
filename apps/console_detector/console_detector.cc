@@ -1,11 +1,12 @@
 /*
  * console_detector —— 通过 C ABI(rkpipe/rkpipe.h)驱动完整流水线的命令行工具。
  *
- * 同时承担 ABI 验收测试的职责: 本程序只使用 rkpipe.h 声明的接口;
+ * 同时承担 ABI 验收测试的职责: 本程序只使用 rkpipe.h 声明的接口,
  * 若本程序能编译链接并跑通,则 ABI 契约成立。
  *
  * 用法:
  *   console_detector <config.yaml> [--quiet]
+ *   console_detector --config <config.yaml> [--quiet]   (rk_pipe_daemon 监督模式使用)
  */
 #include <signal.h>
 
@@ -37,19 +38,34 @@ static void on_event(rkpipe_event_t ev, const char* payload_json, void* user_ctx
     /* 注意: 回调在库内部线程触发,此处不要调用 rkpipe_* 接口(见 README 线程契约) */
 }
 
+static void usage(const char* prog) {
+    fprintf(stderr, "usage: %s <config.yaml> | --config <config.yaml> [--quiet]\n", prog);
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <config.yaml> [--quiet]\n", argv[0]);
-        return 2;
+    const char* config_path = NULL;
+    int quiet = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--config") == 0) {
+            if (i + 1 >= argc) { usage(argv[0]); return 2; }
+            config_path = argv[++i];
+        } else if (strcmp(argv[i], "--quiet") == 0) {
+            quiet = 1;
+        } else if (argv[i][0] != '-' && !config_path) {
+            config_path = argv[i];   /* 位置参数兼容: 原用法 <config.yaml> */
+        } else {
+            usage(argv[0]);
+            return 2;
+        }
     }
-    int quiet = (argc > 2 && strcmp(argv[2], "--quiet") == 0);
+    if (!config_path) { usage(argv[0]); return 2; }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    rkpipe_handle h = rkpipe_create(argv[1]);
+    rkpipe_handle h = rkpipe_create(config_path);
     if (!h) {
-        fprintf(stderr, "rkpipe_create failed: config load/init error (%s)\n", argv[1]);
+        fprintf(stderr, "rkpipe_create failed: config load/init error (%s)\n", config_path);
         return 1;
     }
 
@@ -62,7 +78,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* 输入驱动: 本地文件/有限流自然结束;实时流持续运行,Ctrl-C 退出进程 */
+    /* 输入驱动: 本地文件/有限流自然结束,实时流持续运行,Ctrl-C 退出进程 */
     while (!g_interrupted) {
         rc = rkpipe_wait(h, 200);
         if (rc != RK_PIPE_ERR_TIMEOUT) break;  /* 结束或错误 */

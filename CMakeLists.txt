@@ -267,6 +267,60 @@ set_target_properties(rknn_eval PROPERTIES
 )
 target_link_options(rknn_eval PRIVATE "-Wl,--disable-new-dtags")
 
+# ---------------------------------------------------------------------------
+# 守护进程（B3 REST 服务包 + C2 配置热切换）：仅依赖线程库，不链接核心库
+# ---------------------------------------------------------------------------
+find_path(LLM_CURL_INCLUDE_DIR curl/curl.h
+    HINTS ${PROJECT_SOURCE_DIR}/3rdparty/curl/include)
+find_library(LLM_CURL_LIB NAMES curl)
+if(LLM_CURL_INCLUDE_DIR AND LLM_CURL_LIB)
+    set(RK_PIPE_HAVE_CURL ON)
+    message(STATUS "libcurl: ${LLM_CURL_LIB} (LLM cloud provider enabled)")
+else()
+    set(RK_PIPE_HAVE_CURL OFF)
+    message(STATUS "libcurl not found: LLM module builds mock-only (cloud provider unavailable)")
+endif()
+
+set(RK_PIPE_DAEMON_SOURCES
+    src/io/http_request.cc
+    src/utils/http_post.cc
+    src/daemon_main.cc
+    src/daemon/events_store.cc
+    src/daemon/llm_review.cc
+    src/daemon/daemon_pages.cc
+    src/daemon/daemon_sysinfo.cc
+    src/daemon/daemon_http.cc
+    src/daemon/daemon_supervision.cc
+    src/daemon/daemon_api.cc
+    src/daemon/daemon_prometheus.cc
+    src/daemon/flywheel.cc
+    src/core/thermal_governor.cc
+)
+add_executable(rk_pipe_daemon ${RK_PIPE_DAEMON_SOURCES}
+    src/llm/provider_mock.cc
+)
+if(RK_PIPE_HAVE_CURL)
+    list(APPEND RK_PIPE_DAEMON_SOURCES src/llm/provider_cloud.cc)
+endif()
+target_sources(rk_pipe_daemon PRIVATE ${RK_PIPE_DAEMON_SOURCES})
+target_link_libraries(rk_pipe_daemon Threads::Threads)
+if(RK_PIPE_HAVE_CURL)
+    target_link_libraries(rk_pipe_daemon ${LLM_CURL_LIB})
+    target_compile_definitions(rk_pipe_daemon PRIVATE RK_PIPE_HAVE_CURL=1)
+else()
+    target_compile_definitions(rk_pipe_daemon PRIVATE RK_PIPE_LLM_NO_CLOUD=1)
+endif()
+target_compile_definitions(rk_pipe_daemon PRIVATE "RK_PIPE_GIT_COMMIT=\"${RK_PIPE_GIT_COMMIT}\"")
+target_include_directories(rk_pipe_daemon PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/3rdparty
+    ${LLM_CURL_INCLUDE_DIR}
+)
+set_target_properties(rk_pipe_daemon PROPERTIES
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN"
+)
+
 # ---- 单元测试(完整构建;CI 模式被 #ifndef RK_PIPE_CI 剔除的 tracker/工厂用例在此激活)
 include(CTest)
 if(BUILD_TESTING)
@@ -285,7 +339,7 @@ endif()
 
 # ---- 安装 --------------------------------------------------------------------
 include(GNUInstallDirs)
-install(TARGETS console_detector rknn_eval
+install(TARGETS console_detector rknn_eval rk_pipe_daemon
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS chromaprint_compat LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES ${RKNNRT_LIB} DESTINATION ${CMAKE_INSTALL_LIBDIR})

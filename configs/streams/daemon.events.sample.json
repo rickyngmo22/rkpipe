@@ -1,0 +1,53 @@
+{
+  "board_ip": "<board-ip>",
+  "base_port": 8090,
+  "bind": "0.0.0.0",
+  "quality": 85,
+  "streams": [
+    {
+      "id": "d1d2",
+      "task": "detect",
+      "input": "/userdata/rkpipe/test_videos/baseline17.mp4",
+      "model": "/userdata/rkpipe/model/yolo26n.rknn",
+      "threads": 3,
+      "tracking": 1,
+      "port": 8090,
+      "event_line": "450,740,1250,680",
+      "event_line_cross": 1,
+      "event_region": "820,480,1230,500,1300,810,750,810",
+      "event_intrusion": 1,
+      "event_dwell": 1,
+      "event_dwell_seconds": 10,
+      "event_absence": 1,
+      "event_absence_seconds": 20,
+      "event_classes": "0,2",
+      "alert_enabled": 1,
+      "alert_webhook_url": "http://192.0.2.10:9000/alert",
+      "alert_interval_s": 5,
+      "alert_snapshot_dir": "/userdata/rkpipe/snapshots"
+    },
+    {
+      "id": "multi_rule",
+      "task": "detect",
+      "input": "/userdata/rkpipe/test_videos/baseline17.mp4",
+      "model": "/userdata/rkpipe/model/yolov8n.rknn",
+      "threads": 3,
+      "tracking": 1,
+      "port": 8091,
+      "alert_enabled": 1,
+      "alert_webhook_url": "http://192.0.2.10:9000/alert",
+      "alert_interval_s": 5,
+      "alert_snapshot_dir": "/userdata/rkpipe/snapshots",
+      "rules": [
+        { "id": "gate_out", "type": "line_cross", "line": "450,740,1250,680", "direction": "A2B", "classes": "0,2" },
+        { "id": "gate_in", "type": "line_cross", "line": "450,740,1250,680", "direction": "B2A" },
+        { "id": "yard", "type": "intrusion", "region": "820,480,1230,500,1300,810,750,810", "classes": "2" },
+        { "id": "loiter", "type": "dwell", "region": "820,480,1230,500,1300,810,750,810", "dwell_seconds": 10 },
+        { "id": "post", "type": "absence", "region": "820,480,1230,500,1300,810,750,810", "absence_seconds": 30 },
+        { "id": "crowd", "type": "crowd", "region": "0,540,1920,540,1920,1080,0,1080", "min_count": 5 },
+        { "id": "leftbag", "type": "abandoned", "region": "820,480,1230,500,1300,810,750,810", "seconds": 60 },
+        { "id": "ward", "type": "fall", "fall_aspect": 1.2, "fall_seconds": 2.0 }
+      ]
+    }
+  ]
+}

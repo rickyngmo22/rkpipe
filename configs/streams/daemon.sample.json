@@ -1,0 +1,41 @@
+{
+  "board_ip": "<board-ip>",
+  "base_port": 8090,
+  "bind": "0.0.0.0",
+  "quality": 97,
+  "dump_dir": "/tmp/rk_pipe_gui",
+  "streams": [
+    {
+      "task": "detect",
+      "input": "/userdata/rkpipe/test_videos/baseline.mp4",
+      "model": "/userdata/rkpipe/model/yolov8n.rknn",
+      "threads": 3,
+      "pace": 1,
+      "port": 8090
+    },
+    {
+      "task": "pose",
+      "input": "/userdata/rkpipe/test_videos/baseline2.mp4",
+      "model": "/userdata/rkpipe/model/yolov8_pose.rknn",
+      "threads": 3,
+      "pace": 1,
+      "port": 8091
+    },
+    {
+      "task": "obb",
+      "input": "/userdata/rkpipe/test_videos/baseline5_720p.mp4",
+      "model": "/userdata/rkpipe/model/yolov8_obb.rknn",
+      "threads": 3,
+      "pace": 1,
+      "port": 8092
+    },
+    {
+      "task": "pose",
+      "input": "/userdata/rkpipe/test_videos/baseline10.mp4",
+      "model": "/userdata/rkpipe/model/yolov8_pose.rknn",
+      "threads": 3,
+      "pace": 1,
+      "port": 8093
+    }
+  ]
+}
