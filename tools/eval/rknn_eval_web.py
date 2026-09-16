@@ -280,7 +280,8 @@ FORM = """
 <label>label 文件</label><input name="label" id="label_in" value="%(label)s" placeholder="留空 = 按标注 JSON 自动生成">
 <input type="file" id="label_file" accept=".txt" onchange="uploadLabel(this)"><br>
 <span id="label_stat" class="small">类别表只影响可视化框上的文字（越界降级 clsN），不影响精度指标；留空会自动从标注 categories 生成，自定义数据集同样适用</span><br>
-<label>类别数</label><input name="obj_num" value="%(obj_num)s" size="6"><br>
+<label>类别数</label><input name="obj_num" value="%(obj_num)s" size="6">
+<span class=small>= label 文件行数，提交时自动按 label 校正覆盖（不是"目标数"）</span><br>
 <label>置信度</label><input name="conf" value="%(conf)s" size="6"><br>
 <h3>输出</h3>
 <label>可视化</label><input type="checkbox" name="vis" checked> 渲染检测结果图（完成后展示）<br>
@@ -1610,6 +1611,18 @@ def start_job(form):
     # label 类别表：留空或所填路径板上不存在时，按标注 JSON 自动生成
     # （--label 只影响可视化文字，不影响指标；自定义数据集不给会显示 cls0/cls1）
     label, label_note = resolve_label(label, ann, task, os.path.abspath(out_dir))
+    # obj_num 的语义是「类别数」（写入 yaml obj_class_num，后处理按它解码类别
+    # 通道），不是目标数——pose 填 1 正确，detect 80 类填 1 会让 one2one 头
+    # （yolo26 系）只解 1 个类别通道：几乎零检出且全部 cls=0（任务 166e7c97
+    # 实测翻车）。label 文件行数是权威值，能数出来就以它覆盖表单填的数。
+    if label and os.path.isfile(label):
+        try:
+            with open(label, encoding="utf-8", errors="replace") as _lf:
+                _n = sum(1 for _ln in _lf if _ln.strip())
+            if _n > 0:
+                obj_num = str(_n)
+        except OSError:
+            pass
     vis = form.get("vis") == ["on"]
     preview = form.get("preview") == ["on"]
     pv_base = int(form.get("preview_port", ["8090"])[0].strip() or 8090)

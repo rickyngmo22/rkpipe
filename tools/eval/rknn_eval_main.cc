@@ -940,8 +940,8 @@ static void write_report(const Config& cfg, const TaskSpec& spec,
     md << "- 生成时间: " << tbuf << "\n";
     md << "- 数据集: " << (spec.dataset == Dataset::Dota ? "DOTA v1.0 val（1024/200 切片）" : "COCO val2017")
        << " | 推理输入: " << cfg.images << "\n";
-    md << "- 口径: conf=" << cfg.conf << ", threads=" << cfg.threads
-       << ", conf 全量导出离线评测, 指标 ×100\n\n";
+    md << "- 评测参数: 置信度阈值 conf=" << cfg.conf << ", 线程数 threads=" << cfg.threads
+       << "（均为提交页可调项）, 检测框按该阈值导出后离线评测, 指标 ×100\n\n";
 
     // 主表
     md << "## Table 1: 主要结果\n\n";
@@ -954,29 +954,16 @@ static void write_report(const Config& cfg, const TaskSpec& spec,
         md << "| " << r.tag << " |";
         for (auto& c : spec.cols) {
             if (c == "FPS") md << " " << fmt_fps(r.fps) << " |";
+            else if (!r.ok) md << " - |";  // 评测失败：指标缺失，FPS 仍真实
             else md << " " << fmt1(metric_value(r.summary, cfg.task, c)) << " |";
         }
         md << "\n";
-    }
-
-    // 量化损失表（相对第一个 compare，或相对最后一个主模型之外的行）
-    if (!cfg.compare.empty() && runs.size() > 1) {
-        const RunResult* base = &runs[1];  // 第一个 compare
-        md << "\n## Table 2: 量化损失（相对 " << base->tag << "）\n\n";
-        std::string m1 = "AP50";
-        std::string m0 = (cfg.task == Task::Obb) ? "mAP50-95" : "mAP";
-        double d0 = (metric_value(runs[0].summary, cfg.task, m0) - metric_value(base->summary, cfg.task, m0)) * 100.0;
-        double d1 = (metric_value(runs[0].summary, cfg.task, m1) - metric_value(base->summary, cfg.task, m1)) * 100.0;
-        char b[128];
-        std::snprintf(b, sizeof(b), "| %s vs %s | %.1f | %.1f | %.1fx |\n",
-                      runs[0].tag.c_str(), base->tag.c_str(), d0, d1,
-                      base->fps > 0 ? runs[0].fps / base->fps : 0.0);
-        md << "| 对比 | Δ(" << m0 << ") | Δ(" << m1 << ") | 速度比 |\n|---|---|---|---|\n" << b;
+        if (!r.ok) md << "  （⚠ " << r.tag << " 评测失败，指标缺失，详见 run.log）\n";
     }
 
     // OBB 逐类表
     if (cfg.task == Task::Obb) {
-        md << "\n## Table 3: 逐类 AP50\n\n| Class |";
+        md << "\n## Table 2: 逐类 AP50\n\n| Class |";
         for (auto& r : runs) md << " " << r.tag << " |";
         md << "\n|---";
         for (size_t i = 0; i < runs.size(); ++i) md << "|---";
@@ -1177,12 +1164,25 @@ int main(int argc, char** argv) {
         }
         std::printf("[rknn_eval] 评测: %s\n", job.tag.c_str());
         std::string log;
-        if (!run_evaluator(cfg, spec, scripts, r.dump, r.summary_path, cfg.conf, &r.summary, &log)) {
-            return 3;
+        r.ok = run_evaluator(cfg, spec, scripts, r.dump, r.summary_path, cfg.conf, &r.summary, &log);
+        if (!r.ok) {
+            // 单模型评测失败（如类别数填错/标注问题）不应拖垮其他模型的对比
+            // 报告：标记后继续评下一个，报告里该行指标显示缺失（166e7c97 教训）。
+            std::printf("[rknn_eval] ⚠ %s 评测失败，跳过（其余模型继续出报告）\n", job.tag.c_str());
         }
         // 摘要行
         std::printf("[rknn_eval] %s done: fps=%.1f infer=%.1fms\n", job.tag.c_str(), r.fps, r.infer_ms);
         runs.push_back(std::move(r));
+    }
+
+    // 全部模型评测失败 → 报告没有任何可用指标，按失败退出；部分失败则继续出报告
+    {
+        bool any_eval_ok = false;
+        for (auto& r : runs) any_eval_ok = r.ok || any_eval_ok;
+        if (!runs.empty() && !any_eval_ok) {
+            std::fprintf(stderr, "[rknn_eval] 所有模型评测均失败，退出\n");
+            return 3;
+        }
     }
 
     if (cfg.dump_only) {
@@ -1254,24 +1254,28 @@ int main(int argc, char** argv) {
 
     // ---- 断言 ----
     int exit_code = 0;
+    const bool main_ok = !runs.empty() && runs[0].ok;
     double main_metric = (cfg.task == Task::Obb)
-                             ? (runs[0].summary.find("mAP50") ? runs[0].summary.find("mAP50")->num_or(0) : 0)
-                             : (runs[0].summary.find("AP") ? runs[0].summary.find("AP")->num_or(0) : 0);
+                             ? (main_ok && runs[0].summary.find("mAP50") ? runs[0].summary.find("mAP50")->num_or(0) : 0)
+                             : (main_ok && runs[0].summary.find("AP") ? runs[0].summary.find("AP")->num_or(0) : 0);
     double main_ap50 = (cfg.task == Task::Obb)
                            ? main_metric
-                           : (runs[0].summary.find("AP50") ? runs[0].summary.find("AP50")->num_or(0) : 0);
-    if (cfg.assert_ap > 0 && main_metric * 100.0 < cfg.assert_ap) {
+                           : (main_ok && runs[0].summary.find("AP50") ? runs[0].summary.find("AP50")->num_or(0) : 0);
+    if (cfg.assert_ap > 0 && main_ok && main_metric * 100.0 < cfg.assert_ap) {
         std::fprintf(stderr, "[rknn_eval][ASSERT] 主指标 %.2f < 阈值 %.2f\n",
                      main_metric * 100.0, cfg.assert_ap);
         exit_code = 1;
     }
-    if (cfg.assert_ap50 > 0 && main_ap50 * 100.0 < cfg.assert_ap50) {
+    if (cfg.assert_ap50 > 0 && main_ok && main_ap50 * 100.0 < cfg.assert_ap50) {
         std::fprintf(stderr, "[rknn_eval][ASSERT] AP50 %.2f < 阈值 %.2f\n",
                      main_ap50 * 100.0, cfg.assert_ap50);
         exit_code = 1;
     }
 
-    std::printf("\n[rknn_eval] 完成: %s | 主指标 %.2f | 报告 %s\n",
-                report_md.c_str(), main_metric * 100.0, report_md.c_str());
+    int n_eval_fail = 0;
+    for (auto& r : runs) if (!r.ok) ++n_eval_fail;
+    std::printf("\n[rknn_eval] 完成: %s | 主指标 %.2f | 报告 %s%s\n",
+                report_md.c_str(), main_metric * 100.0, report_md.c_str(),
+                n_eval_fail ? "（⚠ 有模型评测失败，见 run.log）" : "");
     return exit_code;
 }
