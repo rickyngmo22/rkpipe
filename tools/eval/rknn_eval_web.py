@@ -1431,6 +1431,10 @@ def _write_batch_script(out_dir, task, models, ds_root, ann_arg, ann, label, obj
     os.makedirs(out_dir, exist_ok=True)
     eval_bin = os.path.abspath(eval_bin)
     ds_root = os.path.abspath(ds_root)
+    # 防御：images 误填成 <数据集根>/b<N>（历史 b0 启发式 / 手填）→ 回退到数据集根。
+    # ROOT 错一层，脚本就会永远等 <ROOT>/b0/.ready（实测 faa5a3af）。
+    if re.fullmatch(r"b\d+", os.path.basename(ds_root)):
+        ds_root = os.path.dirname(ds_root)
     main_tag = models[0][0]
     tags = [t for t, _ in models]
 
@@ -2195,16 +2199,20 @@ def handle_sync_done(key, ann_rel=None, want_label=False):
     root = os.path.join(RK_EVAL_DATA, key)
     if not os.path.isdir(root):
         return {"ok": False, "error": "该缓存不存在（请重新选文件夹）"}
-    # 分批上传模式：图片落在 root/b0.. 子目录，标注在 root/ann.json
-    b0 = os.path.join(root, "b0")
-    if os.path.isdir(b0) and any(
-            f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"))
-            for f in os.listdir(b0)):
-        images, ann, names_f = b0, "", ""
-        if os.path.isfile(os.path.join(root, "ann.json")):
-            ann = os.path.join(root, "ann.json")
-    else:
-        images, ann, names_f = probe_dataset(root)
+    # 图片目录：优先按根目录探测（flat 图集 / images/ 子目录）。
+    # ⚠️ 不能优先看 root/b0：分批任务会在根下留 b0..b10 批目录，b0 启发式一旦
+    # 抢先，done 就把 images 返回成 root/b0 → 提交后 _write_batch_script 的
+    # ROOT=root/b0，板端永远等 root/b0/b0/.ready（实测 faa5a3af 卡死）；
+    # 不选分批提交时则只会评测 b0 里的 500 张。b0 只配当"根下完全没有图"的兜底。
+    images, ann, names_f = probe_dataset(root)
+    if not images:
+        b0 = os.path.join(root, "b0")
+        if os.path.isdir(b0) and any(
+                f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"))
+                for f in os.listdir(b0)):
+            images = b0
+            if os.path.isfile(os.path.join(root, "ann.json")):
+                ann = os.path.join(root, "ann.json")
     if not images:
         return {"ok": False, "error": "未找到图片（需含 images/ 目录或任意含图片的子目录）"}
     if ann_rel:  # 浏览器分选流程：标注是单独上传的固定文件
