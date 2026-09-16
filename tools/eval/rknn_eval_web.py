@@ -33,7 +33,6 @@ import email
 import email.policy
 import glob
 import hashlib
-import tarfile
 import html
 import json
 import os
@@ -47,6 +46,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -195,6 +195,10 @@ display:block;margin-top:4px;min-height:90px;object-fit:contain}
 .grid9{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .grid9 img{width:100%;border-radius:8px;border:1px solid var(--line);background:#000;
 object-fit:contain;cursor:zoom-in;display:block}
+/* 多模型可视化：tab 切换（点击模型名显示对应九宫格） */
+.vtab{padding:5px 14px;margin:0 8px 10px 0;border:1px solid var(--line);background:#fff;
+border-radius:6px;cursor:pointer;font:inherit;font-size:13px;color:var(--sub)}
+.vtab.on{background:var(--acc);border-color:var(--acc);color:#fff}
 #lb{position:fixed;inset:0;background:rgba(13,17,26,.9);display:none;align-items:center;
 justify-content:center;z-index:99;cursor:zoom-out}
 #lb img{max-width:92vw;max-height:92vh;border-radius:8px;box-shadow:0 8px 40px rgba(0,0,0,.5)}
@@ -875,12 +879,37 @@ def _mjpeg_frames(resp, boundary=MJPEG_BOUNDARY, maxbuf=16 << 20):
                 yield data
 
 
-def _pose_has_person(job):
-    """pose 任务：查当前模型 dump 的最新进度，最近帧有人才值得抽帧存档。
+def _row_has_person(row, kmin=3, kth=0.5):
+    """一行 dump 里是否存在"可信的人"：任一 pose 有 ≥kmin 个关键点分数 ≥kth。
 
-    dump 与推理流同序（逐帧落盘），读文件尾部最近几行判断；从后往前找第一条
-    完整写入的行（尾行可能被写到一半，json 解析失败就跳过上一条）。找不到
-    dump / 解析异常时返回 True —— 宁可多抽不漏抽。
+    不能只看 kpts 非空 —— 误检框也会带出关键点数组；分数够高的关键点
+    达到一定数量才算人，能滤掉大片低分误检。
+    """
+    for ps in row.get("poses") or []:
+        n = 0
+        for k in ps.get("kpts") or []:
+            try:
+                if len(k) >= 3 and float(k[2]) >= kth:
+                    n += 1
+            except (TypeError, ValueError):
+                continue
+            if n >= kmin:
+                return True
+    return False
+
+
+def _pose_has_person(job):
+    """pose 任务：是否值得抽帧存档。
+
+    判定（实测旧版抽出一堆没人画面后的修正）：
+    1. **最新一条完整 dump 行必须有人** —— 存档帧是"现在"的画面，人不在最新帧
+       就没理由拍；
+    2. **最近 4 条完整行里 ≥3/4 有人** —— 存档帧来自预览流，比 dump 最新行略新
+       （流水线延迟），人刚走开的一瞬会"dump 说有人、画面已没人"；要求在场
+       持续稳定才拍，闪现/刚离开的瞬间都不拍。
+    "有人" = 该行任一 pose 有 ≥3 个关键点分数 ≥0.5（_row_has_person），
+    不能只看 kpts 非空 —— 低分误检也会带出关键点数组。
+    dump 缺失/解析异常/非 pose 行 → True（宁可多抽不漏抽）。
     """
     od = job["out_dir"]
     cands = glob.glob(os.path.join(od, "dump_*.jsonl"))
@@ -892,23 +921,29 @@ def _pose_has_person(job):
     try:
         with open(p, "rb") as f:
             f.seek(0, 2)
-            f.seek(max(0, f.tell() - 16384))
+            f.seek(max(0, f.tell() - 65536))
             lines = [l for l in f.read().decode("utf-8", "replace").splitlines()
                      if l.strip()]
-        for line in reversed(lines):
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if "poses" not in row:
-                return True        # 非 pose 行（混跑其他任务类型）→ 不拦
-            for ps in row.get("poses") or []:
-                if ps.get("kpts"):
-                    return True
-            return False           # 最新完整帧无人 → 不抽
     except Exception:
         return True
-    return True
+    rows = []
+    for line in reversed(lines):           # 从最新往回收集 4 条完整行
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue                       # 尾行可能写到一半，跳过
+        if "poses" not in row:
+            return True                    # 非 pose 行（混跑其他任务类型）→ 不拦
+        rows.append(row)
+        if len(rows) >= 4:
+            break
+    if not rows:
+        return True
+    if not _row_has_person(rows[0]):       # 最新完整行没人 → 不拍
+        return False
+    need = max(1, -(-3 * len(rows) // 4))  # ceil(0.75*n)；窗口未满时要求全有
+    have = sum(1 for r in rows if _row_has_person(r))
+    return have >= need
 
 
 def stream_shots(job, port, stop, sub=""):
@@ -1306,33 +1341,9 @@ def _write_job_script(out_dir, task, models, images, ann_arg, ann, label, obj_nu
 
     L = ["#!/bin/bash", "set -e",
          "OUT=%s; IMG=%s; EVAL=%s" % (q(out_dir), q(images), q(eval_bin)),
-         'mkdir -p "$OUT/mparts"']
-    wait_lines = []
-    for i, (tag, mpath) in enumerate(models):
-        a = [q(eval_bin), "--task", task, "--model", q(mpath),
-             '--images "$IMG"', "--conf", str(conf), "--threads", str(per_th),
-             "--dump-only", '--out-dir "$OUT/%s"' % tag,
-             "--name", tag]
-        if label:
-            a += ["--label", q(label)]
-        if obj_num:
-            a += ["--obj-num", str(obj_num)]
-        if preview:
-            a += ["--preview", "--preview-port", str(pv_base + i)]
-        if vis:
-            a += ['--vis-dir "$OUT/vis/%s"' % tag, "--vis-sample", "20"]
-        L.append(" ".join(a) + " & p%d=$!" % i)
-        wait_lines.append("  wait $p%d || rc=1" % i)
-    L = ["#!/bin/bash", "set -e",
-         "OUT=%s; IMG=%s; EVAL=%s" % (q(out_dir), q(images), q(eval_bin)),
-         'mkdir -p "$OUT/mparts"',
-         'rc=0'] + \
-        ["  " + " ".join(a) + " & p%d=$!" % i for i, (a, tag) in enumerate([])]  # placeholder
-    # 重新按正确结构组织
-    L = ["#!/bin/bash", "set -e",
-         "OUT=%s; IMG=%s; EVAL=%s" % (q(out_dir), q(images), q(eval_bin)),
          'mkdir -p "$OUT/mparts"',
          'rc=0']
+    wait_lines = []
     for i, (tag, mpath) in enumerate(models):
         a = [q(eval_bin), "--task", task, "--model", q(mpath),
              '--images "$IMG"', "--conf", str(conf), "--threads", str(per_th),
@@ -1440,7 +1451,9 @@ def _write_batch_script(out_dir, task, models, ds_root, ann_arg, ann, label, obj
         if obj_num:
             c += ["--obj-num", str(obj_num)]
         if vis:
-            c += ['--vis-dir "$OUT/vis"', "--vis-sample", "20"]
+            # 必须按模型分目录：全模型共用一个平铺 vis/ 时，同名 *_vis.jpg 互相覆盖，
+            # 页面/压缩包里分不清是哪个模型检出的（多模型对比的刚需）
+            c += ['--vis-dir "$OUT/vis/%s"' % mtag, "--vis-sample", "20"]
         if preview:
             c += ["--preview", "--preview-port", str(pv_base + k)]
         infer_cmds.append(" ".join(c))
@@ -2366,6 +2379,97 @@ def mdish(text):
     return "\n".join(out)
 
 
+def _archive_readme(j, n_vis):
+    """zip 包里的结构说明：多模型对比按目录名区分模型。"""
+    return (
+        "任务 %s 结果包（评测控制台导出）\n\n"
+        "- index.html          结果页（解压后浏览器直接打开，内含报告/可视化/推理画面）\n"
+        "- report.md           评测报告（markdown）\n"
+        "- metrics_<模型>.json  各模型指标\n"
+        "- dump_<模型>.jsonl    各模型原始结果导出（jsonl）\n"
+        "- run.log             运行日志\n"
+        "- vis/<模型名>/        该模型的检测结果可视化图（文件名 = 原图名 _vis.jpg）\n"
+        "  多模型对比任务按目录名区分是哪个模型检出的；\n"
+        "  单模型任务没有模型子目录，直接在 vis/ 下。\n"
+        "- preview/            推理过程抽帧存档（多模型任务分 preview/<模型名>/）\n\n"
+        "共 %d 张可视化图。\n" % (j["id"], n_vis))
+
+
+def _job_export_html(j):
+    """离线结果页（zip 包内的 index.html）。
+
+    与任务页对齐但去掉轮询/操作按钮；图片全部用相对路径（vis/...、preview/...），
+    解压后离线可看，不依赖板子在线。可视化每模型最多列 48 张，其余留在包里。
+    """
+    jid, od = j["id"], j["out_dir"]
+    badge = {"done": "ok", "error": "err", "canceled": "canceled"}.get(j["state"], "q")
+    dur = (j.get("t_end") or time.time()) - (j.get("t_start") or j["created"])
+    parts = ["<div class=card><h2>任务 <code>%s</code> "
+             "<span class='badge %s'>%s</span></h2>"
+             "<p class=small>%s · 来源 %s · 耗时 %.0fs · 导出于 %s</p>"
+             "<details class=cmd><summary>命令</summary><pre>%s</pre></details></div>"
+             % (jid, badge, j["state"], html.escape(j.get("task", "?")),
+                html.escape(j.get("source", "-")), dur,
+                time.strftime("%Y-%m-%d %H:%M:%S"), html.escape(j.get("cmd", "")))]
+    rep = os.path.join(od, "report.md")
+    if os.path.isfile(rep):
+        parts.append("<div class=card><h2>评测报告</h2>"
+                     + mdish(open(rep, errors="replace").read()) + "</div>")
+    ms = sorted(glob.glob(os.path.join(od, "metrics_*.json")))
+    if ms:
+        links = " ".join("<a href='%s'>%s</a>" % (html.escape(os.path.basename(p)),
+                                                  html.escape(os.path.basename(p)))
+                         for p in ms)
+        parts.append("<div class=card><h2>指标文件</h2><p class=small>%s</p></div>" % links)
+    vis_dir = os.path.join(od, "vis")
+    if os.path.isdir(vis_dir):
+        subs = sorted(d for d in os.listdir(vis_dir)
+                      if os.path.isdir(os.path.join(vis_dir, d)))
+        groups = ([(t, sorted(glob.glob(os.path.join(vis_dir, t, "*_vis.jpg"))))
+                   for t in subs]
+                  if subs else [("", sorted(glob.glob(os.path.join(vis_dir, "*_vis.jpg"))))])
+        for t, imgs in groups:
+            if not imgs:
+                continue
+            cap = 48
+            pre = (t + "/") if t else ""
+            cell = "".join(
+                "<figure style='margin:0'><img loading=lazy src='vis/%s'>"
+                "<figcaption class=small>%s</figcaption></figure>"
+                % (pre + html.escape(os.path.basename(i)),
+                   html.escape(os.path.basename(i).rsplit("_vis.jpg", 1)[0]))
+                for i in imgs[:cap])
+            title = "检测可视化 · %s" % html.escape(t) if t else "检测可视化"
+            note = ("共 %d 张，页面显示前 %d 张，其余见 vis/ 目录" % (len(imgs), cap)
+                    if len(imgs) > cap else "共 %d 张" % len(imgs))
+            parts.append("<div class=card><h2>%s</h2><div class=visgrid>%s</div>"
+                         "<span class=small>%s</span></div>" % (title, cell, note))
+    pv_dir = os.path.join(od, "preview")
+    if os.path.isdir(pv_dir):
+        subs = sorted(d for d in os.listdir(pv_dir)
+                      if os.path.isdir(os.path.join(pv_dir, d)))
+        if subs:
+            cols = ""
+            for t in subs:
+                imgs = "".join("<img src='preview/%s/shot_%d.jpg'>" % (html.escape(t), i)
+                               for i in range(SHOT_SLOTS)
+                               if os.path.isfile(os.path.join(pv_dir, t, "shot_%d.jpg" % i)))
+                if imgs:
+                    cols += ("<div class=pcol><b class=small>%s</b>%s</div>"
+                             % (html.escape(t), imgs))
+            if cols:
+                parts.append("<div class=card><h2>推理画面（多模型）</h2>"
+                             "<div class=pcmp>%s</div></div>" % cols)
+        else:
+            imgs = "".join("<img src='preview/shot_%d.jpg'>" % i
+                           for i in range(SHOT_SLOTS)
+                           if os.path.isfile(os.path.join(pv_dir, "shot_%d.jpg" % i)))
+            if imgs:
+                parts.append("<div class=card><h2>推理画面</h2>"
+                             "<div class=shots>%s</div></div>" % imgs)
+    return render_page("".join(parts))
+
+
 def parse_form_body(ctype, body):
     """解析 POST 表单体 → {name: [value]}（与 parse_qs 同形）。
 
@@ -2581,34 +2685,44 @@ class Handler(BaseHTTPRequestHandler):
                     return
             self._send(404, "no image", "text/plain")
         elif u.path.startswith("/archive/"):
-            # 任务结果打包下载：报告/metrics/dump/日志/可视化 → 一个 tar.gz
+            # 任务结果打包下载：离线结果页/报告/metrics/dump/日志/可视化/抽帧存档 → 一个 zip
             jid = u.path.split("/")[2] if u.path.count("/") >= 2 else ""
             j = JOBS.get(jid)
             od = j["out_dir"] if j else ""
             if not j or not os.path.isdir(od):
                 self._send(404, "no job", "text/plain"); return
-            tgz = "/tmp/webres_%s.tar.gz" % jid
+            zp = "/tmp/webres_%s.zip" % jid
             try:
-                with tarfile.open(tgz, "w:gz") as tf:
+                with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
                     for name in ("report.md", "run.log", "labels_auto.txt"):
                         p = os.path.join(od, name)
                         if os.path.isfile(p):
-                            tf.add(p, arcname="%s/%s" % (jid, name))
+                            zf.write(p, "%s/%s" % (jid, name))
                     for pat in ("metrics_*.json", "dump_*.jsonl"):
                         for p in glob.glob(os.path.join(od, pat)):
-                            tf.add(p, arcname="%s/%s" % (jid, os.path.basename(p)))
+                            zf.write(p, "%s/%s" % (jid, os.path.basename(p)))
+                    # 抽帧存档（多模型任务在 preview/<tag>/ 下，一并带上）
+                    for p in (glob.glob(os.path.join(od, "preview", "*", "shot_*.jpg"))
+                              + glob.glob(os.path.join(od, "preview", "shot_*.jpg"))):
+                        zf.write(p, "%s/%s" % (jid, os.path.relpath(p, od)))
+                    # 可视化：vis/<tag>/ 目录结构原样保留 → 压缩包里按模型区分
+                    n_vis = 0
                     vd = os.path.join(od, "vis")
                     if os.path.isdir(vd):
                         for p in (glob.glob(os.path.join(vd, "*", "*_vis.jpg"))
                                   + glob.glob(os.path.join(vd, "*_vis.jpg"))):
-                            tf.add(p, arcname="%s/vis/%s" % (jid, os.path.relpath(p, vd)))
-                self._send(200, open(tgz, "rb").read(), "application/gzip",
-                           dl="%s_results.tar.gz" % jid)
+                            zf.write(p, "%s/vis/%s" % (jid, os.path.relpath(p, vd)))
+                            n_vis += 1
+                    # 离线结果页 + 结构说明（README 注明按目录名区分模型）
+                    zf.writestr("%s/index.html" % jid, _job_export_html(j))
+                    zf.writestr("%s/README.txt" % jid, _archive_readme(j, n_vis))
+                self._send(200, open(zp, "rb").read(), "application/zip",
+                           dl="%s_results.zip" % jid)
             except Exception as e:
                 self._send(500, "archive 失败: %s" % e, "text/plain")
             finally:
                 try:
-                    os.remove(tgz)
+                    os.remove(zp)
                 except OSError:
                     pass
         elif u.path.startswith("/files/"):
@@ -2646,34 +2760,51 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.exists(rep):
                     extra = ("<div class=card><h2>评测报告</h2>"
                               + mdish(open(rep, errors="replace").read()) + "</div>")
-                    # 结果打包下载：报告/metrics/dump/日志/可视化一个压缩包
+                    # 结果打包下载：离线结果页 + 报告/metrics/dump/日志/可视化/抽帧一个 zip
                     extra += ("<div class=card><h2>结果下载</h2>"
                               "<p><a class=btn href='/archive/%s' "
-                              "style='text-decoration:none'>⬇ 打包下载全部结果（tar.gz）</a></p>"
-                              "<span class=small>含评测报告、各模型 metrics_*.json 与 dump_*.jsonl、"
-                              "run.log、全部可视化结果图；也可用 /files/%s/&lt;文件&gt;?dl=1 取单个文件"
+                              "style='text-decoration:none'>⬇ 打包下载全部结果（zip）</a></p>"
+                              "<span class=small>含离线结果页 index.html（解压即可离线查看）、"
+                              "评测报告、各模型 metrics_*.json 与 dump_*.jsonl、run.log、"
+                              "全部可视化结果图与抽帧存档；多模型对比按 vis/&lt;模型名&gt;/ 目录区分"
+                              "；也可用 /files/%s/&lt;文件&gt;?dl=1 取单个文件"
                               "</span></div>" % (jid, jid))
                     vis_dir = os.path.join(j["out_dir"], "vis")
                     if os.path.isdir(vis_dir):
                         vis_subs = sorted(d for d in os.listdir(vis_dir)
                                           if os.path.isdir(os.path.join(vis_dir, d)))
                         if vis_subs:
-                            # 并行对比：每个模型一个 3×3 九宫格（同数据不同模型）
-                            cols = ""
+                            # 并行对比：每个模型一个九宫格，tab 切换（同数据不同模型）
+                            btns, panels = "", ""
                             for t in vis_subs:
                                 imgs = sorted(glob.glob(os.path.join(vis_dir, t, "*_vis.jpg")))[:9]
-                                if imgs:
-                                    cell = "".join(
-                                        "<img src='/vis/%s/%s/%s' data-lb='/vis/%s/%s/%s'>"
-                                        % (jid, t, html.escape(os.path.basename(i)),
-                                           jid, t, html.escape(os.path.basename(i)))
-                                        for i in imgs)
-                                    cols += ("<div class=pcol><b class=small>%s</b>"
-                                             "<div class=grid9>%s</div></div>"
-                                             % (html.escape(t), cell))
-                            if cols:
-                                extra += ("<div class=card><h2>检测结果对比（同数据不同模型，每模型 9 张）</h2>"
-                                          "<div class=pcmp>%s</div></div>" % cols)
+                                if not imgs:
+                                    continue
+                                cell = "".join(
+                                    "<img src='/vis/%s/%s/%s' data-lb='/vis/%s/%s/%s'>"
+                                    % (jid, t, html.escape(os.path.basename(i)),
+                                       jid, t, html.escape(os.path.basename(i)))
+                                    for i in imgs)
+                                btns += ("<button class=vtab%s onclick=\"vtabShow('%s',this)\">"
+                                         "%s</button>"
+                                         % ("" if btns else " on", t, html.escape(t)))
+                                panels += ("<div class=vpanel%s id=vp_%s>"
+                                           "<div class=grid9>%s</div></div>"
+                                           % ("" if panels else "", t, cell))
+                            if btns:
+                                extra += ("<div class=card><h2>检测可视化（多模型对比）</h2>"
+                                          "<div>%s</div>%s"
+                                          "<script>function vtabShow(t,b){"
+                                          "var ps=document.querySelectorAll('.vpanel');"
+                                          "for(var i=0;i<ps.length;i++)ps[i].style.display='none';"
+                                          "var el=document.getElementById('vp_'+t);"
+                                          "if(el)el.style.display='block';"
+                                          "var bs=document.querySelectorAll('.vtab');"
+                                          "for(var i=0;i<bs.length;i++)bs[i].classList.remove('on');"
+                                          "b.classList.add('on');}</script>"
+                                          "<span class=small>点击模型名切换对应九宫格；"
+                                          "点击图片浮窗放大，ESC 或点击空白处关闭</span></div>"
+                                          % (btns, panels))
                         else:
                             imgs = sorted(glob.glob(os.path.join(vis_dir, "*_vis.jpg")))[:9]
                             if imgs:
@@ -2682,10 +2813,10 @@ class Handler(BaseHTTPRequestHandler):
                                     % (j["id"], html.escape(os.path.basename(i)),
                                        j["id"], html.escape(os.path.basename(i)))
                                     for i in imgs)
-                                extra += ("<div class=card><h2>检测可视化（九宫格，共 %d 张）</h2>"
+                                extra += ("<div class=card><h2>检测可视化</h2>"
                                           "<div class=grid9>%s</div>"
                                           "<span class=small>点击任意图片浮窗放大，ESC 或点击空白处关闭</span></div>"
-                                          % (len(glob.glob(os.path.join(vis_dir, "*_vis.jpg"))), cell))
+                                          % cell)
                 else:
                     extra = ("<div class=card><h2>结果</h2><pre>"
                              + html.escape(tail(j["log_path"], 30)) + "</pre></div>")
