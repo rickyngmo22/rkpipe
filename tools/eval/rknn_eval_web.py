@@ -210,6 +210,8 @@ FORM = """
 <label>选择模型</label><select name="model" id="model_sel">%(model_options)s</select><br>
 <label>或上传模型</label><input type="file" id="model_file" accept=".rknn" onchange="uploadModel(this)">
 <span id="model_up_stat" class="small">.rknn 上传到板上 uploads/models/（大文件请直接拷到 model/）</span><br>
+<label>对比模型</label><span id="cmp_rows"><select name="cmp" id="cmp_main" onchange="onCmpChange()"><option value="">不对比（单模型）</option>%(model_options)s</select></span>
+<input class="btn sub" type="button" id="cmp_add" value="＋添加" onclick="addCmpRow()" style="width:auto;padding:4px 10px" disabled><span class="small">可加多个：N 模型并行对比，线程均分</span><br>
 <label>任务</label><select name="task" onchange="onTaskChange(this)">%(task_options)s</select>
 <span class="small">detect / pose / seg / obb</span><br>
 <h3>数据集</h3>
@@ -232,22 +234,20 @@ FORM = """
 </span>
 <input type="hidden" name="uploaded_ds" value="">
 <input type="hidden" name="sync_key" value="">
-<h3>参数</h3>
-<label>label 文件</label><input name="label" id="label_in" value="%(label)s" placeholder="留空 = 按标注 JSON 自动生成">
-<input type="file" id="label_file" accept=".txt" onchange="uploadLabel(this)"><br>
-<span id="label_stat" class="small">类别表只影响可视化框上的文字（越界降级 clsN），不影响精度指标；留空会自动从标注 categories 生成，自定义数据集同样适用</span><br>
-<label>类别数</label><input name="obj_num" value="%(obj_num)s" size="6"><br>
-<label>conf / threads</label><input name="conf" value="%(conf)s" size="6">
-<input name="threads" value="%(threads)s" size="4"><br>
 <label>数据缓存</label><input type="checkbox" name="keep_ds" %(keep_ds)s> 评测完成后保留上传的数据
 （默认<b>保留</b>：同一文件夹二次评测只传差异图片、失败任务可断点续跑；取消勾选则用完即删，省板端空间）<br>
 <span id="batch_box"><label>边传边测</label><input type="checkbox" name="batch_up" id="batch_up" %(batch_up)s onchange="batchMode()">
 每 <input name="batch_size" id="batch_size" value="%(batch_size)s" size="5"> 张一批：
 传满一批板端即开始推理（<b>上传与推理重叠</b>），全部到齐后自动合并出报告
-<span class="small">—— 数千张的大文件夹推荐；需先选好标注；暂不支持多模型对比</span></span><br>
+<span class="small">—— 数千张的大文件夹推荐；需先选好标注；支持多模型对比（批内串行推理）</span></span><br>
 <input type="hidden" name="batch_total" id="batch_total" value="">
-<label>对比模型</label><span id="cmp_rows"><select name="cmp" id="cmp_main" onchange="onCmpChange()"><option value="">不对比（单模型）</option>%(model_options)s</select></span>
-<input class="btn sub" type="button" id="cmp_add" value="＋添加" onclick="addCmpRow()" style="width:auto;padding:4px 10px" disabled><span class="small">可加多个：N 模型并行对比，线程均分</span><br>
+<h3>参数</h3>
+<label>label 文件</label><input name="label" id="label_in" value="%(label)s" placeholder="留空 = 按标注 JSON 自动生成">
+<input type="file" id="label_file" accept=".txt" onchange="uploadLabel(this)"><br>
+<span id="label_stat" class="small">类别表只影响可视化框上的文字（越界降级 clsN），不影响精度指标；留空会自动从标注 categories 生成，自定义数据集同样适用</span><br>
+<label>类别数</label><input name="obj_num" value="%(obj_num)s" size="6"><br>
+<label>置信度</label><input name="conf" value="%(conf)s" size="6">
+<label>线程数</label><input name="threads" value="%(threads)s" size="4"><br>
 <h3>输出</h3>
 <label>可视化</label><input type="checkbox" name="vis" checked> 渲染检测结果图（完成后展示）<br>
 <label>实时画面</label><input type="checkbox" name="preview" checked> 推理时板端抽帧快照
