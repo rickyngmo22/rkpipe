@@ -154,9 +154,12 @@ td,th{border-bottom:1px solid var(--line);padding:8px 10px;font-size:13px;text-a
 th{color:var(--sub);font-weight:600;background:#fafbfd}
 tr:hover td{background:#f7f9fc}
 label{display:inline-block;width:130px;font-size:13px;color:var(--sub)}
-input,select{padding:6px 8px;margin:3px 0;width:400px;border:1px solid var(--line);
+input,select{padding:6px 8px;margin:3px 0;width:340px;border:1px solid var(--line);
 border-radius:6px;background:#fff;font:inherit;color:var(--txt)}
 input[type=checkbox]{width:auto;margin-right:4px;vertical-align:middle}
+/* 带 size 属性的小数字框（conf/threads/obj_num/batch_size/preview_port）：
+   行内使用，不能吃全局 400px/340px 宽度 */
+input[size]{width:86px;padding:4px 6px}
 input[type=file]{width:auto;border:none;padding:2px 0;color:var(--sub)}
 input:focus,select:focus{outline:2px solid #cdddfb;border-color:var(--acc)}
 .btn{padding:8px 22px;width:auto;cursor:pointer;background:var(--acc);color:#fff;
