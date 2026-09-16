@@ -42,9 +42,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,9 +92,13 @@ JOB_ORDER = []
 LOCK = threading.Lock()
 QUEUE = []  # 待执行 job id
 RUNNING = {}  # board_key -> jid（同板串行）
-PREVIEW_CACHE = {}  # jid -> (ts, jpeg_bytes)：板端 MJPEG 抓帧缓存（2s）
+PREVIEW_CACHE = {}  # jid -> (ts, jpeg_bytes)：板端最新帧缓存（/job/<id>/preview.jpg 用）
 PREVIEW_IDX = {}    # jid -> 下一个快照槽位（out_dir/preview/shot_<i%6>.jpg 轮转）
 SHOT_SLOTS = 6      # 运行页底部展示的快照张数（每 ~3s 抽 1 帧，跳帧刷新）
+SHOT_INTERVAL = 3.0  # 快照存档间隔（秒）—— 板端流 100+ fps，按时间抽样而非按帧
+# 板端 web_preview_server 的 MJPEG 分帧标记（src/io/web_preview_server.cc: kBoundary）
+MJPEG_BOUNDARY = b"frame"
+LIVE_PORT_WAIT = 90  # 预览端口最长等待秒数（模型加载期间服务尚未 listen）
 DATASET_DIRS = ["datasets", os.path.join(HERE, "datasets")]
 # PC 数据集拉取的板上缓存根目录（按数据集 key 稳定存放 → rsync 增量，二次评测≈0 传输）
 RK_EVAL_DATA = os.environ.get("RK_EVAL_DATA", "/userdata/rk_eval_data")
@@ -103,7 +108,9 @@ DEFAULTS = dict(
     model="",
     images="test_images",
     ann="",
-    label="assets/labels/coco_80_labels_list.txt",
+    # 留空 = 由标注 JSON 的 categories 自动生成（自定义数据集也适用）；
+    # 旧值 "assets/labels/coco_80_labels_list.txt" 是相对路径，依赖服务 CWD。
+    label="",
     obj_num="80",
     conf="0.25",
     threads="4",
@@ -131,7 +138,7 @@ h3{font-size:13px;margin:16px 0 6px;color:var(--sub);font-weight:600;
 text-transform:uppercase;letter-spacing:.04em}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
 padding:18px 20px;margin-bottom:18px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
-table{border-collapse:collapse;width:100%%}
+table{border-collapse:collapse;width:100%}
 td,th{border-bottom:1px solid var(--line);padding:8px 10px;font-size:13px;text-align:left}
 th{color:var(--sub);font-weight:600;background:#fafbfd}
 tr:hover td{background:#f7f9fc}
@@ -156,15 +163,20 @@ vertical-align:middle}
 pre{background:var(--dark);color:#cdd6e4;padding:12px;font-size:12px;line-height:1.5;
 overflow:auto;max-height:380px;border-radius:8px;margin:8px 0}
 .shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
-.shots img{width:100%%;border-radius:8px;border:1px solid var(--line);background:#000;
+.shots img{width:100%;border-radius:8px;border:1px solid var(--line);background:#000;
 min-height:110px;object-fit:contain}
 .shots img.empty{visibility:hidden}
+/* 实时画面：反代板端 MJPEG 长连接（/job/<id>/live.mjpg），浏览器原生滚动播放。
+   注意不能给这个 img 加 ?t= 破缓存（会断流重连），刷新靠流本身推帧。 */
+.live{width:100%;max-width:640px;border-radius:8px;border:1px solid var(--line);
+background:#000;display:block;margin:0 auto 10px;min-height:120px;object-fit:contain}
+.livehint{text-align:center;margin:-4px 0 10px}
 .pcmp{display:flex;gap:12px;flex-wrap:wrap}
 .pcol{flex:1;min-width:190px}
 .pcol img{width:100%;border-radius:8px;border:1px solid var(--line);background:#000;
 display:block;margin-top:4px;min-height:90px;object-fit:contain}
 .visgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
-.visgrid img{width:100%%;border-radius:8px;border:1px solid var(--line)}
+.visgrid img{width:100%;border-radius:8px;border:1px solid var(--line)}
 details.cmd{margin:8px 0}
 details.cmd summary{cursor:pointer;color:var(--sub);font-size:12px}
 </style></head><body>
@@ -211,7 +223,9 @@ FORM = """
 <input type="hidden" name="uploaded_ds" value="">
 <input type="hidden" name="sync_key" value="">
 <h3>参数</h3>
-<label>label 文件</label><input name="label" value="%(label)s" placeholder="可选：模型类别表（顺序校验）"><br>
+<label>label 文件</label><input name="label" id="label_in" value="%(label)s" placeholder="留空 = 按标注 JSON 自动生成">
+<input type="file" id="label_file" accept=".txt" onchange="uploadLabel(this)"><br>
+<span id="label_stat" class="small">类别表只影响可视化框上的文字（越界降级 clsN），不影响精度指标；留空会自动从标注 categories 生成，自定义数据集同样适用</span><br>
 <label>类别数</label><input name="obj_num" value="%(obj_num)s" size="6"><br>
 <label>conf / threads</label><input name="conf" value="%(conf)s" size="6">
 <input name="threads" value="%(threads)s" size="4"><br>
@@ -438,8 +452,50 @@ function syncAnnFile(input) {
       SYNC.annOk = true;
       f.ann.value = '/userdata/rk_eval_data/' + SYNC.key + '/' + file.name;
       syncStat('✓ 标注已上传');
+      autoLabel(file.name);   // 顺手按 categories 生成类别表回填
     } else syncStat('✗ 标注上传失败，请重选');
   });
+}
+/* 类别表：按标注 JSON 的 categories 自动生成并回填（自定义数据集同样适用） */
+function autoLabel(annRel) {
+  var st = document.getElementById('label_stat');
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/sync/done?key=' + encodeURIComponent(SYNC.key) +
+           '&ann=' + encodeURIComponent(annRel) + '&label=1');
+  xhr.onload = function() {
+    var r = null;
+    try { r = JSON.parse(xhr.responseText); } catch (e) {}
+    if (r && r.label_auto) {
+      var li = document.getElementById('label_in');
+      if (li && !li.value) li.value = r.label_auto;
+      if (st) st.textContent = '✓ 类别表已按标注自动生成（' + (r.label_n || 0) + ' 类）';
+    } else if (st) {
+      st.textContent = (r && r.error) ? ('✗ ' + r.error)
+                                      : '类别表未能自动生成（将用内置表或降级 clsN）';
+    }
+  };
+  xhr.onerror = function() { if (st) st.textContent = '类别表生成请求失败（不影响评测）'; };
+  xhr.send();
+}
+/* label 文件 UI 上传（覆盖自动生成的结果，路径回填输入框） */
+function uploadLabel(input) {
+  var file = input.files[0];
+  if (!file) return;
+  var st = document.getElementById('label_stat');
+  st.textContent = '上传中 ' + file.name + ' ...';
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload?name=' + encodeURIComponent(file.name));
+  xhr.onload = function() {
+    try {
+      var r = JSON.parse(xhr.responseText);
+      if (r.ok && r.kind == 'label') {
+        document.getElementById('label_in').value = r.path;
+        st.textContent = '✓ 已就绪：' + r.path + '（' + (r.count || 0) + ' 类）';
+      } else { st.textContent = '✗ ' + (r.error || '上传失败'); }
+    } catch (e) { st.textContent = '✗ 上传失败'; }
+  };
+  xhr.onerror = function() { st.textContent = '✗ 上传失败(网络)'; };
+  xhr.send(file);
 }
 /* 提交: 等图片+标注都就绪才允许(上传状态由 syncFolder/syncAnnFile 维护) */
 function beforeSubmit(ev) {
@@ -541,13 +597,96 @@ def scan_datasets():
     return out
 
 
+def _mjpeg_frames(resp, boundary=MJPEG_BOUNDARY, maxbuf=16 << 20):
+    """从板端 MJPEG 流里按 boundary 切出**原始 JPEG 字节**（零解码）。
+
+    板端 part 结构（src/io/web_preview_server.cc:779-787）：
+        --frame\\r\\nContent-Type: image/jpeg\\r\\nContent-Length: N\\r\\n\\r\\n<JPEG>\\r\\n
+    直接透传原始 JPEG，比 cv2 解一遍再重编码省 CPU 且不损失画质。
+    """
+    delim = b"--" + boundary
+    buf = b""
+    while True:
+        chunk = resp.read(65536)
+        if not chunk:
+            return
+        buf += chunk
+        while True:
+            i = buf.find(delim)
+            if i < 0:
+                if len(buf) > maxbuf:      # 异常流：只保留尾部，防止内存无限涨
+                    buf = buf[-65536:]
+                break
+            j = buf.find(delim, i + len(delim))
+            if j < 0:
+                if i > 0:
+                    buf = buf[i:]           # 丢掉 boundary 之前的残留
+                break
+            part = buf[i + len(delim):j]
+            buf = buf[j:]
+            k = part.find(b"\r\n\r\n")
+            if k < 0:
+                continue
+            data = part[k + 4:].strip(b"\r\n")
+            if data[:2] == b"\xff\xd8":     # JPEG SOI
+                yield data
+
+
+def stream_shots(job, port, stop, sub=""):
+    """长期连接板端 /stream.mjpg 抽帧存档。
+
+    为什么必须用长连接：板端 encodeLoop 里 `if (client_fds_.empty()) continue;`
+    （web_preview_server.cc:555-562）——**没有 MJPEG 客户端时它整段跳过 JPEG 编码**。
+    旧的短连接轮询 /snapshot.jpg 自己不驱动编码，只能捡别人留下的帧，实测仅
+    3.24 帧/s 且经常 503；长连接下同刻 111 帧/s。所以这里自己持一个常驻连接。
+    """
+    jid, od = job["id"], job["out_dir"]
+    url = "http://127.0.0.1:%s/stream.mjpg" % port
+    dst = os.path.join(od, "preview", sub) if sub else os.path.join(od, "preview")
+    key = "%s_%s" % (jid, sub) if sub else jid
+    while not stop.is_set() and job["state"] == "running":
+        try:
+            resp = urllib.request.urlopen(url, timeout=10)
+        except Exception:
+            stop.wait(2)          # 预览服务尚未 listen（模型加载/批数据同步中）→ 退避
+            continue
+        last = 0.0
+        try:
+            for data in _mjpeg_frames(resp):
+                if stop.is_set() or job["state"] != "running":
+                    break
+                now = time.time()
+                PREVIEW_CACHE[key] = (now, data)   # 最新帧（/job/<id>/preview.jpg 兜底）
+                if now - last >= SHOT_INTERVAL:    # 111fps 的流按时间抽样，别把盘写爆
+                    last = now
+                    try:
+                        if _rotating_write(dst, PREVIEW_IDX.get(key, 0), data):
+                            PREVIEW_IDX[key] = PREVIEW_IDX.get(key, 0) + 1
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        if stop.is_set() or job["state"] != "running":
+            break
+        stop.wait(1)              # 流被断开（任务切换 / 板端服务重启）→ 重连
+
+
 def _grab_jpeg(port, cache_key=None):
-    """从板端 MJPEG 预览的 /snapshot.jpg 抓一帧（2s 缓存），返回 JPEG 字节。"""
+    """抓单帧：优先取常驻流的缓存帧；无流时退回 /snapshot.jpg 短连接。
+
+    短连接路径只是兜底——它不驱动板端编码（见 stream_shots 的说明），
+    首次抓帧往往要等好几秒才有画面。
+    """
     ent = PREVIEW_CACHE.get(cache_key)
     if ent and time.time() - ent[0] < 1:
         return ent[1]
     if cv2 is None:
-        return None
+        return ent[1] if ent else None
     cap = cv2.VideoCapture("http://127.0.0.1:%s/snapshot.jpg" % port)
     ok, frame = cap.read()
     cap.release()
@@ -560,6 +699,32 @@ def _grab_jpeg(port, cache_key=None):
     if cache_key:
         PREVIEW_CACHE[cache_key] = (time.time(), data)
     return data
+
+
+def _preview_targets(job):
+    """任务应拉取的预览流：[(tag, port, sub_dir)]。
+
+    并行对比任务每模型一路（preview_ports 由 _write_job_script 生成），
+    单模型一路（端口从命令行 --preview-port 解析）。
+    """
+    ports = job.get("preview_ports") or []
+    if ports:
+        return [(str(tag), str(port), str(tag)) for tag, port in ports]
+    cmd = job.get("cmd", "")
+    m = re.search(r"--preview-port (\d+)", cmd)
+    if m:
+        return [("", m.group(1), "")]
+    if "--preview" in cmd:
+        return [("", "8090", "")]
+    return []
+
+
+def preview_port_of(job, tag=None):
+    """任务预览端口（反代 /job/<id>/live.mjpg 用）；tag 指定时取对比里的某个模型。"""
+    for t, port, _sub in _preview_targets(job):
+        if tag is None or t == tag:
+            return port
+    return ""
 
 
 PREVIEW_LAST = {}  # 快照目录 -> 上一帧 md5（同帧不重复落盘、不推进轮转位）
@@ -578,37 +743,15 @@ def _rotating_write(d, idx, data):
 
 
 def grab_preview(job):
-    """单模型任务的板端抽帧（同时落盘到 out_dir/preview/ 供存档展示）。"""
-    jid = job["id"]
-    m = re.search(r"--preview-port (\d+)", job.get("cmd", ""))
-    if not m and "run_eval.py" not in job.get("cmd", "") \
-            and "--preview" not in job.get("cmd", ""):
-        return None
-    data = _grab_jpeg(m.group(1) if m else "8090", cache_key=jid)
-    if data is None:
-        return None
-    try:
-        if _rotating_write(os.path.join(job["out_dir"], "preview"),
-                           PREVIEW_IDX.get(jid, 0), data):
-            PREVIEW_IDX[jid] = PREVIEW_IDX.get(jid, 0) + 1
-    except OSError:
-        pass
-    return data
+    """取任务当前最新一帧（反代 /job/<id>/preview.jpg 用）。无预览任务返回 None。
 
-
-def sample_previews(job):
-    """并行对比任务的板端抽帧：每个模型实例一个端口，
-    快照按模型分目录落盘（out_dir/preview/<tag>/），任务页同帧分列对比。"""
-    for i, (tag, port) in enumerate(job.get("preview_ports") or []):
-        try:
-            data = _grab_jpeg(str(port), cache_key="%s_%s" % (job["id"], tag))
-            if data is not None:
-                key = "%s_%s" % (job["id"], tag)
-                if _rotating_write(os.path.join(job["out_dir"], "preview", tag),
-                                   PREVIEW_IDX.get(key, 0), data):
-                    PREVIEW_IDX[key] = PREVIEW_IDX.get(key, 0) + 1
-        except OSError:
-            pass
+    抽帧存档已由 stream_shots 常驻线程负责，这里只做单帧兜底读取。
+    """
+    t = _preview_targets(job)
+    if not t:
+        return None
+    _tag, port, sub = t[0]
+    return _grab_jpeg(port, cache_key=("%s_%s" % (job["id"], sub)) if sub else job["id"])
 
 
 def find_eval_bin():
@@ -631,28 +774,19 @@ def run_job(job):
     # 开了实时预览的任务：后台采样线程每 2s 抽帧轮转落盘——单模型写到
     # preview/，并行对比任务按模型写到 preview/<tag>/（任务页同帧分列对比）。
     stop = threading.Event()
-    if job.get("preview_ports") and cv2 is not None:
+    targets = _preview_targets(job)
+    if targets:
+        # 每个预览实例一个常驻长连接线程：长连接本身就驱动板端编码（无客户端时
+        # 板端整段跳过 JPEG 编码），同时把抽帧存档落到 out_dir/preview/
+        # （并行对比按模型分目录）。不再依赖 cv2，板端无 OpenCV-Python 也能预览。
         def sampler():
-            while not stop.is_set() and job["state"] == "running":
-                try:
-                    sample_previews(job)
-                except Exception:
-                    pass
-                stop.wait(1)  # 并行批次较短，加密采样避免错过批次窗口
-        threading.Thread(target=sampler, daemon=True).start()
-    elif "--preview" in job["cmd"] and cv2 is not None:
-        def sampler():
-            fail = 0
-            while not stop.is_set() and job["state"] == "running":
-                try:
-                    ok = grab_preview(job) is not None
-                except Exception:
-                    ok = False
-                # 批次间隙(模型加载/等补传)预览服务不在, 连续失败退避到 5s 再试,
-                # 服务恢复后自动回到 1s 采样——避免空转的同时保证画面及时续上
-                fail = 0 if ok else fail + 1
-                stop.wait(5 if fail > 4 else 1)
-        threading.Thread(target=sampler, daemon=True).start()
+            ths = [threading.Thread(target=stream_shots,
+                                    args=(job, port, stop, sub), daemon=True)
+                   for _tag, port, sub in targets]
+            for th in ths:
+                th.start()
+            for th in ths:
+                th.join()
         threading.Thread(target=sampler, daemon=True).start()
     # 新进程组：终止时 killpg 连子进程（rsync/rknn_eval 等）一起带走
     logf = open(job["log_path"], "a")
@@ -1034,6 +1168,9 @@ def start_job(form):
                 obj_num = str(len(cats))
         except (OSError, ValueError):
             pass
+    # label 类别表：留空或所填路径板上不存在时，按标注 JSON 自动生成
+    # （--label 只影响可视化文字，不影响指标；自定义数据集不给会显示 cls0/cls1）
+    label, label_note = resolve_label(label, ann, task, os.path.abspath(out_dir))
     vis = form.get("vis") == ["on"]
     preview = form.get("preview") == ["on"]
     pv_base = int(form.get("preview_port", ["8090"])[0].strip() or 8090)
@@ -1090,6 +1227,9 @@ def start_job(form):
         if preview:
             cmd += ["--preview", "--preview-port", str(pv_base)]
         cmd_s = " ".join("'%s'" % c if " " in c else c for c in cmd)
+
+    if label_note:
+        note = (note + " | " if note else "") + label_note
 
     with LOCK:
         # form 快照: 任务页"重新提交"跳回提交页时按此预填(模型/任务/参数/数据来源)
@@ -1220,7 +1360,9 @@ def retry_job(jid):
     return new_id, None
 
 
-UPLOAD_DIR = "uploads"
+# 板上上传件根目录（模型 / label 表 / zip 数据集）。基于仓库根取绝对路径：
+# 旧值是相对路径，依赖服务进程的 CWD，换目录启动就读不到已上传的模型。
+UPLOAD_DIR = os.path.join(REPO_ROOT, "uploads")
 
 
 def safe_name(name):
@@ -1261,6 +1403,79 @@ def probe_dataset(d):
         if ann is None and len(cands) == 1:
             ann = cands[0]
     return images, ann, names_f
+
+
+def labels_from_ann(ann_path):
+    """从标注 JSON 的 categories 生成类别表（按 id 升序 = 模型输出序号）。
+
+    COCO 官方 80 类是 id 1~90 的空洞编号，按 id 升序排出来正合官方顺序；
+    自定义数据集的 categories 自带 names，同样适用。失败返回 []。
+    """
+    try:
+        cj = json.load(open(ann_path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    cats = cj.get("categories") if isinstance(cj, dict) else None
+    if not isinstance(cats, list) or not cats:
+        return []
+    named = [c for c in cats if isinstance(c, dict) and c.get("name")]
+    if not named:
+        return []
+    try:
+        named.sort(key=lambda c: int(c.get("id", 0)))
+    except (TypeError, ValueError):
+        pass
+    return [str(c["name"]) for c in named]
+
+
+def auto_label_path(key):
+    """PC 同步数据集对应的自动类别表落盘路径（服务管理，不受数据缓存清理影响）。"""
+    safe = re.sub(r"[^0-9A-Za-z_.-]", "_", key or "default")
+    return os.path.join(UPLOAD_DIR, "labels", safe + ".txt")
+
+
+def write_labels(dest, names):
+    """把类别表写到 dest，返回路径；失败返回 ""。"""
+    if not names:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write("\n".join(names) + "\n")
+    except OSError:
+        return ""
+    return dest
+
+
+def resolve_label(label, ann, task, out_dir):
+    """确定本次评测传给 --label 的类别表，返回 (路径, 说明)。
+
+    --label 本身不影响精度指标：它只喂给可视化渲染（rknn_eval_main.cc:712
+    render_vis），越界会安全降级成 clsN。但自定义数据集不给它，框上就只能显示
+    cls0/cls1。优先级：
+      1. 表单填的板端路径且存在 → 直接用；
+      2. 否则由标注 JSON 的 categories 自动生成（随任务产物留存）；
+      3. 否则回退仓库内置 assets/labels/ 里与任务匹配的那份；
+      4. 都没有 → 空（不传 --label，C++ 侧降级 clsN）。
+    """
+    if label and os.path.isfile(label):
+        return label, ""
+    names = labels_from_ann(ann) if ann and os.path.isfile(ann) else []
+    if names:
+        dst = write_labels(os.path.join(out_dir, "labels_auto.txt"), names)
+        if dst:
+            note = "类别表由标注 JSON 自动生成（%d 类）" % len(names)
+            if label:
+                note += "；表单所填板上不存在: %s" % label
+            return dst, note
+    builtin = {"obb": "assets/labels/yolov8_obb_labels_list.txt",
+               "detect": "assets/labels/coco_80_labels_list.txt"}.get(task, "")
+    if builtin:
+        for base in (REPO_ROOT, HERE):
+            ap = os.path.join(base, builtin)
+            if os.path.isfile(ap):
+                return ap, ""
+    return "", ""
 
 
 # ---- PC 文件夹同步（浏览器 webkitdirectory 增量上传；Windows 零环境）----
@@ -1451,7 +1666,7 @@ def handle_sync_reset(key):
     return {"ok": True}
 
 
-def handle_sync_done(key, ann_rel=None):
+def handle_sync_done(key, ann_rel=None, want_label=False):
     if not _valid_key(key):
         return {"ok": False, "error": "非法 key"}
     root = os.path.join(RK_EVAL_DATA, key)
@@ -1486,6 +1701,13 @@ def handle_sync_done(key, ann_rel=None):
                 r["obj_num"] = str(len(cj["categories"]))
         except (OSError, ValueError):
             pass
+        # want_label：按标注 categories 自动生成类别表（PC 侧无感回填，自定义数据集同理）
+        if want_label:
+            names = labels_from_ann(ann)
+            lp = write_labels(auto_label_path(key), names)
+            if lp:
+                r["label_auto"] = lp
+                r["label_n"] = len(names)
     return r
 
 
@@ -1535,6 +1757,20 @@ def handle_upload(query, body):
         if os.path.abspath(final) != os.path.abspath(dest):
             os.replace(dest, final)
         return {"ok": True, "path": final, "kind": "model"}
+    if name.lower().endswith(".txt"):
+        # 类别表归位 uploads/labels/（行序 = 模型输出类别序号；只影响可视化文字）
+        ldir = os.path.join(UPLOAD_DIR, "labels")
+        os.makedirs(ldir, exist_ok=True)
+        final = os.path.join(ldir, name)
+        if os.path.abspath(final) != os.path.abspath(dest):
+            os.replace(dest, final)
+        cnt = 0
+        try:
+            with open(final, encoding="utf-8", errors="replace") as f:
+                cnt = sum(1 for ln in f if ln.strip())
+        except OSError:
+            pass
+        return {"ok": True, "path": final, "kind": "label", "count": cnt}
     return {"ok": True, "path": dest}
 
 
@@ -1635,6 +1871,41 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _proxy_mjpeg(self, port, path="/stream.mjpg"):
+        """把板端 MJPEG 长连接原样字节转发给浏览器（零缓冲、零解码、低延迟）。
+
+        板端 streamHeader 是 HTTP/1.1 + Connection: close + boundary=frame
+        （src/io/web_preview_server.cc:252-261），这里照搬——HTTP/1.0 下部分
+        浏览器不会滚动播放 multipart/x-mixed-replace。
+        这样 8081 页面对板端就是"一个长连接客户端"，正是驱动板端编码的条件。
+        """
+        url = "http://127.0.0.1:%s%s" % (port, path)
+        try:
+            resp = urllib.request.urlopen(url, timeout=10)
+        except Exception:
+            self._send(404, "preview stream not up", "text/plain")
+            return
+        self.close_connection = True
+        try:
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY +
+                b"\r\nCache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+                b"Pragma: no-cache\r\nConnection: close\r\n"
+                b"Access-Control-Allow-Origin: *\r\n\r\n")
+            while True:
+                chunk = resp.read(32768)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except Exception:
+            pass          # 用户关页面 / 任务结束 → BrokenPipe 等，静默收尾
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/":
@@ -1720,6 +1991,9 @@ class Handler(BaseHTTPRequestHandler):
                  "note": j.get("note", ""),
                  "batch_done": _batch_done_of(j),
                  "shots_total": _shots_total_of(j),
+                 # rc / cmd 一并暴露：排查脚本与页面摘要都要用（此前只能读 web_job.json）
+                 "rc": j.get("rc"),
+                 "cmd": j.get("cmd", ""),
                  "form": j.get("form") or {}}
             self._send(200, json.dumps(r, ensure_ascii=False), "application/json")
         elif u.path == "/api/sync/refill-done":
@@ -1746,7 +2020,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(r), "application/json")
         elif u.path == "/api/sync/done":
             q = parse_qs(u.query)
-            r = handle_sync_done(q.get("key", [""])[0], q.get("ann", [""])[0])
+            r = handle_sync_done(q.get("key", [""])[0], q.get("ann", [""])[0],
+                                 q.get("label", [""])[0] == "1")
             self._send(200, json.dumps(r, ensure_ascii=False), "application/json")
         elif u.path == "/compare":
             self._send(200, render_page(compare_page(parse_qs(u.query))))
@@ -1758,6 +2033,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, data, "image/jpeg")
             else:
                 self._send(404, "no preview", "text/plain")
+        elif u.path.startswith("/job/") and (u.path.endswith("/live.mjpg")
+                                             or "/live/" in u.path):
+            # 实时画面反代（同源，不受板 IP 变化影响）：
+            #   /job/<jid>/live.mjpg        → 单模型
+            #   /job/<jid>/live/<tag>.mjpg  → 并行对比按模型分列
+            parts = u.path.split("/")
+            tag = None
+            if len(parts) == 5 and parts[3] == "live" and parts[4].endswith(".mjpg"):
+                tag = parts[4][:-5]
+            port = preview_port_of(JOBS[parts[2]], tag) if len(parts) >= 4 \
+                and JOBS.get(parts[2]) else ""
+            if port:
+                self._proxy_mjpeg(port)
+            else:
+                self._send(404, "no live stream", "text/plain")
         elif u.path.startswith("/vis/"):
             # 任务可视化：/vis/<jid>/<file> 或并行对比的 /vis/<jid>/<tag>/<file>
             parts = u.path.split("/")
@@ -1846,34 +2136,43 @@ class Handler(BaseHTTPRequestHandler):
             running_pv = j["state"] == "running" and (
                 bool(ports) or "--preview" in j.get("cmd", ""))
             if running_pv and ports:
-                # 并行对比：每个模型一列，同帧数据分列对比。
-                # 只渲染已落盘的帧——空槽不再渲染成黑框；首批画面未出时给占位提示
-                cols = ""
+                # 并行对比：每模型一列。画面区走反代长连接实时流（板端满速编码），
+                # 下面单独一块抽帧存档 —— 两者分开 DOM，局部刷新才不会重建 <img> 断流。
+                cols_live, cols_shot = "", ""
                 for tag, _port in ports:
                     pvt = os.path.join(pv_dir, tag)
                     imgs = "".join(
                         "<img src='/files/%s/preview/%s/shot_%d.jpg'>"
-                        % (jid, tag, i) for i in range(SHOT_SLOTS)
+                        % (jid, quote(tag), i) for i in range(SHOT_SLOTS)
                         if os.path.exists(os.path.join(pvt, "shot_%d.jpg" % i)))
                     if not imgs:
-                        imgs = ("<div class=small style='padding:8px;color:#888'>"
-                                "等待首批画面…（批数据同步/模型加载中）</div>")
-                    cols += ("<div class=pcol><b class=small>%s</b>%s</div>"
-                             % (html.escape(tag), imgs))
-                shots = ("<div class=card><h2>推理画面（多模型同帧对比）"
-                         "<span class=small>（每模型一列，帧随推理实时追加）</span></h2>"
-                         "<div class=pcmp id=shots>%s</div></div>" % cols)
+                        imgs = "<div class=small style='color:#888'>尚无存档帧</div>"
+                    head = "<b class=small>%s</b>" % html.escape(tag)
+                    cols_live += ("<div class=pcol>%s"
+                                  "<img class=live src='/job/%s/live/%s.mjpg'></div>"
+                                  % (head, jid, quote(tag, safe="")))
+                    cols_shot += "<div class=pcol>%s%s</div>" % (head, imgs)
+                shots = ("<div class=card><h2>推理画面（多模型实时对比）"
+                         "<span class=small>（每模型一列，板端 MJPEG 实时流）</span></h2>"
+                         "<div class=pcmp>%s</div>"
+                         "<h3>抽帧存档（每 %d 秒 1 张）</h3>"
+                         "<div class=pcmp id=shots>%s</div></div>"
+                         % (cols_live, SHOT_INTERVAL, cols_shot))
             elif running_pv:
+                live = ("<img class=live src='/job/%s/live.mjpg'>"
+                        "<p class='small livehint'>板端 MJPEG 实时流（满速编码）；"
+                        "下方为每 %d 秒一张的抽帧存档</p>" % (jid, SHOT_INTERVAL))
                 slots = "".join(
                     "<img src='/files/%s/preview/shot_%d.jpg'>"
                     % (jid, i) for i in range(SHOT_SLOTS)
                     if os.path.exists(os.path.join(pv_dir, "shot_%d.jpg" % i)))
                 if not slots:
                     slots = ("<div class=small style='padding:8px;color:#888'>"
-                             "等待首批画面…（批数据同步/模型加载中）</div>")
+                             "尚无存档帧（推理刚开始或批数据同步中）</div>")
                 shots = ("<div class=card><h2>推理画面"
-                         "<span class=small>（板端抽帧快照，帧随推理实时追加）</span></h2>"
-                         "<div class=shots id=shots>%s</div></div>" % slots)
+                         "<span class=small>（实时流 + 抽帧存档）</span></h2>"
+                         "<div>%s</div><div class=shots id=shots>%s</div></div>"
+                         % (live, slots))
             elif j["state"] in ("done", "error", "canceled") and sub_tags:
                 # 运行结束也保留快照流（否则页面刷新后画面消失，像"没拍过"）
                 cols = ""
@@ -2072,7 +2371,8 @@ var timer = setInterval(function() {
             self._send(200, json.dumps(r), "application/json")
         elif u.path == "/api/sync/done":
             q = parse_qs(u.query)
-            r = handle_sync_done(q.get("key", [""])[0], q.get("ann", [""])[0])
+            r = handle_sync_done(q.get("key", [""])[0], q.get("ann", [""])[0],
+                                 q.get("label", [""])[0] == "1")
             self._send(200, json.dumps(r, ensure_ascii=False), "application/json")
         else:
             self._send(404, render_page("404"))
