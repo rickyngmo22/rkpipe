@@ -261,7 +261,7 @@ std::string monitorHtml() {
   <div id="editHead"><span class="title" id="editTitle">修改任务</span><div><button onclick="closeEdit()">关闭</button></div></div>
   <form id="editForm">
     <div class="row"><label>任务类型</label>
-      <select name="task"><option value="detect">detect</option><option value="pose">pose</option><option value="obb">obb</option><option value="seg">seg</option><option value="sem">sem</option></select>
+      <select name="task"><option value="detect">detect</option><option value="pose">pose</option><option value="obb">obb</option><option value="seg">seg</option><option value="depth">depth</option><option value="sem">sem</option><option value="ocr_det">ocr_det（文本框检测）</option><option value="ocr">ocr（检测+识别）</option><option value="detect3d">detect3d（单目 3D）</option><option value="face">face（人脸检测）</option><option value="composite_cls">composite_cls（检测+二级分类）</option><option value="rtmpose">rtmpose（两阶段姿态）</option></select>
     </div>
     <div class="row"><label>输入源</label><input name="input" size="40"></div>
     <div class="row"><label>模型</label><input name="model" size="40" placeholder="留空=按任务类型默认"></div>
@@ -287,7 +287,7 @@ std::string monitorHtml() {
       <select name="aux_task"><option value="detect">detect</option><option value="pose">pose</option><option value="obb">obb</option><option value="seg">seg</option><option value="depth">depth</option><option value="sem">sem</option></select>
     </div>
     <div class="row"><label>事件/告警 YAML</label>
-      <textarea name="extra_yaml" placeholder="可选：原样追加到任务 yaml。事件规则示例：&#10;event_line: &quot;450,740,1250,680&quot;&#10;event_line_cross: 1&#10;event_region: &quot;820,480,1230,500,1300,810,750,810&quot;&#10;event_intrusion: 1&#10;alert_enabled: 1&#10;alert_webhook_url: &quot;http://192.0.2.10:9000/alert&quot;"></textarea>
+      <textarea name="extra_yaml" placeholder="可选：原样追加到任务 yaml。事件规则示例：&#10;event_line: &quot;450,740,1250,680&quot;&#10;event_line_cross: 1&#10;event_region: &quot;820,480,1230,500,1300,810,750,810&quot;&#10;event_intrusion: 1&#10;alert_enabled: 1&#10;alert_webhook_url: &quot;http://192.0.2.10:9000/alert&quot;&#10;&#10;rtmpose 双阶段示例（model 填 feat 模型）：&#10;rtmpose_head_path: &quot;/userdata/rkpipe/model/rtmpose-t_256x192_head_fixed.rknn&quot;&#10;person_model_path: &quot;/userdata/rkpipe/model/yolo26n.rknn&quot;&#10;obj_class_num: 1&#10;conf_threshold: 0.3&#10;&#10;composite_cls 二级分类示例：&#10;cls_model_path: &quot;/userdata/rkpipe/model/mobilenetv2_fp16.rknn&quot;&#10;cls_labels_path: &quot;/userdata/rkpipe/model/mobilenet_labels.txt&quot;&#10;obj_class_num: 80"></textarea>
     </div>
     <button type="submit" style="margin-top:6px;" id="editSubmit">保存并重启</button>
   </form>
