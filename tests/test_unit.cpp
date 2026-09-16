@@ -1767,6 +1767,7 @@ static void testTrackerOtherTasks() {
 #include "llm/llm_analyzer.h"
 #include "llm/llm_config.h"
 #include "llm/detection_json.h"
+#include "core/task_result_json.h"
 
 static void testLlmConfig() {
     std::printf("[test] LlmConfig::loadFromFile\n");
@@ -2404,6 +2405,94 @@ static void testEventStatsPersistence() {
     std::remove(path.c_str());
 }
 
+
+// ---- 0.3.0 二级任务 JSONL 载荷回归：composite_cls / face / action ----
+// 覆盖两套序列化器：buildFrameResultJson（JSONL 写入端）与 llm::taskResultToJson（LLM 复查链路）。
+// 背景：0.3.0 前这两处缺二级任务分支，composite_cls 等全落 type:"none" 兜底（板上实测踩坑）。
+static void testResultJsonStage2() {
+    std::printf("[test] ResultJson stage2 (composite_cls/face/action)\n");
+
+    PipelineFrame frame;
+    frame.index = 7;
+    frame.sourceName = "stage2";
+    frame.bufferFrame.width = 1920;
+    frame.bufferFrame.height = 1080;
+    frame.hasResult = true;
+
+    // 1) composite_cls：一级检测框 + 二级 top-1（sub 字段）
+    {
+        CompositeClsTaskResult cc;
+        cc.data.count = 1;
+        cc.data.results[0].box = {10, 20, 110, 120};
+        cc.data.results[0].prop = 0.778f;
+        cc.data.results[0].cls_id = 2;
+        cc.cls_ids = {656};
+        cc.cls_scores = {0.4006f};
+        cc.cls_labels = {"minivan 40%"};
+        frame.result = cc;
+        const std::string json = buildFrameResultJson(frame, nullptr);
+        CHECK(json.find("\"type\":\"composite_cls\"") != std::string::npos);
+        CHECK(json.find("[10,20,100,100]") != std::string::npos);
+        CHECK(json.find("\"sub\":{\"cls\":656") != std::string::npos);
+        CHECK(json.find("\"label\":\"minivan 40%\"") != std::string::npos);
+        const std::string ljson = llm::taskResultToJson(frame.result, {});
+        CHECK(ljson.find("\"type\":\"composite_cls\"") != std::string::npos);
+        CHECK(ljson.find("\"sub\":{\"cls_id\":656") != std::string::npos);
+    }
+    // 1b) composite 无检出 → 空数组、无 sub 键
+    {
+        CompositeClsTaskResult cc;
+        frame.result = cc;
+        const std::string json = buildFrameResultJson(frame, nullptr);
+        CHECK(json.find("\"type\":\"composite_cls\"") != std::string::npos);
+        CHECK(json.find("\"dets\":[]") != std::string::npos);
+        CHECK(json.find("\"sub\"") == std::string::npos);
+    }
+    // 2) face：框 + 5 点 landmark
+    {
+        FaceTaskResult fr;
+        FaceItem f;
+        f.box = {0, 0, 100, 100};
+        f.score = 0.9f;
+        f.landmarks[0] = {10.0f, 20.0f};
+        fr.faces.push_back(f);
+        frame.result = fr;
+        const std::string json = buildFrameResultJson(frame, nullptr);
+        CHECK(json.find("\"type\":\"face\"") != std::string::npos);
+        CHECK(json.find("\"kpts\":[[10,20]") != std::string::npos);
+        const std::string ljson = llm::taskResultToJson(frame.result, {});
+        CHECK(ljson.find("\"type\":\"face\"") != std::string::npos);
+        CHECK(ljson.find("\"landmarks\":[[10.0,20.0]") != std::string::npos);
+    }
+    // 3) action：pose 主结果原样保留 + 本帧新鲜动作项
+    {
+        ActionTaskResult act;
+        act.data.count = 1;
+        act.data.results[0].box = {5, 5, 50, 150};
+        act.data.results[0].box_conf = 0.8f;
+        act.data.results[0].cls_id = 0;
+        act.data.results[0].track_id = 3;
+        act.actions.push_back({3, 12, 0.77f});
+        frame.result = act;
+        const std::string json = buildFrameResultJson(frame, nullptr);
+        CHECK(json.find("\"type\":\"action\"") != std::string::npos);
+        CHECK(json.find("\"actions\":[{\"track_id\":3,\"action\":12,\"score\":0.77}]") != std::string::npos);
+        const std::string ljson = llm::taskResultToJson(frame.result, {});
+        CHECK(ljson.find("\"type\":\"action\"") != std::string::npos);
+        CHECK(ljson.find("\"keypoints\"") != std::string::npos);
+        CHECK(ljson.find("\"actions\":[{\"action_id\":12") != std::string::npos);
+    }
+    // 3b) NaN/Inf 防护：病态分数钳为 0，不得产出非法 JSON 数字
+    {
+        ActionTaskResult act;
+        act.actions.push_back({1, 2, std::nanf("")});
+        frame.result = act;
+        const std::string json = buildFrameResultJson(frame, nullptr);
+        CHECK(json.find("nan") == std::string::npos);
+        CHECK(json.find("NaN") == std::string::npos);
+    }
+}
+
 int main() {
     testConfigLoad();
     testConfigValidate();
@@ -2451,6 +2540,7 @@ int main() {
     testTurbojpeg();
     testLlmConfig();
     testLlmAnalyzer();
+    testResultJsonStage2();
 #ifndef RK_PIPE_CI
     testTrackerIds();
     testTrackerOcclusion();

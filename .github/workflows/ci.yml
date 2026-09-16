@@ -22,7 +22,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ clang libopencv-dev libturbojpeg0-dev
+          sudo apt-get install -y cmake g++ clang libopencv-dev libturbojpeg0-dev libcurl4-openssl-dev
       - name: Select compiler
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then
