@@ -29,6 +29,8 @@ API：
 """
 
 import argparse
+import email
+import email.policy
 import glob
 import hashlib
 import html
@@ -536,11 +538,6 @@ function batchMode() {
   if (batchOn()) syncStat('边传边测已启用：提交后按 ' + batchSize() +
       ' 张一批上传，板端边收边推理（需先选好图片文件夹与标注）');
 }
-function hasCompare() {
-  var sels = document.querySelectorAll('select[name=cmp]');
-  for (var i = 0; i < sels.length; i++) if (sels[i].value) return true;
-  return false;
-}
 /* 按批切分清单。板端 --images 不递归子目录，故文件名扁平化进 b<i>/；
    不同子目录重名会互相覆盖丢图，直接拒绝而非静默出错 */
 function batchPlan(bs) {
@@ -667,8 +664,7 @@ function beforeSubmit(ev) {
     if (SYNC.uploading) { alert('还在上传中，请稍候'); ev.preventDefault(); return false; }
     if (!SYNC.key) { alert('请先选择图片文件夹（用于建立清单）'); ev.preventDefault(); return false; }
     if (!f.ann.value) { alert('请先选择标注文件'); ev.preventDefault(); return false; }
-    if (hasCompare()) { alert('边传边测暂不支持多模型对比 —— 请取消对比模型，或关闭边传边测');
-                        ev.preventDefault(); return false; }
+    // 多模型对比已支持：每批内按模型串行推理，全部到齐后一次出对比报告
     var plan = batchPlan(batchSize());
     if (plan.err) { alert(plan.err); ev.preventDefault(); return false; }
     SYNC.plan = plan;
@@ -678,6 +674,10 @@ function beforeSubmit(ev) {
     if (btn) { btn.disabled = true; btn.value = '提交中...'; }
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/create');
+    /* 必须显式发 urlencoded：板端用 parse_qs 解析表单，遇到 multipart 会全字段解析为空，
+       现象就是提交后弹「模型不存在: 」（冒号后为空）。表单里的 file input 都没有 name，
+       FormData 只含文本字段，可直接转成 URLSearchParams。 */
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
     xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
     xhr.onload = function () {
       var r = null; try { r = JSON.parse(xhr.responseText); } catch (e) {}
@@ -694,7 +694,7 @@ function beforeSubmit(ev) {
       if (btn) { btn.disabled = false; btn.value = '开始评测'; }
     };
     ev.preventDefault();
-    xhr.send(fd);
+    xhr.send(new URLSearchParams(fd).toString());
     return false;
   }
   if (SYNC.uploading) { alert('图片还在上传中，请稍候'); ev.preventDefault(); return false; }
@@ -1315,10 +1315,13 @@ def _write_job_script(out_dir, task, models, images, ann_arg, ann, label, obj_nu
     return path, preview_ports
 
 
-def _write_batch_script(out_dir, task, tag, model, ds_root, ann_arg, ann, label, obj_num,
+def _write_batch_script(out_dir, task, models, ds_root, ann_arg, ann, label, obj_num,
                         conf, threads, vis, preview, pv_base, eval_bin, total):
-    """生成"边传边测"分批消费脚本（单模型）：逐批等待 PC 端上传就绪标记，
-    到一批就 --dump-only 推理一批（上传与推理重叠），全部到齐后合并 dump → 统一评测出报告。
+    """生成"边传边测"分批消费脚本：逐批等待 PC 端上传就绪标记，到一批就 --dump-only
+    推理一批（上传与推理重叠），全部到齐后合并 dump → 统一评测出报告。
+
+    models = [(tag, 模型路径), ...]，首个为主模型。多模型时在**每批内串行**推理
+    （互不抢 NPU 与线程，预览端口每个模型各占一个），最后用 --compare 一次出对比报告。
 
     约定（必须与消费端配套，改动前先读这些函数）：
       ROOT=<数据集根>   _cleanup_dir_from_script 用 `ROOT=([^\\s;]+)` 提取 → 值不能加引号/含空格
@@ -1332,27 +1335,35 @@ def _write_batch_script(out_dir, task, tag, model, ds_root, ann_arg, ann, label,
     os.makedirs(out_dir, exist_ok=True)
     eval_bin = os.path.abspath(eval_bin)
     ds_root = os.path.abspath(ds_root)
+    main_tag = models[0][0]
+    tags = [t for t, _ in models]
 
-    infer = [q(eval_bin), "--task", task, "--model", q(model),
+    # 每批内的推理命令（多模型串行；线程数不降，预览端口按序分配）
+    infer_cmds = []
+    for k, (mtag, mpath) in enumerate(models):
+        c = [q(eval_bin), "--task", task, "--model", q(mpath),
              '--images "$BD"', "--conf", str(conf), "--threads", str(threads),
-             "--dump-only", '--out-dir "$OUT/parts/b$i"', "--name", q(tag)]
-    if label:
-        infer += ["--label", q(label)]
-    if obj_num:
-        infer += ["--obj-num", str(obj_num)]
-    if vis:
-        infer += ['--vis-dir "$OUT/vis"', "--vis-sample", "20"]
-    if preview:
-        infer += ["--preview", "--preview-port", str(pv_base)]
+             "--dump-only", '--out-dir "$OUT/parts/b$i"', "--name", q(mtag)]
+        if label:
+            c += ["--label", q(label)]
+        if obj_num:
+            c += ["--obj-num", str(obj_num)]
+        if vis:
+            c += ['--vis-dir "$OUT/vis"', "--vis-sample", "20"]
+        if preview:
+            c += ["--preview", "--preview-port", str(pv_base + k)]
+        infer_cmds.append(" ".join(c))
 
     # --images 只是给报告回填"推理输入"路径（reuse-dump 不重推理，实测 2s/不耗时）
-    ev = [q(eval_bin), "--task", task, "--reuse-dump", '"$OUT/dump_%s.jsonl"' % tag,
-          "--name", q(tag), '--out-dir "$OUT"', "--conf", str(conf), ann_arg, q(ann),
+    ev = [q(eval_bin), "--task", task, "--reuse-dump", '"$OUT/dump_%s.jsonl"' % main_tag,
+          "--name", q(main_tag), '--out-dir "$OUT"', "--conf", str(conf), ann_arg, q(ann),
           '--images "$ROOT"']
     if label:
         ev += ["--label", q(label)]
     if obj_num:
         ev += ["--obj-num", str(obj_num)]
+    for mtag in tags[1:]:
+        ev += ["--compare", '%s=dump:"$OUT/dump_%s.jsonl"' % (mtag, mtag)]
 
     L = ["#!/bin/bash", "set -e",
          "ROOT=%s" % ds_root,
@@ -1373,44 +1384,47 @@ def _write_batch_script(out_dir, task, tag, model, ds_root, ann_arg, ann, label,
          "  done",
          "  [ $rc -eq 0 ] || break",
          '  echo "@stage infer 第 $i/$((TOTAL-1)) 批（边传边推理）"',
-         "  %s || rc=1" % " ".join(infer),
+         ] + ["  %s || rc=1" % c for c in infer_cmds] + [
+         '  [ $rc -eq 0 ] || break',
          '  echo $i > "$OUT/batch_state"',
          "done",
          "if [ $rc -eq 0 ]; then",
          '  echo "@stage merge 合并各批 dump"',
-         '  cat "$OUT"/parts/b*/dump_%s.jsonl > "$OUT/dump_%s.jsonl" || rc=1' % (tag, tag),
-         # 各批 metrics 合并成 $OUT/metrics_<tag>.json：reuse-dump 评测时会读它
+         ] + ['  for t in %s; do cat "$OUT"/parts/b*/dump_$t.jsonl > "$OUT/dump_$t.jsonl" || rc=1; done'
+              % " ".join(tags)] + [
+         # 各批 metrics 按模型合并成 $OUT/metrics_<tag>.json：reuse-dump 评测时会读它
          # 回填报告里的 FPS / 推理耗时，否则显示 0（各批 fps 见 parts/b*/metrics_*.json）
          '  echo "@stage merge 汇总各批 metrics"',
          '  python3 - "$OUT" <<\'PYEOF\'',
          'import json, glob, os, sys',
          'out = sys.argv[1]',
-         'tag = %s' % json.dumps(tag),
+         'tags = %s' % json.dumps(tags),
          'task = %s' % json.dumps(task),
-         'fr = el = inf = pre = 0.0',
-         'for p in sorted(glob.glob(os.path.join(out, "parts", "b*", "metrics_" + tag + ".json"))):',
-         '    try:',
-         '        rp = json.load(open(p))["rk_pipe"]',
-         '        pp = rp.get("pipeline", {}) or {}',
-         '        f = float(pp.get("processed_frames", 0) or 0)',
-         '        el += float(pp.get("elapsed_seconds", 0) or 0)',
-         '        fr += f',
-         '        st = rp.get("stage_avg_ms", {}) or {}',
-         '        inf += float(st.get("inference", 0) or 0) * f',
-         '        pre += float(st.get("preprocess", 0) or 0) * f',
-         '    except Exception:',
-         '        pass',
-         'avg = (fr / el) if el else 0.0',
-         'nb = len(glob.glob(os.path.join(out, "parts", "b*")))',
-         'row = {"rk_pipe": {',
-         '    "task": task, "mode": "pipeline",',
-         '    "note": "边传边测各批汇总（%d 批）" % nb,',
-         '    "pipeline": {"processed_frames": int(fr), "elapsed_seconds": el, "avg_fps": avg},',
-         '    "stage_avg_ms": {"preprocess": (pre / fr if fr else 0.0),',
-         '                     "inference": (inf / fr if fr else 0.0)},',
-         '}}',
-         'json.dump(row, open(os.path.join(out, "metrics_" + tag + ".json"), "w"), indent=1)',
-         'print("[batch] metrics 汇总: %d 帧 / %.3fs / %.1f fps" % (fr, el, avg))',
+         'for tag in tags:',
+         '    fr = el = inf = pre = 0.0',
+         '    for p in sorted(glob.glob(os.path.join(out, "parts", "b*", "metrics_" + tag + ".json"))):',
+         '        try:',
+         '            rp = json.load(open(p))["rk_pipe"]',
+         '            pp = rp.get("pipeline", {}) or {}',
+         '            f = float(pp.get("processed_frames", 0) or 0)',
+         '            el += float(pp.get("elapsed_seconds", 0) or 0)',
+         '            fr += f',
+         '            st = rp.get("stage_avg_ms", {}) or {}',
+         '            inf += float(st.get("inference", 0) or 0) * f',
+         '            pre += float(st.get("preprocess", 0) or 0) * f',
+         '        except Exception:',
+         '            pass',
+         '    avg = (fr / el) if el else 0.0',
+         '    nb = len(glob.glob(os.path.join(out, "parts", "b*")))',
+         '    row = {"rk_pipe": {',
+         '        "task": task, "mode": "pipeline",',
+         '        "note": "边传边测各批汇总（%d 批）" % nb,',
+         '        "pipeline": {"processed_frames": int(fr), "elapsed_seconds": el, "avg_fps": avg},',
+         '        "stage_avg_ms": {"preprocess": (pre / fr if fr else 0.0),',
+         '                         "inference": (inf / fr if fr else 0.0)},',
+         '    }}',
+         '    json.dump(row, open(os.path.join(out, "metrics_" + tag + ".json"), "w"), indent=1)',
+         '    print("[batch] %s: %d 帧 / %.3fs / %.1f fps" % (tag, fr, el, avg))',
          'PYEOF',
          "fi",
          "if [ $rc -eq 0 ]; then",
@@ -1423,7 +1437,7 @@ def _write_batch_script(out_dir, task, tag, model, ds_root, ann_arg, ann, label,
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(L) + "\n")
     os.chmod(path, 0o755)
-    preview_ports = [[tag, pv_base]] if preview else []
+    preview_ports = [[t, pv_base + i] for i, (t, _) in enumerate(models)] if preview else []
     return path, preview_ports
 
 
@@ -1504,8 +1518,6 @@ def start_job(form):
     except ValueError:
         batch_size = 500
     batch_mode = bool(batch_up and ds_source == "sync" and batch_total > 0)
-    if batch_mode and len(models) > 1:
-        return None, "边传边测暂不支持多模型对比 —— 请取消对比模型，或关闭边传边测"
     use_script = len(models) > 1 or batch_mode
     note = ""
     preview_ports = []
@@ -1516,11 +1528,13 @@ def start_job(form):
                       "&& cmake --build build --target rknn_eval -j 8")
     if batch_mode:
         script, preview_ports = _write_batch_script(
-            out_dir, task, models[0][0], model, images, ann_arg, ann, label, obj_num,
+            out_dir, task, models, images, ann_arg, ann, label, obj_num,
             conf, threads, vis, preview, pv_base, eval_bin, batch_total)
         cmd_s = "bash %s" % shlex.quote(script)
         note = "边传边测：%d 批 × 每批 ≤%d 张（上传与推理重叠，全部到齐后统一评测）" % (
             batch_total, batch_size)
+        if len(models) > 1:
+            note += " | %d 模型对比（每批内串行推理）" % len(models)
     elif use_script:
         script, preview_ports = _write_job_script(
             out_dir, task, models, images, ann_arg, ann, label, obj_num,
@@ -2213,9 +2227,42 @@ def mdish(text):
     return "\n".join(out)
 
 
+def parse_form_body(ctype, body):
+    """解析 POST 表单体 → {name: [value]}（与 parse_qs 同形）。
+
+    支持 application/x-www-form-urlencoded（普通表单提交）与 multipart/form-data
+    （XMLHttpRequest + FormData 走这条）。原实现只 parse_qs，遇到 multipart 会把整个
+    body 当成一个畸形键 ⇒ 所有字段解析为空，现象是提交后报「模型不存在: 」（冒号后
+    为空）。文件字段（带 filename）一律忽略 —— 本控制台的文件都走 POST /api/upload。
+    """
+    if "multipart/form-data" in (ctype or ""):
+        out = {}
+        try:
+            msg = email.message_from_bytes(
+                b"Content-Type: " + ctype.encode("utf-8", "replace") +
+                b"\r\nMIME-Version: 1.0\r\n\r\n" + body,
+                policy=email.policy.default)
+            for part in msg.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if not name or part.get_filename():
+                    continue
+                raw = part.get_payload(decode=True) or b""
+                out.setdefault(name, []).append(
+                    raw.decode(part.get_content_charset() or "utf-8", "replace"))
+        except Exception as e:            # 解析异常不该把整次提交吞掉
+            sys.stderr.write("[web] multipart 解析失败: %s\n" % e)
+        return out
+    return parse_qs(body.decode("utf-8", "replace"))
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def _form(self):
+        """读 POST 表单体。兼容 urlencoded 与 multipart，见 parse_form_body。"""
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        return parse_form_body(self.headers.get("Content-Type"), self.rfile.read(n))
 
     def _send(self, code, body, ctype="text/html; charset=utf-8"):
         if isinstance(body, str):
@@ -2248,10 +2295,13 @@ class Handler(BaseHTTPRequestHandler):
                     if limited and not tasks:
                         continue  # 未登记的板上模型不进下拉
                     dt = "" if not limited else " ".join(tasks)
-                    sel = " selected" if not m_opts else ""
-                    m_opts.append("<option value=\"%s\" data-task=\"%s\"%s>%s</option>" %
+                    # 刻意不给任何 option 加 selected：这段 HTML 同时用于「选择模型」与
+                    # 「对比模型」两个 select，若第一个带 selected，对比下拉会默认选中一个
+                    # 模型 → hasCompare() 恒为 true → 边传边测永远提交不了（报「暂不支持
+                    # 多模型对比」）。不写 selected 时浏览器默认选第一个，两个下拉都对。
+                    m_opts.append("<option value=\"%s\" data-task=\"%s\">%s</option>" %
                                   (html.escape(os.path.join(md, f), quote=True),
-                                   html.escape(dt, quote=True), sel, html.escape(f)))
+                                   html.escape(dt, quote=True), html.escape(f)))
             free_b = _free_bytes(DEFAULTS["model_dir"])
             # 补传模式：?resume=<jid> → 注入一段 JS，让首页进入"只补缺失批次"流程
             resume_js = ""
@@ -2614,12 +2664,10 @@ var timer = setInterval(function() {
     def do_POST(self):
         u = urlparse(self.path)
         if u.path == "/create":
-            n = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(n)
             # 边传边测走 XHR 提交：提交后要留在原页面继续按批上传，故此处回 JSON 而不是 302
             want_json = ("application/json" in (self.headers.get("Accept") or "")
                          or self.headers.get("X-Requested-With") == "XMLHttpRequest")
-            form = parse_qs(body.decode())
+            form = self._form()
             jid, err = start_job(form)
             if want_json:
                 self._send(200 if not err else 400,
@@ -2633,8 +2681,7 @@ var timer = setInterval(function() {
             self.send_header("Location", "/job/" + jid)
             self.end_headers()
         elif u.path == "/retry":
-            n = int(self.headers.get("Content-Length", 0))
-            form = parse_qs(self.rfile.read(n).decode())
+            form = self._form()
             new_id, err = retry_job(form.get("jid", [""])[0])
             if err:
                 self._send(400, render_page("重试失败: %s<p><a href='/jobs'>返回</a></p>" % html.escape(err)))
@@ -2643,8 +2690,7 @@ var timer = setInterval(function() {
             self.send_header("Location", "/job/" + new_id)
             self.end_headers()
         elif u.path == "/cancel":
-            n = int(self.headers.get("Content-Length", 0))
-            form = parse_qs(self.rfile.read(n).decode())
+            form = self._form()
             jid, err = cancel_job(form.get("jid", [""])[0])
             if err:
                 self._send(400, render_page("终止失败: %s<p><a href='/jobs'>返回</a></p>" % html.escape(err)))
@@ -2653,8 +2699,7 @@ var timer = setInterval(function() {
             self.send_header("Location", "/job/" + jid)
             self.end_headers()
         elif u.path == "/delete":
-            n = int(self.headers.get("Content-Length", 0))
-            form = parse_qs(self.rfile.read(n).decode())
+            form = self._form()
             jid, err = delete_job(form.get("jid", [""])[0])
             if err:
                 self._send(400, render_page("删除失败: %s<p><a href='/jobs'>返回</a></p>" % html.escape(err)))
