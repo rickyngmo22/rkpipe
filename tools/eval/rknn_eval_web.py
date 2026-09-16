@@ -260,7 +260,7 @@ FORM = """
 var f = document.forms[0];
 var SYNC = {key: '', map: {}, uploaded: 0, total: 0, imgOk: false, annOk: false, uploading: false,
             manifest: [], top: '', need: [], plan: null, resume: null};
-var IMG_EXT = /\.(jpg|jpeg|png|bmp|tif|tiff)$/i;
+var IMG_EXT = /\\.(jpg|jpeg|png|bmp|tif|tiff)$/i;
 %(resume_js)s
 function syncStat(t) { document.getElementById('sync_stat').textContent = t; }
 function dsMode(v) {
@@ -1450,7 +1450,6 @@ def start_job(form):
     """
     jid = uuid.uuid4().hex[:8]
     out_dir = os.path.join("web_runs", jid)
-    os.makedirs(out_dir, exist_ok=True)
     log_path = os.path.join(out_dir, "run.log")
 
     task = form.get("task", ["detect"])[0]
@@ -1466,6 +1465,16 @@ def start_job(form):
             return None, "图片目录不存在: %s" % images
         if task != "obb" and (not ann or not os.path.exists(ann)):
             return None, "标注不存在: %s" % ann
+
+    # 评测二进制校验放在这里（所有会写盘的步骤之前）：原先它在 resolve_label
+    # 之后，而 resolve_label 在需要自动生成类别表时会往 out_dir 里写文件，于是
+    # "数据合法但缺 build/rknn_eval" 的失败提交会留下一个只含 labels_auto.txt 的
+    # 残留目录。提前到这里后，start_job 里所有 return None 都发生在任何写盘之前。
+    eval_bin = find_eval_bin()
+    if not eval_bin:
+        return None, ("未找到评测二进制 build/rknn_eval —— 板端需先构建："
+                      "cmake -B build -S . -DOPENCV_ROOT=/userdata/opencv-4.11.0-install "
+                      "&& cmake --build build --target rknn_eval -j 8")
 
     # 数据缓存保留策略：默认"用完即删"防爆板端存储；勾选保留后同一文件夹
     # 二次评测走增量只传差异。仅作用于服务管理的根（同步缓存 / zip 解包目录）。
@@ -1507,7 +1516,8 @@ def start_job(form):
         batch = int(form.get("batch", ["0"])[0] or 0)
     except ValueError:
         batch = 0
-    # 边传边测（分批上传）：仅 PC 同步来源可用（图片由 PC 边传边被消费），暂限单模型
+    # 边传边测（分批上传）：仅 PC 同步来源可用（图片由 PC 边传边被消费）；
+    # 多模型对比同样支持——每批内按模型串行推理，全部到齐后统一评测出对比报告。
     batch_up = form.get("batch_up") == ["on"]
     try:
         batch_total = int(form.get("batch_total", ["0"])[0] or 0)
@@ -1521,11 +1531,9 @@ def start_job(form):
     use_script = len(models) > 1 or batch_mode
     note = ""
     preview_ports = []
-    eval_bin = find_eval_bin()
-    if not eval_bin:
-        return None, ("未找到评测二进制 build/rknn_eval —— 板端需先构建："
-                      "cmake -B build -S . -DOPENCV_ROOT=/userdata/opencv-4.11.0-install "
-                      "&& cmake --build build --target rknn_eval -j 8")
+    # 校验全过 → 这里才真正落地任务目录（失败提交不再留空目录残骸）。必须早于
+    # 下面的 QUEUE.append：worker 线程一旦抢到任务，run_job 会直接 open(log_path)。
+    os.makedirs(out_dir, exist_ok=True)
     if batch_mode:
         script, preview_ports = _write_batch_script(
             out_dir, task, models, images, ann_arg, ann, label, obj_num,
