@@ -58,7 +58,33 @@ except ImportError:
     cv2 = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EVAL_BIN_CANDIDATES = ["build/rknn_eval"]
+
+
+def _repo_root():
+    """从本文件向上找含 CMakeLists.txt 的目录（仓库根）；找不到退回上两级。
+
+    不写死层数，这样 tools/eval 的布局变化或把脚本挪位置都不会静默算错。
+    """
+    d = HERE
+    for _ in range(4):
+        if os.path.exists(os.path.join(d, "CMakeLists.txt")):
+            return d
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return os.path.dirname(os.path.dirname(HERE))
+
+
+REPO_ROOT = _repo_root()
+# 用绝对路径（旧实现是相对路径 "build/rknn_eval"，判定结果依赖进程 CWD）
+# build*/ 在 .gitignore 里，删掉后需重建：
+#   cmake -B build -S . -DOPENCV_ROOT=/userdata/opencv-4.11.0-install
+#   cmake --build build --target rknn_eval -j 8
+EVAL_BIN_CANDIDATES = [
+    os.path.join(REPO_ROOT, "build/rknn_eval"),
+    os.path.join(REPO_ROOT, "build-ci/rknn_eval"),
+]
 
 JOBS = {}  # id -> dict(state, cmd, log_path, out_dir, tag, created, ...)
 JOB_ORDER = []
@@ -586,10 +612,16 @@ def sample_previews(job):
 
 
 def find_eval_bin():
+    """返回评测二进制的绝对路径；找不到返回 ""，由调用方明确报错。
+
+    旧实现在找不到时 fallback 成裸名 "rknn_eval"，会静默生成一条
+    必然 `/bin/sh: rknn_eval: not found`（rc=127）的哑任务，页面上只显示
+    日志报错、看不出是"二进制没构建"——改成显式失败。
+    """
     for c in EVAL_BIN_CANDIDATES:
         if os.path.exists(c):
             return c
-    return "rknn_eval"
+    return shutil.which("rknn_eval") or ""
 
 
 def run_job(job):
@@ -1026,10 +1058,15 @@ def start_job(form):
 
     note = ""
     preview_ports = []
+    eval_bin = find_eval_bin()
+    if not eval_bin:
+        return None, ("未找到评测二进制 build/rknn_eval —— 板端需先构建："
+                      "cmake -B build -S . -DOPENCV_ROOT=/userdata/opencv-4.11.0-install "
+                      "&& cmake --build build --target rknn_eval -j 8")
     if use_script:
         script, preview_ports = _write_job_script(
             out_dir, task, models, images, ann_arg, ann, label, obj_num,
-            conf, threads, vis, preview, pv_base, find_eval_bin())
+            conf, threads, vis, preview, pv_base, eval_bin)
         cmd_s = "bash %s" % shlex.quote(script)
         bits = []
         if len(models) > 1:
@@ -1037,7 +1074,7 @@ def start_job(form):
                         % (len(models), max(1, (os.cpu_count() or 4) // len(models))))
         note = " | ".join(bits)
     else:
-        cmd = [find_eval_bin(), "--task", task, "--model", model,
+        cmd = [eval_bin, "--task", task, "--model", model,
                "--images", images, ann_arg, ann,
                "--conf", conf, "--threads", str(threads),
                "--out-dir", out_dir, "--name", models[0][0]]
@@ -2063,7 +2100,7 @@ def main():
     print("rknn_eval_web 评测控制台（板端服务）")
     print("  PC 浏览器打开: %s" % "  或  ".join(board_urls(args.port)))
     print("  评测二进制: %s | 注册数据集: datasets/*.yaml | 历史任务: %d"
-          % (find_eval_bin(), n_restored))
+          % (find_eval_bin() or "未构建(缺失 build/rknn_eval)", n_restored))
     sys.stdout.flush()
     ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
 
