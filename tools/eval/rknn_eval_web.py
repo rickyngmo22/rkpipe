@@ -260,12 +260,23 @@ dsMode(document.forms[0].ds_source.value);
 function dsKey(top) {
   return (top.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 40) || 'ds') + '_' + Date.now().toString(36);
 }
-/* 选完图片文件夹: 生成缓存目录, 4 并发全量上传(带进度), 完成即就绪 */
+/* 上传期间阻止 PC 休眠（浏览器不支持则静默跳过）——原实现缺失导致 ReferenceError */
+var _wakeLock = null;
+function requestWake() {
+  try {
+    if (navigator.wakeLock && !_wakeLock)
+      navigator.wakeLock.request('screen').then(function(l) { _wakeLock = l; }, function() {});
+  } catch (e) {}
+}
+function releaseWake() {
+  try { if (_wakeLock) { _wakeLock.release(); _wakeLock = null; } } catch (e) {}
+}
+/* 选完图片文件夹: 先与板上缓存比对清单, 只传差异(4 并发, 完成即补位), 完成即就绪 */
 function syncFolder(input) {
   var files = input.files;
   if (!files || !files.length) return;
   var top = files[0].webkitRelativePath.split('/')[0];
-  var list = [];
+  var list = [], manifest = [];
   SYNC.map = {};
   for (var i = 0; i < files.length; i++) {
     var rp = files[i].webkitRelativePath || files[i].name;
@@ -274,59 +285,112 @@ function syncFolder(input) {
     rp = parts.join('/');
     if (!rp || !IMG_EXT.test(rp) || files[i].name.startsWith('.')) continue;
     SYNC.map[rp] = files[i];
-    list.push(rp);
+    manifest.push([rp, files[i].size]);
   }
-  if (!list.length) { syncStat('✗ 所选文件夹里没有图片（jpg/jpeg/png/bmp/tif/tiff）'); return; }
-  SYNC.key = dsKey(top); SYNC.uploading = true; SYNC.imgOk = false;
-  f.sync_key.value = SYNC.key;
+  if (!manifest.length) { syncStat('✗ 所选文件夹里没有图片（jpg/jpeg/png/bmp/tif/tiff）'); return; }
+  var prevKey = f.sync_key.value;
+  SYNC.key = ''; SYNC.uploading = true; SYNC.imgOk = false;
+  f.sync_key.value = '';
   requestWake();
   var prog = document.getElementById('up_prog');
   var bar  = document.getElementById('up_bar');
   var txt  = document.getElementById('up_text');
   if (prog) prog.style.display = '';
-  var totalBytes = 0, sentBytes = 0;
-  for (var z = 0; z < list.length; z++) totalBytes += SYNC.map[list[z]].size || 0;
-  var done = 0, fail = 0, i = 0, act = 0, lastPaint = 0;
-  var slotLoadedMap = {};   // 每连接已发字节(全局累加用)
-  var paint = function(force) {
-    var now = Date.now();
-    if (!force && now - lastPaint < 100) return;   // 限频 100ms, 避免频繁重排
-    lastPaint = now;
-    var pct = totalBytes ? Math.min(100, Math.round(sentBytes / totalBytes * 100)) : 0;
-    if (bar) bar.value = pct;
-    if (txt) txt.textContent = pct + '%%（' + (sentBytes / 1048576).toFixed(1) +
-        ' / ' + (totalBytes / 1048576).toFixed(1) + ' MB）';
-    syncStat('上传图片 ' + done + ' / ' + list.length + (fail ? '（失败 ' + fail + '）' : '') + ' ...');
-  };
-  var onFileDone = function(ok) {
-    act--; done++;
-    if (!ok) fail++;
-    paint(done == list.length);
-    if (act == 0) {
-      if (fail) { syncStat('✗ ' + fail + ' 张上传失败，请重新选择文件夹'); SYNC.uploading = false; releaseWake(); return; }
-      SYNC.imgOk = true; SYNC.uploading = false;
-      f.images.value = '/userdata/rk_eval_data/' + SYNC.key;
-      if (txt) txt.textContent = '';
+  if (bar) bar.value = 0;
+  syncStat('清单比对中（' + manifest.length + ' 张图片）...');
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/sync/manifest');
+  xhr.onload = function() {
+    var r = null;
+    try { r = JSON.parse(xhr.responseText); } catch (e) {}
+    if (!r || !r.ok) {
+      syncStat('✗ ' + ((r && r.error) || '清单比对失败'));
+      SYNC.uploading = false; releaseWake(); return;
+    }
+    SYNC.key = r.key; f.sync_key.value = r.key;
+    if (prevKey && prevKey !== r.key) { SYNC.annOk = false; f.ann.value = ''; }  // 换了数据集, 旧标注作废
+    var need = r.need || [];
+    if (!need.length) {
       if (prog) prog.style.display = 'none';
-      syncStat('✓ 图片已上传（' + list.length + ' 张）。' +
-               (SYNC.annFile ? '标注就绪，可提交' : '请选择标注文件'));
-      releaseWake();
+      finishImages(manifest.length, r.have, 0);
+      return;
     }
+    syncStat('需上传 ' + need.length + ' / ' + manifest.length + ' 张（板上已有 ' + r.have + '）...');
+    var totalBytes = 0;
+    for (var z = 0; z < need.length; z++) totalBytes += (SYNC.map[need[z]] || {}).size || 0;
+    var sentBytes = 0, done = 0, fail = 0, i = 0, act = 0, lastPaint = 0;
+    var slotLoadedMap = {};   // 每连接已发字节(全局累加用)
+    var paint = function(force) {
+      var now = Date.now();
+      if (!force && now - lastPaint < 100) return;   // 限频 100ms, 避免频繁重排
+      lastPaint = now;
+      var pct = totalBytes ? Math.min(100, Math.round(sentBytes / totalBytes * 100)) : 0;
+      if (bar) bar.value = pct;
+      if (txt) txt.textContent = pct + '%%（' + (sentBytes / 1048576).toFixed(1) +
+          ' / ' + (totalBytes / 1048576).toFixed(1) + ' MB）';
+      syncStat('上传图片 ' + done + ' / ' + need.length + (fail ? '（失败 ' + fail + '）' : '') + ' ...');
+    };
+    var onFileDone = function(ok) {
+      act--; done++;
+      if (!ok) fail++;
+      paint(false);
+      if (i < need.length) { pump(); return; }   // 关键: 每完成一个就补位, 否则只传前 4 张
+      if (act > 0) return;                       // 仍有在途请求, 等它们回来
+      paint(true);
+      if (fail) {
+        syncStat('✗ ' + fail + ' / ' + need.length + ' 张上传失败，请重新选择文件夹');
+        SYNC.uploading = false; releaseWake(); return;
+      }
+      finishImages(manifest.length, r.have, need.length);
+    };
+    var pump = function() {
+      while (act < 4 && i < need.length) {
+        var nm = need[i++]; act++;
+        uploadOne(nm, SYNC.map[nm], function(ok) { onFileDone(ok); },
+                  function(loaded) {                     // 单连接字节进度 → 全局累加
+          sentBytes += loaded - (slotLoadedMap[nm] || 0);
+          slotLoadedMap[nm] = loaded;
+          paint(false);
+        });
+      }
+    };
+    pump();
   };
-  var pump = function() {
-    while (act < 4 && i < list.length) {
-      var nm = list[i++]; act++;
-      var slotLoaded = 0;
-      uploadOne(nm, SYNC.map[nm], function(ok) {
-        onFileDone(ok);
-      }, function(loaded) {                       // 单连接字节进度 → 全局累加
-        sentBytes += loaded - (slotLoadedMap[nm] || 0);
-        slotLoadedMap[nm] = loaded;
-        paint(false);
-      });
+  xhr.onerror = function() {
+    syncStat('✗ 清单比对失败（网络中断）'); SYNC.uploading = false; releaseWake();
+  };
+  xhr.send(JSON.stringify({name: top, key: '', files: manifest}));
+}
+/* 图片就绪: 取板上权威路径(兼容所选文件夹内含 images/ 子目录) 并回填类别数 */
+function finishImages(total, have, sent) {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/sync/done?key=' + encodeURIComponent(SYNC.key));
+  xhr.onload = function() {
+    var r = null;
+    try { r = JSON.parse(xhr.responseText); } catch (e) {}
+    if (r && r.ok && r.images) {
+      f.images.value = r.images;
+      if (r.obj_num && f.obj_num) f.obj_num.value = r.obj_num;
+    } else {
+      f.images.value = '/userdata/rk_eval_data/' + SYNC.key;
     }
+    SYNC.imgOk = true; SYNC.uploading = false;
+    var prog = document.getElementById('up_prog');
+    var txt  = document.getElementById('up_text');
+    if (prog) prog.style.display = 'none';
+    if (txt) txt.textContent = '';
+    syncStat('✓ 图片已就绪（共 ' + total + ' 张，本次新传 ' + sent + '，复用 ' + have + '）。' +
+             (SYNC.annOk ? '标注已就绪，可提交' : '请选择标注文件'));
+    releaseWake();
   };
-  pump();
+  xhr.onerror = function() {
+    f.images.value = '/userdata/rk_eval_data/' + SYNC.key;
+    SYNC.imgOk = true; SYNC.uploading = false;
+    syncStat('✓ 图片已上传（共 ' + total + ' 张）。' +
+             (SYNC.annOk ? '标注已就绪，可提交' : '请选择标注文件'));
+    releaseWake();
+  };
+  xhr.send();
 }
 function uploadOne(rel, file, cb, onProgress) {
   var x = new XMLHttpRequest();
@@ -407,7 +471,7 @@ function uploadModel(input) {
   };
   xhr.send(file);
 }
-</script></script></script>
+</script>
 
 <p class="small">脚本化评测仍可用 CLI：本地直评 build/rknn_eval，或 PC 端 tools/eval/run_eval.py 走 ssh</p>
 """
