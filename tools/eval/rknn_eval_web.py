@@ -212,6 +212,7 @@ FORM = """
 <span id="model_up_stat" class="small">.rknn 上传到板上 uploads/models/（大文件请直接拷到 model/）</span><br>
 <label>对比模型</label><span id="cmp_rows"><select name="cmp" id="cmp_main" onchange="onCmpChange()"><option value="">不对比（单模型）</option>%(model_options)s</select></span>
 <input class="btn sub" type="button" id="cmp_add" value="＋添加" onclick="addCmpRow()" style="width:auto;padding:4px 10px" disabled><span class="small">可加多个：N 模型并行对比，线程均分</span><br>
+<label>线程数</label><input name="threads" value="%(threads)s" size="4"><span class="small">单模型建议 = CPU 核数；多模型对比时线程均分</span><br>
 <label>任务</label><select name="task" onchange="onTaskChange(this)">%(task_options)s</select>
 <span class="small">detect / pose / seg / obb</span><br>
 <h3>数据集</h3>
@@ -246,8 +247,7 @@ FORM = """
 <input type="file" id="label_file" accept=".txt" onchange="uploadLabel(this)"><br>
 <span id="label_stat" class="small">类别表只影响可视化框上的文字（越界降级 clsN），不影响精度指标；留空会自动从标注 categories 生成，自定义数据集同样适用</span><br>
 <label>类别数</label><input name="obj_num" value="%(obj_num)s" size="6"><br>
-<label>置信度</label><input name="conf" value="%(conf)s" size="6">
-<label>线程数</label><input name="threads" value="%(threads)s" size="4"><br>
+<label>置信度</label><input name="conf" value="%(conf)s" size="6"><br>
 <h3>输出</h3>
 <label>可视化</label><input type="checkbox" name="vis" checked> 渲染检测结果图（完成后展示）<br>
 <label>实时画面</label><input type="checkbox" name="preview" checked> 推理时板端抽帧快照
