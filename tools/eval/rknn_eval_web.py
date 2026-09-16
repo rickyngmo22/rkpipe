@@ -118,6 +118,12 @@ DEFAULTS = dict(
     # 数据缓存默认保留（表单里的 keep_ds 复选框默认勾选）：同一文件夹二次评测
     # 只传差异图片（增量），失败任务也能断点续跑；取消勾选则任务完成后自动清缓存。
     keep_ds="checked",
+    # 边传边测（分批上传）：勾选 batch_up 后按 batch_size 张一批上传，传满一批板端
+    # 即开始推理（上传与推理重叠），全部到齐后合并 dump 统一评测出报告。
+    batch_up="",
+    batch_size="500",
+    # 补传模式：服务端按 ?resume=<jid> 渲染一段初始化 JS，默认空
+    resume_js="",
     model_dir="model",
 )
 
@@ -233,6 +239,11 @@ FORM = """
 <input name="threads" value="%(threads)s" size="4"><br>
 <label>数据缓存</label><input type="checkbox" name="keep_ds" %(keep_ds)s> 评测完成后保留上传的数据
 （默认<b>保留</b>：同一文件夹二次评测只传差异图片、失败任务可断点续跑；取消勾选则用完即删，省板端空间）<br>
+<span id="batch_box"><label>边传边测</label><input type="checkbox" name="batch_up" id="batch_up" %(batch_up)s onchange="batchMode()">
+每 <input name="batch_size" id="batch_size" value="%(batch_size)s" size="5"> 张一批：
+传满一批板端即开始推理（<b>上传与推理重叠</b>），全部到齐后自动合并出报告
+<span class="small">—— 数千张的大文件夹推荐；需先选好标注；暂不支持多模型对比</span></span><br>
+<input type="hidden" name="batch_total" id="batch_total" value="">
 <label>对比模型</label><span id="cmp_rows"><select name="cmp" id="cmp_main" onchange="onCmpChange()"><option value="">不对比（单模型）</option>%(model_options)s</select></span>
 <input class="btn sub" type="button" id="cmp_add" value="＋添加" onclick="addCmpRow()" style="width:auto;padding:4px 10px" disabled><span class="small">可加多个：N 模型并行对比，线程均分</span><br>
 <h3>输出</h3>
@@ -245,8 +256,10 @@ FORM = """
 </div>
 <script>
 var f = document.forms[0];
-var SYNC = {key: '', map: {}, uploaded: 0, total: 0, imgOk: false, annOk: false, uploading: false};
+var SYNC = {key: '', map: {}, uploaded: 0, total: 0, imgOk: false, annOk: false, uploading: false,
+            manifest: [], top: '', need: [], plan: null, resume: null};
 var IMG_EXT = /\.(jpg|jpeg|png|bmp|tif|tiff)$/i;
+%(resume_js)s
 function syncStat(t) { document.getElementById('sync_stat').textContent = t; }
 function dsMode(v) {
   document.getElementById('ds_sync').style.display = v == 'sync' ? '' : 'none';
@@ -351,7 +364,20 @@ function syncFolder(input) {
     }
     SYNC.key = r.key; f.sync_key.value = r.key;
     if (prevKey && prevKey !== r.key) { SYNC.annOk = false; f.ann.value = ''; }  // 换了数据集, 旧标注作废
+    SYNC.manifest = manifest; SYNC.top = top;
     var need = r.need || [];
+    if (batchOn()) {          // 边传边测：这里只建清单拿 key，图片留到提交后按批上传
+      SYNC.imgOk = true; SYNC.uploading = false;
+      f.images.value = '/userdata/rk_eval_data/' + r.key;   // 板端脚本按 $ROOT/b<i> 逐批消费
+      var nb = Math.max(1, Math.ceil(manifest.length / batchSize()));
+      document.getElementById('batch_total').value = nb;
+      if (prog) prog.style.display = 'none';
+      syncStat('✓ 清单就绪（' + manifest.length + ' 张，板上已有 ' + r.have + '）—— 边传边测：' +
+               '提交后分 ' + nb + ' 批上传，每批 ' + batchSize() + ' 张' +
+               (SYNC.annOk ? '' : '；请选择标注文件'));
+      releaseWake();
+      return;
+    }
     if (!need.length) {
       if (prog) prog.style.display = 'none';
       finishImages(manifest.length, r.have, 0);
@@ -499,9 +525,178 @@ function uploadLabel(input) {
   xhr.onerror = function() { st.textContent = '✗ 上传失败(网络)'; };
   xhr.send(file);
 }
+/* ===== 边传边测（分批上传）===== */
+function batchOn() { return !!(f.batch_up && f.batch_up.checked); }
+function batchSize() {
+  var el = document.getElementById('batch_size');
+  var v = parseInt(el ? el.value : '500', 10);
+  return (v > 0) ? v : 500;
+}
+function batchMode() {
+  if (batchOn()) syncStat('边传边测已启用：提交后按 ' + batchSize() +
+      ' 张一批上传，板端边收边推理（需先选好图片文件夹与标注）');
+}
+function hasCompare() {
+  var sels = document.querySelectorAll('select[name=cmp]');
+  for (var i = 0; i < sels.length; i++) if (sels[i].value) return true;
+  return false;
+}
+/* 按批切分清单。板端 --images 不递归子目录，故文件名扁平化进 b<i>/；
+   不同子目录重名会互相覆盖丢图，直接拒绝而非静默出错 */
+function batchPlan(bs) {
+  var list = SYNC.manifest || [];
+  if (!list.length) return {err: '没有图片清单（请重新选择图片文件夹）'};
+  var n = Math.max(1, Math.ceil(list.length / bs));
+  var batches = [];
+  for (var i = 0; i < n; i++) batches.push(list.slice(i * bs, (i + 1) * bs));
+  for (var k = 0; k < batches.length; k++) {
+    var seen = {};
+    for (var z = 0; z < batches[k].length; z++) {
+      var base = batches[k][z][0].split('/').pop();
+      if (seen[base]) return {err: '第 ' + (k + 1) + ' 批内存在同名文件「' + base +
+          '」（不同子目录下重名）。边传边测要求文件名唯一，请整理文件夹后重试。'};
+      seen[base] = 1;
+    }
+  }
+  return {batches: batches};
+}
+/* 提交后驱动分批上传：每批先比对清单（可增量跳过），传完通知板端消费该批 */
+function startBatchUpload(jid) {
+  var plan = SYNC.plan || batchPlan(batchSize());
+  if (plan.err) { syncStat('✗ ' + plan.err); SYNC.uploading = false; releaseWake(); return; }
+  var batches = plan.batches, N = batches.length;
+  var R = SYNC.resume;
+  var isResume = !!(R && R.jid === jid);
+  if (isResume && R.total && N !== R.total) {
+    syncStat('✗ 所选文件夹与任务不符（应为 ' + R.total + ' 批，当前 ' + N +
+             ' 批）—— 补传请选同一个图片文件夹');
+    SYNC.uploading = false; releaseWake(); return;
+  }
+  var prog = document.getElementById('up_prog'), bar = document.getElementById('up_bar'),
+      txt = document.getElementById('up_text'), btn = document.getElementById('submit_btn');
+  if (prog) prog.style.display = '';
+  var cur = isResume ? Math.max(0, (R.done | 0) + 1) : 0;
+  var finishAll = function () {
+    if (prog) prog.style.display = 'none';
+    if (bar) bar.value = 100;
+    releaseWake();
+    if (isResume) {                       // 补传：通知板端续跑
+      syncStat('✓ 缺失批次已补传，正在唤醒任务续跑 ...');
+      var x = new XMLHttpRequest();
+      x.open('GET', '/api/sync/refill-done?resume=' + encodeURIComponent(jid));
+      x.onload = function () {
+        var r = null; try { r = JSON.parse(x.responseText); } catch (e) {}
+        syncStat(r && r.ok ? '✓ 任务已续跑（状态 ' + (r.state || '') + '），可前往任务页查看'
+                           : '✗ 续跑失败：' + ((r && r.error) || '未知'));
+      };
+      x.onerror = function () { syncStat('✗ 续跑请求失败（网络）'); };
+      x.send();
+      return;
+    }
+    syncStat('✓ 全部 ' + N + ' 批已传完 —— 板端正在推理/评测，报告完成后可在任务页查看');
+    if (btn) { btn.disabled = false; btn.value = '前往任务页查看 →';
+               btn.onclick = function (e) { e.preventDefault(); location.href = '/job/' + jid; }; }
+  };
+  var next = function () {
+    if (cur >= N) { finishAll(); return; }
+    var i = cur, slice = batches[i];
+    var mark = function () {                 // 通知板端第 i 批就绪
+      var x = new XMLHttpRequest();
+      x.open('POST', '/api/sync/batch-done?key=' + encodeURIComponent(SYNC.key) + '&i=' + i);
+      x.onload = x.onerror = function () {
+        cur++;
+        if (bar) bar.value = Math.round(cur / N * 100);
+        if (txt) txt.textContent = cur + ' / ' + N + ' 批已就绪';
+        next();
+      };
+      x.send();
+    };
+    var xh = new XMLHttpRequest();
+    xh.open('POST', '/api/sync/manifest');
+    xh.onload = function () {
+      var r = null; try { r = JSON.parse(xh.responseText); } catch (e) {}
+      if (!r || !r.ok) { syncStat('✗ 第 ' + (i + 1) + ' 批比对失败：' + ((r && r.error) || '未知'));
+                         SYNC.uploading = false; releaseWake(); return; }
+      var need = r.need || [];
+      syncStat('第 ' + (i + 1) + ' / ' + N + ' 批：' +
+               (need.length ? ('需传 ' + need.length + ' 张') : '板上已完整，跳过') + ' ...');
+      if (!need.length) { mark(); return; }
+      var idx = 0, act = 0, fail = 0;
+      var pump = function () {
+        while (act < 4 && idx < need.length) {
+          var nm = need[idx++]; act++;
+          var rel = 'b' + i + '/' + nm.split('/').pop();
+          uploadOne(rel, SYNC.map[nm], function (ok) {
+            act--;
+            if (!ok) fail++;
+            if (txt) txt.textContent = '第 ' + (i + 1) + '/' + N + ' 批 · 剩余 ' +
+                (need.length - idx + act) + ' 张';
+            if (idx < need.length) { pump(); return; }
+            if (act > 0) return;
+            if (fail) { syncStat('✗ 第 ' + (i + 1) + ' 批有 ' + fail +
+                                 ' 张失败 —— 可重选文件夹补传缺失批次'); 
+                        SYNC.uploading = false; releaseWake(); return; }
+            mark();
+          });
+        }
+      };
+      pump();
+    };
+    xh.onerror = function () { syncStat('✗ 第 ' + (i + 1) + ' 批清单请求失败（网络）');
+                               SYNC.uploading = false; releaseWake(); };
+    xh.send(JSON.stringify({key: SYNC.key, name: SYNC.top, files: slice}));
+  };
+  next();
+}
+/* 补传模式（?resume=<jid>）：只上传缺失批次，传完唤醒任务续跑 */
+function submitRefill() {
+  var R = SYNC.resume, btn = document.getElementById('submit_btn');
+  if (!SYNC.key) { alert('请先选择图片文件夹'); return; }
+  var plan = batchPlan(batchSize());
+  if (plan.err) { alert(plan.err); return; }
+  SYNC.plan = plan;
+  SYNC.uploading = true; requestWake();
+  if (btn) { btn.disabled = true; btn.value = '补传中...'; }
+  startBatchUpload(R.jid);
+}
 /* 提交: 等图片+标注都就绪才允许(上传状态由 syncFolder/syncAnnFile 维护) */
 function beforeSubmit(ev) {
   if (f.ds_source.value !== 'sync') return true;
+  if (SYNC.resume) { submitRefill(); ev.preventDefault(); return false; }
+  if (batchOn()) {                 // 边传边测：AJAX 提交，提交后才开始按批上传
+    if (SYNC.uploading) { alert('还在上传中，请稍候'); ev.preventDefault(); return false; }
+    if (!SYNC.key) { alert('请先选择图片文件夹（用于建立清单）'); ev.preventDefault(); return false; }
+    if (!f.ann.value) { alert('请先选择标注文件'); ev.preventDefault(); return false; }
+    if (hasCompare()) { alert('边传边测暂不支持多模型对比 —— 请取消对比模型，或关闭边传边测');
+                        ev.preventDefault(); return false; }
+    var plan = batchPlan(batchSize());
+    if (plan.err) { alert(plan.err); ev.preventDefault(); return false; }
+    SYNC.plan = plan;
+    var fd = new FormData(f);
+    fd.set('batch_total', plan.batches.length);   // 让板端脚本知道要等多少批
+    var btn = document.getElementById('submit_btn');
+    if (btn) { btn.disabled = true; btn.value = '提交中...'; }
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/create');
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+    xhr.onload = function () {
+      var r = null; try { r = JSON.parse(xhr.responseText); } catch (e) {}
+      if (!r || !r.ok) {
+        alert('提交失败：' + ((r && r.error) || '未知错误'));
+        if (btn) { btn.disabled = false; btn.value = '开始评测'; }
+        return;
+      }
+      syncStat('任务已创建（' + r.jid + '），开始分批上传 ...');
+      startBatchUpload(r.jid);
+    };
+    xhr.onerror = function () {
+      alert('提交失败（网络中断）');
+      if (btn) { btn.disabled = false; btn.value = '开始评测'; }
+    };
+    ev.preventDefault();
+    xhr.send(fd);
+    return false;
+  }
   if (SYNC.uploading) { alert('图片还在上传中，请稍候'); ev.preventDefault(); return false; }
   if (!SYNC.imgOk) { alert('图片尚未上传，请重新选择图片文件夹'); ev.preventDefault(); return false; }
   if (!f.ann.value) { alert('请先选择标注文件'); ev.preventDefault(); return false; }
@@ -1101,6 +1296,8 @@ def _write_job_script(out_dir, task, models, images, ann_arg, ann, label, obj_nu
     a = [q(eval_bin), "--task", task, "--reuse-dump", '"$OUT/dump_%s.jsonl"' % tag0,
          "--name", tag0, '--out-dir "$OUT"', "--conf", str(conf)]
     a += [ann_arg, q(ann)]
+    # 同样只用于回填报告"推理输入"路径（reuse-dump 不重推理）；FPS 靠上面合并的 metrics
+    a += ['--images "$IMG"']
     if label:
         a += ["--label", q(label)]
     if obj_num:
@@ -1115,6 +1312,118 @@ def _write_job_script(out_dir, task, models, images, ann_arg, ann, label, obj_nu
         f.write("\n".join(L) + "\n")
     os.chmod(path, 0o755)
     preview_ports = [[t, pv_base + i] for i, (t, _) in enumerate(models)] if preview else []
+    return path, preview_ports
+
+
+def _write_batch_script(out_dir, task, tag, model, ds_root, ann_arg, ann, label, obj_num,
+                        conf, threads, vis, preview, pv_base, eval_bin, total):
+    """生成"边传边测"分批消费脚本（单模型）：逐批等待 PC 端上传就绪标记，
+    到一批就 --dump-only 推理一批（上传与推理重叠），全部到齐后合并 dump → 统一评测出报告。
+
+    约定（必须与消费端配套，改动前先读这些函数）：
+      ROOT=<数据集根>   _cleanup_dir_from_script 用 `ROOT=([^\\s;]+)` 提取 → 值不能加引号/含空格
+      TOTAL=<批数>      _batch_total_of / _is_batch_consume_job（读脚本前 2000 字符）
+      $ROOT/b<i>/       第 i 批图片（板端 --images 不递归子目录，故必须是扁平文件）
+      $ROOT/b<i>/.ready 就绪标记，由 POST /api/sync/batch-done 写入
+      $OUT/batch_state  已消费批号，_batch_done_of 读它；续跑时脚本据此跳过
+    """
+    q = shlex.quote
+    out_dir = os.path.abspath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    eval_bin = os.path.abspath(eval_bin)
+    ds_root = os.path.abspath(ds_root)
+
+    infer = [q(eval_bin), "--task", task, "--model", q(model),
+             '--images "$BD"', "--conf", str(conf), "--threads", str(threads),
+             "--dump-only", '--out-dir "$OUT/parts/b$i"', "--name", q(tag)]
+    if label:
+        infer += ["--label", q(label)]
+    if obj_num:
+        infer += ["--obj-num", str(obj_num)]
+    if vis:
+        infer += ['--vis-dir "$OUT/vis"', "--vis-sample", "20"]
+    if preview:
+        infer += ["--preview", "--preview-port", str(pv_base)]
+
+    # --images 只是给报告回填"推理输入"路径（reuse-dump 不重推理，实测 2s/不耗时）
+    ev = [q(eval_bin), "--task", task, "--reuse-dump", '"$OUT/dump_%s.jsonl"' % tag,
+          "--name", q(tag), '--out-dir "$OUT"', "--conf", str(conf), ann_arg, q(ann),
+          '--images "$ROOT"']
+    if label:
+        ev += ["--label", q(label)]
+    if obj_num:
+        ev += ["--obj-num", str(obj_num)]
+
+    L = ["#!/bin/bash", "set -e",
+         "ROOT=%s" % ds_root,
+         "TOTAL=%d" % int(total),
+         "OUT=%s; EVAL=%s; ANN=%s" % (q(out_dir), q(eval_bin), q(ann)),
+         "rc=0",
+         'mkdir -p "$OUT/parts"',
+         # 断点续跑：batch_state 记录已消费批号，从下一批接着消费
+         "START=0",
+         'if [ -f "$OUT/batch_state" ]; then START=$(( $(cat "$OUT/batch_state") + 1 )); fi',
+         'for i in $(seq "$START" $((TOTAL-1))); do',
+         '  BD="$ROOT/b$i"',
+         "  w=0",
+         '  while [ ! -f "$BD/.ready" ]; do',
+         "    sleep 2",
+         "    w=$((w+1))",
+         '    if [ $w -gt 43200 ]; then echo "@stage timeout: 等待第 $i 批超时(24h)"; rc=1; break; fi',
+         "  done",
+         "  [ $rc -eq 0 ] || break",
+         '  echo "@stage infer 第 $i/$((TOTAL-1)) 批（边传边推理）"',
+         "  %s || rc=1" % " ".join(infer),
+         '  echo $i > "$OUT/batch_state"',
+         "done",
+         "if [ $rc -eq 0 ]; then",
+         '  echo "@stage merge 合并各批 dump"',
+         '  cat "$OUT"/parts/b*/dump_%s.jsonl > "$OUT/dump_%s.jsonl" || rc=1' % (tag, tag),
+         # 各批 metrics 合并成 $OUT/metrics_<tag>.json：reuse-dump 评测时会读它
+         # 回填报告里的 FPS / 推理耗时，否则显示 0（各批 fps 见 parts/b*/metrics_*.json）
+         '  echo "@stage merge 汇总各批 metrics"',
+         '  python3 - "$OUT" <<\'PYEOF\'',
+         'import json, glob, os, sys',
+         'out = sys.argv[1]',
+         'tag = %s' % json.dumps(tag),
+         'task = %s' % json.dumps(task),
+         'fr = el = inf = pre = 0.0',
+         'for p in sorted(glob.glob(os.path.join(out, "parts", "b*", "metrics_" + tag + ".json"))):',
+         '    try:',
+         '        rp = json.load(open(p))["rk_pipe"]',
+         '        pp = rp.get("pipeline", {}) or {}',
+         '        f = float(pp.get("processed_frames", 0) or 0)',
+         '        el += float(pp.get("elapsed_seconds", 0) or 0)',
+         '        fr += f',
+         '        st = rp.get("stage_avg_ms", {}) or {}',
+         '        inf += float(st.get("inference", 0) or 0) * f',
+         '        pre += float(st.get("preprocess", 0) or 0) * f',
+         '    except Exception:',
+         '        pass',
+         'avg = (fr / el) if el else 0.0',
+         'nb = len(glob.glob(os.path.join(out, "parts", "b*")))',
+         'row = {"rk_pipe": {',
+         '    "task": task, "mode": "pipeline",',
+         '    "note": "边传边测各批汇总（%d 批）" % nb,',
+         '    "pipeline": {"processed_frames": int(fr), "elapsed_seconds": el, "avg_fps": avg},',
+         '    "stage_avg_ms": {"preprocess": (pre / fr if fr else 0.0),',
+         '                     "inference": (inf / fr if fr else 0.0)},',
+         '}}',
+         'json.dump(row, open(os.path.join(out, "metrics_" + tag + ".json"), "w"), indent=1)',
+         'print("[batch] metrics 汇总: %d 帧 / %.3fs / %.1f fps" % (fr, el, avg))',
+         'PYEOF',
+         "fi",
+         "if [ $rc -eq 0 ]; then",
+         '  echo "@stage evaluating 汇总评测出报告"',
+         "  %s || rc=1" % " ".join(ev),
+         "fi",
+         'echo "@stage done"',
+         "exit $rc"]
+    path = os.path.join(out_dir, "run_job.sh")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+    os.chmod(path, 0o755)
+    preview_ports = [[tag, pv_base]] if preview else []
     return path, preview_ports
 
 
@@ -1184,9 +1493,20 @@ def start_job(form):
         batch = int(form.get("batch", ["0"])[0] or 0)
     except ValueError:
         batch = 0
-    use_script = len(models) > 1
-    note = "" 
-
+    # 边传边测（分批上传）：仅 PC 同步来源可用（图片由 PC 边传边被消费），暂限单模型
+    batch_up = form.get("batch_up") == ["on"]
+    try:
+        batch_total = int(form.get("batch_total", ["0"])[0] or 0)
+    except ValueError:
+        batch_total = 0
+    try:
+        batch_size = int(form.get("batch_size", ["500"])[0] or 500)
+    except ValueError:
+        batch_size = 500
+    batch_mode = bool(batch_up and ds_source == "sync" and batch_total > 0)
+    if batch_mode and len(models) > 1:
+        return None, "边传边测暂不支持多模型对比 —— 请取消对比模型，或关闭边传边测"
+    use_script = len(models) > 1 or batch_mode
     note = ""
     preview_ports = []
     eval_bin = find_eval_bin()
@@ -1194,7 +1514,14 @@ def start_job(form):
         return None, ("未找到评测二进制 build/rknn_eval —— 板端需先构建："
                       "cmake -B build -S . -DOPENCV_ROOT=/userdata/opencv-4.11.0-install "
                       "&& cmake --build build --target rknn_eval -j 8")
-    if use_script:
+    if batch_mode:
+        script, preview_ports = _write_batch_script(
+            out_dir, task, models[0][0], model, images, ann_arg, ann, label, obj_num,
+            conf, threads, vis, preview, pv_base, eval_bin, batch_total)
+        cmd_s = "bash %s" % shlex.quote(script)
+        note = "边传边测：%d 批 × 每批 ≤%d 张（上传与推理重叠，全部到齐后统一评测）" % (
+            batch_total, batch_size)
+    elif use_script:
         script, preview_ports = _write_job_script(
             out_dir, task, models, images, ann_arg, ann, label, obj_num,
             conf, threads, vis, preview, pv_base, eval_bin)
@@ -1230,6 +1557,8 @@ def start_job(form):
         form_snap = dict(task=task, model=model, images=images, ann=ann,
                          label=label, obj_num=obj_num, conf=str(conf),
                          threads=str(threads), batch=str(batch),
+                         batch_up="on" if batch_up else "",
+                         batch_size=str(batch_size),
                          ds_source=ds_source,
                                                   vis="on" if vis else "", preview="on" if preview else "",
                          keep_ds="on" if keep_ds else "",
@@ -1584,6 +1913,15 @@ def _batch_done_of(job):
         return -1
 
 
+def _resume_key_of(job):
+    """从分批任务的数据根反推出数据集 key（补传页要按同一个 key 续传）。"""
+    sh = os.path.join(job.get("out_dir") or "", "run_job.sh")
+    root = _cleanup_dir_from_script(sh)
+    if not root:
+        root = _cleanup_dir_for((job.get("form") or {}).get("images") or "")
+    return os.path.basename(root) if root else ""
+
+
 def _cleanup_dir_for(images):
     """由 images 路径推断可清理的数据缓存根目录（仅限服务管理的两个根）。
 
@@ -1647,6 +1985,31 @@ def handle_sync_file(key, rel, body):
     with open(fp, "wb") as f:
         f.write(body)
     return {"ok": True}
+
+
+def handle_sync_batch_done(key, idx):
+    """边传边测：PC 端传完第 idx 批 → 写就绪标记，板端脚本据此开始消费这一批。"""
+    if not _valid_key(key):
+        return {"ok": False, "error": "非法 key"}
+    try:
+        i = int(idx)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "非法批号"}
+    if i < 0 or i > 100000:
+        return {"ok": False, "error": "批号越界"}
+    bd = os.path.join(RK_EVAL_DATA, key, "b%d" % i)
+    if not os.path.isdir(bd):
+        return {"ok": False, "error": "第 %d 批目录不存在（请先上传该批图片）" % i}
+    n = len([f for f in os.listdir(bd)
+             if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"))])
+    if not n:
+        return {"ok": False, "error": "第 %d 批目录里没有图片" % i}
+    try:
+        with open(os.path.join(bd, ".ready"), "w"):
+            pass
+    except OSError as e:
+        return {"ok": False, "error": "写就绪标记失败: %s" % e}
+    return {"ok": True, "batch": i, "images": n}
 
 
 def handle_sync_reset(key):
@@ -1890,9 +2253,26 @@ class Handler(BaseHTTPRequestHandler):
                                   (html.escape(os.path.join(md, f), quote=True),
                                    html.escape(dt, quote=True), sel, html.escape(f)))
             free_b = _free_bytes(DEFAULTS["model_dir"])
+            # 补传模式：?resume=<jid> → 注入一段 JS，让首页进入"只补缺失批次"流程
+            resume_js = ""
+            rq = parse_qs(u.query).get("resume", [""])[0]
+            rjob = JOBS.get(rq) if rq else None
+            if rjob and _is_batch_consume_job(rjob):
+                tot = _batch_total_of(rjob)
+                done = _batch_done_of(rjob)
+                if tot > 0 and done + 1 < tot:
+                    resume_js = (
+                        "SYNC.resume = {jid: %s, key: %s, done: %d, total: %d};\n"
+                        "f.batch_up.checked = true;\n"
+                        "document.getElementById('batch_total').value = %d;\n"
+                        "syncStat('补传模式：任务 %s 已消费 %d/%d 批 —— 请重新选择同一个图片"
+                        "文件夹，只会补传缺失批次');\n"
+                        % (json.dumps(rjob["id"]), json.dumps(_resume_key_of(rjob)),
+                           done, tot, tot, rjob["id"], done + 1, tot))
             page = FORM % {**DEFAULTS, "task_options": opts,
                            "model_options": "".join(m_opts),
-                           "free_gb": "%.1f" % (free_b / 2**30) if free_b >= 0 else "?"}
+                           "free_gb": "%.1f" % (free_b / 2**30) if free_b >= 0 else "?",
+                           "resume_js": resume_js}
             self._send(200, render_page(page))
         elif u.path == "/jobs":
             rows = []
@@ -2235,8 +2615,17 @@ var timer = setInterval(function() {
         u = urlparse(self.path)
         if u.path == "/create":
             n = int(self.headers.get("Content-Length", 0))
-            form = parse_qs(self.rfile.read(n).decode())
+            body = self.rfile.read(n)
+            # 边传边测走 XHR 提交：提交后要留在原页面继续按批上传，故此处回 JSON 而不是 302
+            want_json = ("application/json" in (self.headers.get("Accept") or "")
+                         or self.headers.get("X-Requested-With") == "XMLHttpRequest")
+            form = parse_qs(body.decode())
             jid, err = start_job(form)
+            if want_json:
+                self._send(200 if not err else 400,
+                           json.dumps({"ok": not err, "jid": jid or "", "error": err or ""},
+                                      ensure_ascii=False), "application/json")
+                return
             if err:
                 self._send(400, render_page("提交失败: %s<p><a href='/'>返回</a></p>" % html.escape(err)))
                 return
@@ -2301,6 +2690,10 @@ var timer = setInterval(function() {
                 return
             r = handle_sync_file(q.get("key", [""])[0], q.get("p", [""])[0], body)
             self._send(200, json.dumps(r), "application/json")
+        elif u.path == "/api/sync/batch-done":
+            q = parse_qs(u.query)
+            r = handle_sync_batch_done(q.get("key", [""])[0], q.get("i", [""])[0])
+            self._send(200, json.dumps(r, ensure_ascii=False), "application/json")
         elif u.path == "/api/sync/reset":
             q = parse_qs(u.query)
             r = handle_sync_reset(q.get("key", [""])[0])
