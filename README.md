@@ -143,6 +143,11 @@ DOTA 评测、`--conf-sweep`/`--vis-dir`(单图可视化)等进阶用法见 [too
 ## 板端性能与精度（RK3588 实测）
 
 以下数据在 RK3588 板端实测（COCO val2017 5000 张，`thread_count: 9`，`conf=0.001`）。
+2026-09-15 起模型全部换用新量化布局：**yolo26 detect/obb 为 split6 拆分布局（每尺度 box/cls 独立张量）、
+seg 为 split10（box/cls/mask 拆分 + proto）、pose 为融合布局**。旧 sigmoid 融合版已删除，
+转换脚本见 `tools/convert/`（`export_onnx_split6.py` → `convert_yolo26_split_int8.py` 等）。
+拆分布局的动机与量化论证：one2one 检测头 box/cls 共享量化 scale 会被 cls 极值撑爆导致 AP 塌缩，
+拆分后纯 INT8 即可正常工作（detect AP 33.0→35.8，obb mAP50 63.3→66.8，seg mask AP 27.0→28.5）。
 
 **推理速度（pipeline 9 线程，视频流 1280×720@60fps）**
 
@@ -155,19 +160,19 @@ DOTA 评测、`--conf-sweep`/`--vis-dir`(单图可视化)等进阶用法见 [too
 | yolo26n_pose | pose | baseline9.mp4 | 1280×640@30 | 125.3 | 70.6ms |
 | yolo11n_pose | pose | baseline9.mp4 | 1280×640@30 | 114.6 | 76.6ms |
 | yolov8_obb | obb | baseline11.mp4 | 1280×720@24 | 173.1 | 44.8ms |
-| yolo26n_seg | seg | baseline17_mid30s.mp4 | 1920×1080@30 | 60.2 | 238.6ms |
+| yolo26n_seg | seg | baseline17_mid30s.mp4 | 1920×1080@30 | 39.0 | 107.3ms |
 
 **INT8 vs FP16 推理速度对比**（yolo26 系列，9 线程）
 
 | 模型 | 量化 | FPS | 推理耗时/帧 |
 |---|---|---|---|
-| yolo26n | INT8 | 127.0 | 79.3ms |
+| yolo26n | INT8 | 127.6 | 77.3ms |
 | yolo26n | FP16 | 58.6 | 218.4ms |
-| yolo26n_obb | INT8 | 132.7 | 51.1ms |
+| yolo26n_obb | INT8 | 112.0 | 55.0ms |
 | yolo26n_obb_fp16 | FP16 | 62.8 | 99.3ms |
 | yolo26n_pose | INT8 | 125.2 | 71.6ms |
 | yolo26n_pose_fp16 | FP16 | 58.1 | 111.5ms |
-| yolo26n_seg | INT8 | 61.2 | 261.3ms |
+| yolo26n_seg | INT8 | 39.0 | 107.3ms |
 | yolo26n_seg_fp16 | FP16 | 34.7 | 435.3ms |
 
 > INT8 量化模型推理速度约为 FP16 的 2 倍以上；精度损失用 `--compare` 参数量化。
@@ -176,32 +181,44 @@ DOTA 评测、`--conf-sweep`/`--vis-dir`(单图可视化)等进阶用法见 [too
 
 | 模型 | AP | AP50 | AP75 | APs | APm | APl | AR | FPS |
 |---|---|---|---|---|---|---|---|---|
-| yolo26n | 34.2 | 48.7 | 36.9 | 14.5 | 37.9 | 52.6 | 46.7 | 126.9 |
+| yolo26n | 35.8 | 50.8 | 38.8 | 15.4 | 39.6 | 53.9 | 53.6 | 129.3 |
+| yolo26s | 41.1 | 57.1 | 44.9 | 22.0 | 45.7 | 58.4 | 60.5 | 73.5* |
+| yolo26m | 43.8 | 59.7 | 47.8 | 27.0 | 49.4 | 60.1 | 65.1 | 31.4 |
 | yolov8n | 34.0 | 48.5 | 37.0 | 14.3 | 37.7 | 50.1 | 44.5 | 170.8 |
 | yolo11n | 35.9 | 50.8 | 38.9 | 15.5 | 39.3 | 54.5 | 45.9 | 141.7 |
 | yolov5s | 31.2 | 48.4 | 33.8 | 14.3 | 35.9 | 42.5 | 39.5 | 147.5 |
+
+\* y26s 的 sweep 口径存在 CPU 瓶颈，此处为端到端实测值；y26n/m 两口径一致。
 
 **pose 精度（COCO val2017, COCOeval keypoints）**
 
 | 模型 | AP | AP50 | AP75 | AR | FPS |
 |---|---|---|---|---|---|
-| yolo26n_pose | 49.7 | 77.6 | 53.7 | 47.2 | 126.2 |
-| yolov8_pose | 49.3 | 77.0 | — | — | 121.6 |
-| yolo11n_pose | 46.6 | 78.6 | 48.8 | 46.1 | 114.5 |
+| yolo26n_pose | 49.5 | 77.5 | 53.1 | 46.8 | 123.5 |
+| yolo26s_pose | 48.4 | 81.1 | 51.2 | 48.7 | 50.1 |
+| yolo26m_pose | 55.7 | 85.4 | 61.5 | 56.2 | 30.3 |
+| yolov8_pose | 49.3 | 78.4 | 52.8 | 47.9 | 119.3 |
+| yolo11n_pose | 46.6 | 78.6 | 48.8 | 46.1 | 112.5 |
 
 **seg 精度（COCO val2017, COCOeval segm）**
 
 | 模型 | AP | AP50 | AP75 | FPS |
 |---|---|---|---|---|
-| yolo26n_seg | 27.0 | 45.5 | 27.6 | 59.6 |
+| yolo26n_seg | 28.5 | 48.8 | 29.0 | 39.0 |
+| yolo26s_seg | 32.9 | 55.9 | 33.4 | 38.9 |
+| yolo26m_seg | 36.6 | 61.9 | 37.3 | 38.0 |
 | yolov8_seg | 12.7 | — | — | 58.5 |
 | yolo11n_seg | 10.1 | 18.5 | 9.9 | 74.1 |
+
+> yolov8/yolo11 的 seg 模型为早期导出链转换产物，数值异常偏低，仅作记录。
 
 **obb 精度（DOTA v1.0 val, 旋转 IoU）**
 
 | 模型 | mAP50 | mAP50:95 | FPS |
 |---|---|---|---|
-| yolo26n_obb | 63.3 | 33.7 | 107.0 |
+| yolo26n_obb | 66.8 | 35.4 | 112.0 |
+| yolo26s_obb | 69.6 | 39.0 | 109.4 |
+| yolo26m_obb | 72.1 | 42.5 | 105.2 |
 | yolov8_obb | 65.4 | 32.1 | 104.9 |
 
 **depth 推理速度**
@@ -211,9 +228,10 @@ DOTA 评测、`--conf-sweep`/`--vis-dir`(单图可视化)等进阶用法见 [too
 | yolo26n_depth | 63.6 |
 
 > 以上均为 INT8 量化模型在 RK3588 NPU 上的板端实测值（非 PC 模拟）；
-> 精度用 `rknn_eval` 全量 COCO val2017 评测（COCOeval 标准口径，conf=0.001）。
+> 精度用 `rknn_eval` 全量评测（COCOeval / DOTA 旋转 IoU 标准口径，conf=0.001）。
 > FPS 为 9 线程 pipeline 全量推理速度（非单帧推理耗时）。
-> 如需 INT8 vs FP16 量化损失对比，用 `--compare` 参数即可。
+> obb 精度在 DOTA v1.0 val（458 图 → 1024/200 切片 5297 张）上评测；obb/seg 的 640 固定输入
+> 与官方模型页的 1024 原生输入口径不同，绝对值不可直接对标，家族内横向比较有效。
 
 ## C ABI 用法(配置即契约)
 

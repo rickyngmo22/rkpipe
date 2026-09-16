@@ -5,6 +5,7 @@
 ## [未发布]
 
 ### 移除
+- 旧版 yolo26 sigmoid 量化方案：`tools/convert/add_cls_sigmoid_yolo26_onnx.py` 与 `convert_yolo26_cls_sigmoid_int8.py` 删除，sigmoid 融合版模型被拆分布局版替换（detect AP 33.0→35.8、obb mAP50 63.3→66.8、seg mask AP 27.0→28.5，均为纯 INT8 实测）
 - 语义分割(sem)与单目 3D 检测(detect3d)任务：契约类型/检测器/后处理/绘制/评测载荷与单测；后续版本再随需求恢复
 - 多任务同路组合（Y5 aux）与依赖它的 depth-dist 测距标注/近距告警：`AppConfig` 的 `aux_model_path`/`aux_task`/`depth_dist_*` 字段、`--aux-model`/`--aux-task`/`--depth-dist-*` 命令行、`PipelineFrame` 的 `auxDepth*` 四字段、JSONL/RESULT 的 `aux` 附加载荷、`utils/depth_distance.h` 纯函数与对应单测；配套核心库已同步重编
 - 二阶段任务与级联:rtmpose 两阶段姿态、ocr_det / ocr_rec、二级分类(composite_cls / cls_top1 / ctc_decode / 透视矫正)全部源码、单测与文档,OCR 字典资产与转换脚本
@@ -12,10 +13,12 @@
 - 边界自检脚本 `scripts/check_open_boundary.py`、发布同步脚本 `scripts/publish_public.sh` 与对应 CI job
 
 ### 新增
+- **yolo26 拆分布局量化链** `tools/convert/`:`export_onnx_split6.py` + `convert_yolo26_split_int8.py`（detect/obb 通用，每尺度 box/cls 独立张量，cls clamp(-12,8) 保序）、`export_onnx_obb_split.py`（boxangle/cls 拆分）、`export_onnx_seg_split.py` + `convert_yolo26_seg_split_int8.py`（box/cls/mask 拆分 + proto，10 输出）、`export_onnx_raw.py` + `convert_yolo26_pose_fused_int8.py`（pose 融合裸头，INT8 不塌缩无需拆分）、`export_onnx_pose_split.py`（备用）。板端后处理按输出 channels 自动判布局，新旧模型共存兼容
 - OBB 评测指南 `docs/benchmark_dota_obb.md`；**PC 端一键预处理** `tools/eval/prepare_dota.bat/.py`（解压官方包→整理 val_images/labelTxt→本机切片出 patches+gt，上传量约为原图一半；`--limit N` 支持小样试跑）；网页端 DOTA 走 PC 预处理产物（patches + gt jsonl 经文件夹同步上传），实测 3 图 zip → 10 切片 → yolo26n_obb mAP50 65.5 全流程通过(DOTA v1.0 数据准备/自动切片/已切片复用/INT8 vs FP16 对比/网页控制台操作/评测口径)
 - **网页评测控制台**（`tools/eval/eval_web_service.sh start`，PC 浏览器直连 `http://<板IP>:8081`，零依赖纯标准库）:数据集上传（zip 或 PC 文件夹增量同步,二次评测只传差异）→ 模型下拉（`model/models.json` 登记）/上传 → 提交评测（同板串行队列,多模型对比,实时日志 + MJPEG 抽帧快照）→ 自动出 mAP 报告（MD/CSV/逐类表）→ 历史任务还原与跨任务对比。**存储安全**：同步/上传前空间预检（不足即拒绝），默认任务成功后用完即删上传缓存（可勾选保留走增量复评），页面显示板端剩余空间，缓存根目录 `RK_EVAL_DATA` 可指到大容量分区。**提交页交互修正与标注放开**：标注文件不再限制扩展名/命名（自定义数据集任意命名均可，按原名上板）；修复网页提交把已选图片文件整体序列化进请求体导致的 400（改为字段白名单）；核心默认 label 路径改为 `assets/labels/`（随公库布局）。任务切换即时过滤模型下拉（页面加载即按任务过滤）；提交失败时弹窗透出服务端原因、HTML 页面禁缓存防旧脚本（`Cache-Control: no-store`）；修复网页提交 400 的根因——`FormData` 走 multipart 而后端按 urlencoded 解析导致全部字段丢失（改用 `URLSearchParams` urlencoded 提交）；修复补传驱动 `join` 的转义错误导致的整页 JS 失效（该错误会让任务过滤/提交拦截/分批上传全部失灵，现已用 esprima 全量语法校验页面脚本）；对比下拉不再被任务切换强制改选（选回"不对比"状态可保持）；任务切换即时过滤模型下拉（页面加载即按任务过滤）；对比模型默认"不对比"时添加按钮禁用（选模型才启用，选回"不对比"自动清掉已添加行）；选完图片文件夹只做清单比对不立刻上传，点「开始评测」时才上传（并发 4，进度可见）。**数据集分批增量上传**：文件夹同步模式按「每批张数」分批——先传 2 批（1 运行 + 1 候选），任务逐批消费（脚本按 `batch_state` 进度 + `.ready` 哨兵等待），板上跑完一批由页面自动补传下一批，板上任意时刻最多 2 批，评测全程无需一次性上传大数据集；**补传不再依赖页面存活**：提交页统一引入补传模块并自动请求屏幕唤醒锁（上传期间防 PC/浏览器休眠）；数据集为**一次性全量上传**（选文件夹 → 清单比对 → 4 并发全量上传 → 提交，进度实时可见；比对请求 30s 超时与失败有明确提示，提交时未完成比对会自动补跑），数据保留在板上缓存（同文件夹再次提交只补差异，任务结束自动清理，可勾选保留）；「每批张数」输入框随分批机制一并移除；修复 iframe 初始化竞态（脚本未就绪即移交导致补传静默丢失、任务卡在等下一批——现重试至驱动就绪才跳转）；修复补传驱动的两个致命问题——iframe 方案在整页跳转时随页面上下文被卸载导致补传停止（改为提交页自身驱动 + 任务页开新标签查看，评测完成自动跳转）；以及批次表误传对象数组导致 `S.batches[idx]` 取空、批 2 永远不打 `.ready`（改按批号索引稀疏数组）——误传 `[{idx,names}]` 对象数组而驱动按下标 `S.batches[idx]` 取文件列表，导致 `S.batches[2]` 恒为 undefined、批 2 永远不打 `.ready`、任务卡死在批间隙（现改为按批号索引的稀疏数组）；每批跑完即删，任务结束清空缓存（默认）。配套 `run_eval.py`(PC ssh/rsync 脚本化远程评测,断点续传+状态机)与 `convert_dataset.py`(YOLO/VOC/labelme/yolo-obb → COCO/DOTA 转换+校验+GT 预览);`rknn_eval` 新增 `--dump-only/--preview/--preview-port/--vis-sample`
 
 ### 变更
+- **yolo26 模型全面换用拆分布局纯 INT8**:`model/yolo26n.rknn`(detect, split6)、`model/yolo26n_obb.rknn`(split6)、`model/yolo26n_seg.rknn`(split10)替换旧 sigmoid 融合版;`yolo26n_pose.rknn` 维持融合布局(实测不塌缩)。README 板端实测数据同步更新(detect AP 35.8 @129FPS、obb mAP50 66.8、seg mask AP 28.5,含 s/m 全家族行与新旧口径说明)
 - 网页数据集上传简化为一次性全量上传（不分批/不断点，选文件夹 → 全量上传 → 提交，4 并发进度可见；同文件夹再次提交按清单只补差异，任务结束自动清理缓存可勾选保留）；移除分批消费/断点续跑/补传驱动的相关机制与界面:`model/` 附带四个 YOLO 版本(yolo26n / yolov8n / yolo11n / yolov5s)的板端模型,覆盖 detect / pose / obb / seg / depth,示例配置开箱即用;来源与许可见 NOTICE
 - 二进制收敛为两个:`console_detector`(板端控制台应用,由原 CLI 改名,经 C ABI 驱动完整流水线)与 `rknn_eval`(精度/性能评测)
 - 仓库作为独立项目发布:文档不再区分源码层与核心库的分发形态;任务范围收敛到单阶段(detect / pose / obb / seg / depth)

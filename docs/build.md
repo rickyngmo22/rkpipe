@@ -33,9 +33,15 @@ ctest --test-dir build-ci --output-on-failure
 `model/` 已附带常用 YOLO 版本的板端模型(从公开权重经 `tools/convert/` 转换),示例配置可直接使用。需要换模型/量化版本时,以公开权重为起点自己转:
 
 1. 用 Ultralytics / 官方仓库导出 ONNX(检测头含解码或裸输出均可,见 `tools/convert/` 各脚本注释);
-2. 运行转换脚本(`tools/convert/`)。**脚本不含命令行参数**:运行前先编辑脚本头部的"按需修改"常量块(onnx 路径、输出名、量化 dataset 等),然后在脚本所在目录直接运行,例如:
-   - `python3 tools/convert/convert_yolo26_fp16.py`(FP16 转换)
-   - 量化版本参考 `tools/convert/convert_yolo26_cls_sigmoid_int8.py`(cls 输出 Sigmoid 收窄值域,保住 INT8 分数)
+2. 运行转换脚本(`tools/convert/`)。yolo26 系列**推荐拆分布局链**(脚本带命令行参数):
+   - detect:`export_onnx_split6.py --weights yolo26n.pt --output onnx/yolo26n_split6.onnx`
+     → `convert_yolo26_split_int8.py --onnx onnx/yolo26n_split6.onnx --output yolo26n_split6_i8.rknn`
+   - obb:`export_onnx_obb_split.py` → `convert_yolo26_split_int8.py`(同一转换脚本)
+   - seg:`export_onnx_seg_split.py` → `convert_yolo26_seg_split_int8.py`(10 输出:3×[box/cls/mask]+proto)
+   - pose:`export_onnx_raw.py`(融合裸头) → `convert_yolo26_pose_fused_int8.py`(pose 融合布局 INT8 不塌缩,无需拆分)
+   - FP16 转换:`convert_yolo26_fp16.py`(旧式脚本,无命令行参数,编辑头部常量块后运行)
+   - 动机:one2one 头 box/cls 共享量化 scale 会被 cls 极值撑爆(纯融合 INT8 detect AP 33.0 → 塌缩),
+     拆分后各张量独占 scale,纯 INT8 正常工作;pose/seg 因输出构成不同不塌缩,pose 直接融合即可。
 3. 把得到的 `.rknn` 与 labels 文本路径填入示例配置。
 
 
