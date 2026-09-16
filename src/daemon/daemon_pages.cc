@@ -211,7 +211,7 @@ std::string monitorHtml() {
 </style>
 </head>
 <body>
-<h1>rk_pipe 监控面板 <span class="hint">（<a href="/timeline">事件时间线 →</a>）</span></h1>
+<h1>rk_pipe 监控面板 <!--UI-SHIELD(时间线入口) 屏蔽前: <span class="hint">（<a href="/timeline">事件时间线 →</a>）</span>--></h1>
 <div class="boardbar">
   <span class="bitem"><span id="cpuLabel">CPU</span> <span class="bar"><i id="cpu"></i></span></span>
   <span class="bitem">MEM <span class="bar"><i id="mem"></i></span><span id="memv" class="hint"></span></span>
@@ -228,7 +228,7 @@ std::string monitorHtml() {
   <button onclick="refresh()">刷新</button>
   <span class="hint">每 2s 自动刷新</span>
 </div>
-<div class="events" id="events">
+<!--UI-SHIELD(最近事件)--><div class="events" id="events" style="display:none">
   <div class="evhead">最近事件（LLM/人工复核结论，每 5s 刷新，详情 GET /api/events）</div>
   <div id="evlist"><span class="hint">加载中…</span></div>
 </div>
@@ -330,7 +330,7 @@ function cardEl(t){
       '<button data-act="edit" data-id="'+t.id+'">修改</button>'+
       '<button data-act="preview" data-id="'+t.id+'">预览</button>'+
       '<button data-act="log" data-id="'+t.id+'">日志</button>'+
-      '<button data-act="rules" data-id="'+t.id+'">画规则</button>'+
+      /*UI-SHIELD(画规则)*/ ''+
       '<button data-act="restart" data-id="'+t.id+'">重启</button>'+
       '<button data-act="stop" data-id="'+t.id+'">停止</button>'+
     '</div>';
