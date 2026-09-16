@@ -46,3 +46,5 @@ __pycache__/
 .zcode/
 multistream_logs/
 results/
+web_runs_archive_*.tar.gz
+*.bak.*
