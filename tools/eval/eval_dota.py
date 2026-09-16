@@ -152,7 +152,10 @@ def main():
     if len(ap_all) > 1:
         print("mAP50:0.95 = %.4f" % float(np.mean(ap_all)))
     if args.out:
-        out = {"mAP50": float(ap_all[0]),
+        # kind 与 eval_coco.py 的 summary 对齐，历史对比页（compare_runs）
+        # 靠它按任务类型分 tab，缺失会导致 obb 不出现在对比页
+        out = {"kind": "obb",
+               "mAP50": float(ap_all[0]),
                "mAP50_95": float(np.mean(ap_all)) if len(ap_all) > 1 else None,
                "AP50_per_class": ap50_per_cls, "n_gt": n_gt, "n_pred": n_pred}
         with open(args.out, "w") as f:
@@ -163,3 +166,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

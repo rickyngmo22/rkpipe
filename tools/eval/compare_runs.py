@@ -27,8 +27,16 @@ def load_runs(dirs):
                 s = json.load(open(sp))
             except (OSError, ValueError):
                 continue
-            if not isinstance(s, dict) or "kind" not in s:
+            if not isinstance(s, dict):
                 continue
+            if "kind" not in s:
+                # 旧版 eval_dota.py 的 obb summary 不带 kind：按指标特征推断
+                # （mAP50_95 / AP50_per_class 是 DOTA 评测独有；其余缺 kind 的
+                # 聚合产物如 summary_all.json 仍跳过）
+                if "mAP50_95" in s or "AP50_per_class" in s:
+                    s = dict(s, kind="obb")
+                else:
+                    continue
             mp = os.path.join(d, "metrics_%s.json" % tag)
             fps = 0.0
             if os.path.exists(mp):
