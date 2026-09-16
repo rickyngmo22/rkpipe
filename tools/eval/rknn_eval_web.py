@@ -385,7 +385,8 @@ function syncFolder(input) {
       finishImages(manifest.length, r.have, 0);
       return;
     }
-    syncStat('需上传 ' + need.length + ' / ' + manifest.length + ' 张（板上已有 ' + r.have + '）...');
+    syncStat('需上传 ' + need.length + ' / ' + manifest.length + ' 张（板上已有 ' + r.have +
+             '）。未勾选「边传边测」= 立即全量上传；想分批边传边测，请先勾选再重新选择文件夹');
     var totalBytes = 0;
     for (var z = 0; z < need.length; z++) totalBytes += (SYNC.map[need[z]] || {}).size || 0;
     var sentBytes = 0, done = 0, fail = 0, i = 0, act = 0, lastPaint = 0;
@@ -535,8 +536,11 @@ function batchSize() {
   return (v > 0) ? v : 500;
 }
 function batchMode() {
-  if (batchOn()) syncStat('边传边测已启用：提交后按 ' + batchSize() +
-      ' 张一批上传，板端边收边推理（需先选好图片文件夹与标注）');
+  if (!batchOn()) return;
+  syncStat('边传边测已启用：提交后按 ' + batchSize() + ' 张一批上传，板端边收边推理' +
+           (SYNC.manifest && SYNC.manifest.length
+             ? '（清单已建好，板上已有的图片不会重传，直接提交即可）'
+             : '（请选择图片文件夹建清单 —— 只比对、不全量上传；若刚才已开始全量上传，等它传完或刷新页面重选）'));
 }
 /* 按批切分清单。板端 --images 不递归子目录，故文件名扁平化进 b<i>/；
    不同子目录重名会互相覆盖丢图，直接拒绝而非静默出错 */
@@ -598,15 +602,27 @@ function startBatchUpload(jid) {
     if (cur >= N) { finishAll(); return; }
     var i = cur, slice = batches[i];
     var mark = function () {                 // 通知板端第 i 批就绪
+      /* 携带该批清单：板上已有同数据的（增量复用）由服务端从原始路径
+         硬链接补齐 b<i>/，不依赖重复上传 */
       var x = new XMLHttpRequest();
       x.open('POST', '/api/sync/batch-done?key=' + encodeURIComponent(SYNC.key) + '&i=' + i);
-      x.onload = x.onerror = function () {
+      x.onload = function () {
+        var r = null; try { r = JSON.parse(x.responseText); } catch (e) {}
+        if (!r || !r.ok) {                   // 不再吞错误：批未真正就绪就推进会让板端永远等 .ready
+          syncStat('✗ 第 ' + (i + 1) + ' 批就绪确认失败：' + ((r && r.error) || '未知') +
+                   ' —— 可重选文件夹补传该批');
+          SYNC.uploading = false; releaseWake(); return;
+        }
         cur++;
         if (bar) bar.value = Math.round(cur / N * 100);
         if (txt) txt.textContent = cur + ' / ' + N + ' 批已就绪';
         next();
       };
-      x.send();
+      x.onerror = function () {
+        syncStat('✗ 第 ' + (i + 1) + ' 批就绪请求失败（网络）');
+        SYNC.uploading = false; releaseWake();
+      };
+      x.send(JSON.stringify({files: slice}));
     };
     var xh = new XMLHttpRequest();
     xh.open('POST', '/api/sync/manifest');
@@ -1089,7 +1105,7 @@ def save_job(job):
                    ("id", "state", "cmd", "rc", "tag", "task", "created",
                     "t_start", "t_end", "log_path", "out_dir", "board_key",
                     "source", "note", "pc_out", "remote_result_dir",
-                    "preview_ports")},
+                    "preview_ports", "form")},
                   open(path, "w"), indent=2, ensure_ascii=False)
 
 
@@ -1377,9 +1393,14 @@ def _write_batch_script(out_dir, task, models, ds_root, ann_arg, ann, label, obj
          'for i in $(seq "$START" $((TOTAL-1))); do',
          '  BD="$ROOT/b$i"',
          "  w=0",
+         # 等待期必须有即时输出：此前 run.log 0 字节 + 任务页日志空白，
+         # 用户以为服务卡死（实际是浏览器还没传完第 0 批）
+         '  echo "@stage waiting 等待第 $i/$((TOTAL-1)) 批上传就绪（浏览器分批上传中；'
+         '若长期不动说明上传已中断，请在提交页用 ?resume=$(basename "$OUT") 补传）"',
          '  while [ ! -f "$BD/.ready" ]; do',
          "    sleep 2",
          "    w=$((w+1))",
+         '    if [ $((w % 15)) -eq 0 ]; then echo "@stage waiting 已等 $((w*2))s，第 $i 批仍未就绪"; fi',
          '    if [ $w -gt 43200 ]; then echo "@stage timeout: 等待第 $i 批超时(24h)"; rc=1; break; fi',
          "  done",
          "  [ $rc -eq 0 ] || break",
@@ -2009,8 +2030,15 @@ def handle_sync_file(key, rel, body):
     return {"ok": True}
 
 
-def handle_sync_batch_done(key, idx):
-    """边传边测：PC 端传完第 idx 批 → 写就绪标记，板端脚本据此开始消费这一批。"""
+def handle_sync_batch_done(key, idx, files=None):
+    """边传边测：PC 端传完第 idx 批 → 写就绪标记，板端脚本据此开始消费这一批。
+
+    files: 该批的 [[rel, size], ...] 清单（原始相对路径）。此前只信 b<i>/ 目录里
+    实际传到的文件 —— 当这批图片已在板上（增量复用：先全量传过 / keep_ds 保留
+    后重评），浏览器端比对出 need=[] 一张不传，b<i>/ 根本不建立，batch-done
+    恒失败且被前端吞掉 → 板端永远等不到 .ready，任务挂死（实测 3a2970d2）。
+    现按清单把 b<i>/<基名> 缺失的文件从原始路径硬链接补齐（同大小才链，
+    硬链接零磁盘开销），再校验、写 .ready。"""
     if not _valid_key(key):
         return {"ok": False, "error": "非法 key"}
     try:
@@ -2019,7 +2047,35 @@ def handle_sync_batch_done(key, idx):
         return {"ok": False, "error": "非法批号"}
     if i < 0 or i > 100000:
         return {"ok": False, "error": "批号越界"}
-    bd = os.path.join(RK_EVAL_DATA, key, "b%d" % i)
+    root = os.path.join(RK_EVAL_DATA, key)
+    if not os.path.isdir(root):
+        # key 格式合法但会话不存在：绝不能往下走建目录，否则伪造 key 会留垃圾目录
+        return {"ok": False, "error": "同步会话不存在（请先在网页上重新选择图片文件夹）"}
+    bd = os.path.join(root, "b%d" % i)
+    os.makedirs(bd, exist_ok=True)   # 链接目标目录；增量复用时浏览器可能一张不传
+    linked = 0
+    for ent in (files or []):
+        if not isinstance(ent, (list, tuple)) or len(ent) < 2:
+            continue
+        rel, sz = ent[0], ent[1]
+        if not _valid_relpath(rel):
+            continue
+        base = rel.replace("\\", "/").split("/")[-1]
+        if not base.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")):
+            continue
+        dst = os.path.join(bd, base)
+        if os.path.exists(dst):
+            continue
+        src = os.path.join(root, rel.replace("\\", "/"))
+        try:
+            if os.path.getsize(src) != int(sz or -1):
+                continue  # 大小不符（板上版本不同）→ 不链，留给浏览器上传
+            os.link(src, dst)
+            linked += 1
+        except OSError:
+            pass  # 源不存在/跨设备等 → 该文件仍需浏览器上传
+    if linked:
+        sys.stderr.write("[web] 批 %d 从缓存硬链接补齐 %d 张\n" % (i, linked))
     if not os.path.isdir(bd):
         return {"ok": False, "error": "第 %d 批目录不存在（请先上传该批图片）" % i}
     n = len([f for f in os.listdir(bd)
@@ -2745,7 +2801,18 @@ var timer = setInterval(function() {
             self._send(200, json.dumps(r), "application/json")
         elif u.path == "/api/sync/batch-done":
             q = parse_qs(u.query)
-            r = handle_sync_batch_done(q.get("key", [""])[0], q.get("i", [""])[0])
+            # body 携带该批 [[rel, size], ...] 清单：板上已存在的（增量复用场景）
+            # 由服务端从原始路径硬链接补齐批目录，不再依赖浏览器重复上传
+            n = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(n) if n < 16 * 1048576 else b""
+            flist = None
+            try:
+                j = json.loads(body.decode("utf-8")) if body else {}
+                if isinstance(j, dict) and isinstance(j.get("files"), list):
+                    flist = j["files"]
+            except (UnicodeDecodeError, ValueError):
+                pass
+            r = handle_sync_batch_done(q.get("key", [""])[0], q.get("i", [""])[0], flist)
             self._send(200, json.dumps(r, ensure_ascii=False), "application/json")
         elif u.path == "/api/sync/reset":
             q = parse_qs(u.query)
