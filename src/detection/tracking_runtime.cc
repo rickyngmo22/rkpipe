@@ -203,7 +203,7 @@ void updateAndRenderTracking(const AppConfig& options,
                              std::vector<TrackedDetection>* engine_tracked) {
     std::vector<TrackedDetection> tracked = tracker.update(detect_results, &class_counts);
     if (engine_tracked) {
-        *engine_tracked = tracked;  // 事件引擎消费本帧跟踪结果（规则评估输入）
+        *engine_tracked = tracked;  // 事件引擎消费（顺序模式共用并行的事件链路）
     }
     if (!output_enabled || !overlay_enabled) {
         return;
@@ -303,7 +303,7 @@ void renderPipelinePoseTrackingOutput(const AppConfig& options,
     }
     std::vector<TrackedDetection> tracked = trackPoseResults(tracker, pose->data, &class_counts);
     if (engine_tracked) {
-        *engine_tracked = tracked;  // 事件引擎消费本帧跟踪结果（规则评估输入）
+        *engine_tracked = tracked;  // 事件引擎消费（pose 框即人体框）
     }
     if (std::getenv("RK_PIPE_TRACK_DEBUG") != nullptr) {
         std::fprintf(stderr, "[track][pose] dets=%d ids=", pose->data.count);
@@ -359,7 +359,7 @@ void renderPipelineOBBTrackingOutput(const AppConfig& options,
     }
     std::vector<TrackedDetection> tracked = trackOBBResults(tracker, obb->data, &class_counts);
     if (engine_tracked) {
-        *engine_tracked = tracked;  // 事件引擎消费本帧跟踪结果（规则评估输入）
+        *engine_tracked = tracked;
     }
     if (!output_enabled) {
         return;
@@ -388,7 +388,7 @@ void renderPipelineSegTrackingOutput(const AppConfig& options,
     }
     std::vector<TrackedDetection> tracked = trackSegResults(tracker, *seg, &class_counts);
     if (engine_tracked) {
-        *engine_tracked = tracked;  // 事件引擎消费本帧跟踪结果（规则评估输入）
+        *engine_tracked = tracked;
     }
     if (!output_enabled) {
         return;

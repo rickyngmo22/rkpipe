@@ -1,0 +1,23 @@
+%YAML:1.0
+---
+# M0 两阶级联 demo：一级检测（yolo26n，COCO 80 类）+ 二级分类（MobileNetV2，ImageNet 1000 类）
+#   每个检测框 crop → MobileNetV2 → top-1 类别/分数，叠加在检测框下方第二行标签。
+#   用途：车型/商品/行人属性类 demo 底座（换 cls_model_path 即换二级语义）。
+model_path: "/userdata/rkpipe/model/yolo26n.rknn"
+cls_model_path: "/userdata/rkpipe/model/mobilenetv2_fp16.rknn"
+cls_labels_path: "/userdata/rkpipe/model/mobilenet_labels.txt"
+input_path: "/userdata/rk_pipe/test_videos/baseline.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 1
+web_preview_bind: "0.0.0.0"
+web_preview_port: 8090
+web_preview_quality: 92
+task: "composite_cls"
+mode: "pipeline"
+thread_count: 4
+gui: 0
+local: 0
+label_path: "/userdata/rkpipe/model/coco_80_labels_list.txt"
+obj_class_num: 80
+# 调试：RK_PIPE_DEBUG_COMPOSITE=1 打印每框二级识别结果

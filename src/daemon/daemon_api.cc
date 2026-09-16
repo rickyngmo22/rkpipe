@@ -1,4 +1,4 @@
-// REST 路由与 HTTP 连接处理（自 daemon_main.cc 拆出）：handleRequest/handleClient/acceptLoop。
+// REST 路由与 HTTP 连接处理（自 daemon 主模块拆出）：handleRequest/handleClient/acceptLoop。
 // rk_pipe_daemon：多任务常驻守护进程（B3 REST 服务化 + C2 模型热切换）
 //
 // 职责：

@@ -517,3 +517,19 @@ void compute_dfl_strided_i8_offset(const int8_t* tensor, int grid_len, int dfl_l
         box[b] = acc_sum;
     }
 }
+
+cv::Point2f mapPointToOriginal(const cv::Point2f& point,
+                               const letterbox_t* letter_box,
+                               int src_width,
+                               int src_height) {
+    if (!letter_box) {
+        return cv::Point2f(std::clamp(point.x, 0.0f, static_cast<float>(src_width - 1)),
+                           std::clamp(point.y, 0.0f, static_cast<float>(src_height - 1)));
+    }
+    float scale = letter_box->scale > 0.0f ? letter_box->scale : 1.0f;
+    float mapped_x = (point.x - static_cast<float>(letter_box->x_pad)) / scale + static_cast<float>(letter_box->crop_x);
+    float mapped_y = (point.y - static_cast<float>(letter_box->y_pad)) / scale + static_cast<float>(letter_box->crop_y);
+    return cv::Point2f(std::clamp(mapped_x, 0.0f, static_cast<float>(std::max(1, src_width) - 1)),
+                       std::clamp(mapped_y, 0.0f, static_cast<float>(std::max(1, src_height) - 1)));
+}
+

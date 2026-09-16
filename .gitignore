@@ -52,3 +52,7 @@ web_runs_archive_*.tar.gz
 # rk_pipe_daemon 运行时产物（任务 yaml/log/snapshot）
 daemon_runs/
 daemon_smoke.log
+
+# 内网板卡清单与内部设计文档不入开源仓
+tools/eval/boards.yaml
+tools/eval/远程评测与数据集框架设计.md

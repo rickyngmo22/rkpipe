@@ -2,7 +2,7 @@
 #define RKNN_CONTEXT_H
 
 #include "rknn_api.h"
-#include "common.h"
+#include "utils/common.h"
 
 typedef struct {
     rknn_context rknn_ctx;
@@ -15,6 +15,9 @@ typedef struct {
     int model_width;
     int model_height;
     bool is_quant;
+    // FP16 模型直接取原始 fp16 输出（want_float=0），省去 runtime 的 fp16→fp32 转换拷贝；
+    // 仅当后处理支持 fp16 直读（如 detect3d readRow）时由 init 函数置 true
+    bool out_native_fp16;
     int class_num;
     // yolo26 detect 的 cls 输出语义：-1=logits（需 sigmoid），1=已 sigmoid（值域[0,1]），0=未判定。
     // 方案2（cls 入图 sigmoid）让 INT8 量化 cls 值域收窄到 [0,1] 保住真实分数；板端后处理按此跳过二次 sigmoid。

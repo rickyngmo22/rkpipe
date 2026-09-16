@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/rknn_context.h"
-#include "utils.h"
+#include "utils/utils.h"
 
 typedef int (*RknnPostprocessFunc)(rknn_app_context_t*, void*, letterbox_t*, float, float, void*);
 

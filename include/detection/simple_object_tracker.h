@@ -3,8 +3,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../utils/common.h"
-#include "../postprocess/postprocess.h"
+#include "utils/common.h"
+#include "postprocess/postprocess.h"
 
 // 轻量级恒速 Kalman 滤波状态（SORT 风格，8 维）：
 //   x = [cx, cy, w, h, vx, vy, vw, vh]
@@ -114,7 +114,7 @@ private:
     bool useOru() const { return algorithm_ == TrackAlgorithm::OcSort; }
 
     float iou_threshold_ = 0.3f;
-    int max_missed_ = 20;
+    int max_missed_ = 40;
     int min_confirm_hits_ = 3;
     float reid_iou_threshold_ = 0.15f;
     float center_distance_threshold_ = 1.8f;
@@ -127,7 +127,7 @@ private:
     float size_ratio_threshold_ = 0.3f;
     // OC-SORT 风格遮挡恢复：近期漏检的轨迹允许仅凭中心距离重连
     float relink_center_scale_ = 0.9f;
-    int relink_max_missed_ = 10;
+    int relink_max_missed_ = 20;
     int max_tracks_ = 256;
     TrackAlgorithm algorithm_ = TrackAlgorithm::OcSort;
     int next_track_id_ = 1;

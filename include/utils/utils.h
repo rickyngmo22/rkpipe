@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-#include "common.h"
+#include "utils/common.h"
 
 /**
  * @brief LetterBox

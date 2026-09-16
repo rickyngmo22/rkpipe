@@ -2,13 +2,19 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/),版本遵循语义化版本。
 
-## [未发布]
+## [0.3.0] - 2026-09-16
+
+### 恢复（二级流水线全量回归）
+- **二阶段任务与级联全量恢复**（撤销 0.2.0 后的收敛，预编译核心库重新发布为全任务集）：rtmpose 两阶段姿态（一级检测 → crop → RTMPose 姿态回归 + 姿态时序缓冲，17 关键点含 track_id）；OCR 全链路（ocr_det 文本框检测 + ocr_rec 识别，ppocrv4 模型与 `ppocr_keys_v1.txt` 字典、`convert_ppocr_rec.py` 转换脚本）；二级分类 composite_cls（一级检测框 crop → MobileNetV2 top-1，`cls_top1`/`ctc_decode`/透视矫正）
+- **多任务同路组合（Y5 aux）与 depth-dist 测距标注/近距告警恢复**：`aux_model_path`/`aux_task`/`depth_dist_*` 配置与命令行、`PipelineFrame` 的 `auxDepth*` 字段、`utils/depth_distance.h` 纯函数与单测
+- **语义分割(sem)、单目 3D 检测(detect3d)、RetinaFace 人脸检测、动作识别(pose→时序级联 action_rec)一并恢复**：契约类型、解码/后处理、绘制与单测随核心库回归
+- **预编译核心库 `prebuilt/aarch64/librkpipe_core.a` 重发布**：由私有仓 `RK_PIPE_CORE_DIST=ON` 全量构建（含全部二级实现），任务范围从"单阶段五任务"回归"全任务集"
+- **JSONL/RESULT 载荷补齐**：`task_result_json` 新增 `composite_cls`（检测框 + `sub` 二级标签）、`face`（框 + 5 点 landmark）、`action`（pose 主结果 + `actions` 附加项）三类载荷；LLM 链路 `detection_json` 同步补齐 composite_cls/face/action 分支（此前这些任务 JSONL 全部落 `type:"none"` 兜底）
+- **示例配置** `configs/smoke/`：run_rtmpose / run_ocr / run_composite_cls / run_detect_depth 四任务板端冒烟配置，全部实测通过（rtmpose 1800+ 帧 17 点姿态、OCR 2000+ 行、composite_cls 2500+ 帧二级标签、detect+depth 1400 帧）
+- CI 纯逻辑单测扩展至 **497 checks**（新增 ctc_decode、PoseSequenceBuffer、detect3d/retinaface 解码、cls_top1、depth_distance 回归等）；边界自检脚本回归入库并通过
 
 ### 移除
 - 旧版 yolo26 sigmoid 量化方案：`tools/convert/add_cls_sigmoid_yolo26_onnx.py` 与 `convert_yolo26_cls_sigmoid_int8.py` 删除，sigmoid 融合版模型被拆分布局版替换（detect AP 33.0→35.8、obb mAP50 63.3→66.8、seg mask AP 27.0→28.5，均为纯 INT8 实测）
-- 语义分割(sem)与单目 3D 检测(detect3d)任务：契约类型/检测器/后处理/绘制/评测载荷与单测；后续版本再随需求恢复
-- 多任务同路组合（Y5 aux）与依赖它的 depth-dist 测距标注/近距告警：`AppConfig` 的 `aux_model_path`/`aux_task`/`depth_dist_*` 字段、`--aux-model`/`--aux-task`/`--depth-dist-*` 命令行、`PipelineFrame` 的 `auxDepth*` 四字段、JSONL/RESULT 的 `aux` 附加载荷、`utils/depth_distance.h` 纯函数与对应单测；配套核心库已同步重编
-- 二阶段任务与级联:rtmpose 两阶段姿态、ocr_det / ocr_rec、二级分类(composite_cls / cls_top1 / ctc_decode / 透视矫正)全部源码、单测与文档,OCR 字典资产与转换脚本
 - `events_demo` 示例与 `tools/probes/` 模型输出探针及 `RK_PIPE_BUILD_PROBES` 构建选项
 - 边界自检脚本 `scripts/check_open_boundary.py`、发布同步脚本 `scripts/publish_public.sh` 与对应 CI job
 

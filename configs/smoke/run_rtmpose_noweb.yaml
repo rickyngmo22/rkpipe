@@ -1,0 +1,52 @@
+%YAML:1.0
+---
+# RTMPose 两阶段姿态估计：task=rtmpose
+#   model_path = feat 模型（拆分部署第一阶段，PC 端拆分转换产物）
+#   rtmpose_head_path = head 权重目录（CPU 复刻，export_head_weights.py 产物；以 .rknn 结尾则走 RKNN head）
+#   person_model_path = 第一阶段人体检测模型（复用现有 detect 模型，person=coco 0 类）
+#
+# 注意：head 的 RKNN 转换（MatMul/高斯注意力）在 rknn-toolkit2 2.3.2 下会退化，
+#       故默认走 CPU 复刻 head（权重目录）。feat 仍用 RKNN。
+model_path: "/userdata/rkpipe/model/rtmpose-t_256x192_feat.rknn"
+rtmpose_head_path: "/userdata/rkpipe/model/rtmpose-t_256x192_head_fixed.rknn"
+person_model_path: "/userdata/rkpipe/model/yolo26n.rknn"
+input_path: "/userdata/rk_pipe/test_videos/baseline7.mp4"
+# 仿射裁剪前框外扩：YOLO 框比 RTMDet 紧，1.15 给模型多点上下文提精度
+rtmpose_box_pad: 1.15
+# stage1 人体检测置信度：需匹配 person_model 的分数量级。
+#   yolov5s 系 person 分数高(0.5~0.8)，0.4 不丢人；yolo26n(cls_sigmoid_i8) 在此类场景
+#   把真人压在 0.3~0.55，0.4 会滤掉约 40% 真人 → 频繁漏检。
+#   与单独 detect 的显示阈值(0.3)对齐用 0.3；再低到 0.25 可全召回但增加 stage2 开销。
+conf_threshold: 0.3
+# 跟踪：给 pose 分配稳定 track_id；已确认目标缺检时用 tracker 预测框续画（消闪烁，无伪框）
+enable_tracking: 1
+track_tasks: "pose"
+track_render_max_missed: 3
+output_video_path: ""
+output_backend: "ffmpeg"
+# WebRTC 观感：低延迟编码 → h264 GOP 60→30（1s 一个关键帧）+ 收紧 CBR 缓冲。
+# WebRTC 丢包冻结后 1s 内即可靠下个关键帧恢复（默认 2s 间隔更明显卡）。
+output_low_latency: 1
+# 网页窗格用 WebRTC iframe 播 mediamtx 的 H264 流（板端 h264_rkmpp 硬编，不占 CPU）；
+# 不配则退回 MJPEG。地址需浏览器可达 → 用板子 IP。
+# ⚠ mediamtx.yml 中 WebRTC 监听 8889（8888 是 HLS），真 WebRTC 用 8889。
+web_preview: 0
+web_preview_bind: "0.0.0.0"
+web_preview_port: 8090
+web_preview_quality: 75
+web_preview_mode: "replay"
+web_preview_eof_linger_ms: 1500
+web_preview_replay_pace: 1
+task: "rtmpose"
+mode: "pipeline"
+thread_count: 6
+# 二阶段全局工作池：实测负优化（NPU 瓶颈，池线程的 feat 推理加剧核争抢，stage2 25→55ms）。
+# 保持 0=关闭。若之后 CPU head 重新成为瓶颈（如换大模型）再考虑开。
+rtmpose_stage2_threads: 0
+# 单帧预算（>0 生效）：预算 = 1000*线程数/fps*0.9 ≈ 180ms。stage2 已降到 ~16.5ms/人，
+# K=(180-23)/16.5≈9≥kMaxPersons=8，预算不截断 → 不跳框；密集帧(8人≈155ms)被钳在预算内 → 不卡顿。
+rtmpose_target_fps: 30
+gui: 0
+local: 0
+label_path: "/userdata/rkpipe/model/coco_80_labels_list.txt"
+obj_class_num: 1

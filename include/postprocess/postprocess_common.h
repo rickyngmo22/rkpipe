@@ -59,3 +59,8 @@ int y26_scan_cls_sigmoided(rknn_app_context_t* app_ctx, const rknn_output* outpu
                            int class_count, int cls_start);
 
 #endif
+
+cv::Point2f mapPointToOriginal(const cv::Point2f& point,
+                               const letterbox_t* letter_box,
+                               int src_width,
+                               int src_height);

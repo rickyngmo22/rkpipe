@@ -42,11 +42,11 @@ typedef enum {
 /* 事件类型；payload_json 为对应 JSON 文本 */
 typedef enum {
     RK_PIPE_EVENT_STARTED = 0,   /* 流水线已启动：{"task":"detect","mode":"pipeline"} */
-    RK_PIPE_EVENT_RESULT = 1,    /* 逐帧结构化结果：payload 为 schema v1 JSON（字段定义见
-                                    docs/event_payload.md）。当前版本预留不触发：获取逐帧结果
-                                    请先用环境变量 RK_PIPE_RESULT_JSONL=<file> 落盘同格式
-                                    JSONL；事件下发需配套核心库 Release（闭源门面逐帧调用
-                                    开源序列化器 buildFrameResultJson 后回调） */
+    RK_PIPE_EVENT_RESULT = 1,    /* 逐帧结构化结果（每输出帧触发一次）：payload 为一帧结果 JSON，
+                                  * 与 dump_detections_path 的 JSONL 行同格式
+                                  * （{"file","index","width","height","dets"|"poses"|"obbs"|"segs"}；
+                                  *   检测/姿态/OBB/分割含结果字段，其余任务仅帧元信息）。回调在
+                                  *   输出线程执行，应尽快返回 */
     RK_PIPE_EVENT_COMPLETED = 2, /* 自然结束：{"exit_code":0} */
     RK_PIPE_EVENT_ERROR = 3      /* 运行错误：{"error":"..."} */
 } rkpipe_event_t;
@@ -76,8 +76,8 @@ RK_PIPE_API int rkpipe_start(rkpipe_handle h);
 
 /*
  * 请求停止并等待流水线线程退出。
- * 注意 v0.2：流水线为"输入驱动"，本地文件/有限流会自然结束；
- * 实时流（RTSP 等）会持续运行，timeout_ms<0 时阻塞至外部终止输入或进程退出。
+ * v0.3：stop 会请求流水线尽快停止（producer 逐帧检查），实时流通常在下一帧
+ * 到达时退出（阻塞读帧受输入超时约束）；timeout_ms<0 时阻塞至流水线退出。
  * 返回 RK_PIPE_OK（已结束）或 RK_PIPE_ERR_TIMEOUT。
  */
 RK_PIPE_API int rkpipe_stop(rkpipe_handle h, int timeout_ms);

@@ -1,4 +1,4 @@
-#include "../../include/io/output_router.h"
+#include "io/output_router.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -16,9 +16,10 @@
 #include <unistd.h>
 #include <utility>
 
-#include "../../include/config/app_config.h"
+#include "config/app_config.h"
 #include "preprocess.h"
 #include "utils/draw_utils.h"
+#include "utils/json_escape.h"
 
 namespace {
 
@@ -53,6 +54,130 @@ std::vector<std::string> parseWebrtcUrls(const std::string& urls_csv) {
     }
     return urls;
 }
+
+// #region debug-point A:debug-report
+struct DebugEndpoint {
+    std::string host = "127.0.0.1";
+    int port = 7777;
+    std::string path = "/event";
+    std::string session = "web-preview-stall";
+    bool configured = false;
+};
+
+DebugEndpoint loadDebugEndpoint() {
+    DebugEndpoint endpoint;
+
+    // 调试上报为可选能力，默认关闭（避免硬编码路径与无谓的 socket 连接）：
+    //   RK_PIPE_DEBUG_SERVER_URL=http://host:port/path  开启并指定上报端点
+    //   RK_PIPE_DEBUG_SESSION_ID=xxx                   覆盖会话标识
+    //   旧调试文件仍可通过 RK_PIPE_DEBUG_ENV_FILE=<path> 指定（不再硬编码）。
+    const char* url_env = std::getenv("RK_PIPE_DEBUG_SERVER_URL");
+    const char* env_file = std::getenv("RK_PIPE_DEBUG_ENV_FILE");
+    if (!url_env || url_env[0] == '\0') {
+        if (!env_file || env_file[0] == '\0') {
+            return endpoint;
+        }
+        std::ifstream env(env_file);
+        std::string line;
+        while (std::getline(env, line)) {
+            if (line.rfind("DEBUG_SERVER_URL=", 0) == 0) {
+                const std::string url = line.substr(std::strlen("DEBUG_SERVER_URL="));
+                const std::string prefix = "http://";
+                if (url.rfind(prefix, 0) == 0) {
+                    std::string host_port = url.substr(prefix.size());
+                    std::size_t slash = host_port.find('/');
+                    endpoint.path = slash == std::string::npos ? "/event" : host_port.substr(slash);
+                    host_port = slash == std::string::npos ? host_port : host_port.substr(0, slash);
+                    std::size_t colon = host_port.rfind(':');
+                    if (colon != std::string::npos) {
+                        endpoint.host = host_port.substr(0, colon);
+                        endpoint.port = std::atoi(host_port.substr(colon + 1).c_str());
+                    }
+                }
+                endpoint.configured = true;
+            } else if (line.rfind("DEBUG_SESSION_ID=", 0) == 0) {
+                endpoint.session = line.substr(std::strlen("DEBUG_SESSION_ID="));
+            }
+        }
+        return endpoint;
+    }
+
+    const std::string url(url_env);
+    const std::string prefix = "http://";
+    if (url.rfind(prefix, 0) == 0) {
+        std::string host_port = url.substr(prefix.size());
+        std::size_t slash = host_port.find('/');
+        endpoint.path = slash == std::string::npos ? "/event" : host_port.substr(slash);
+        host_port = slash == std::string::npos ? host_port : host_port.substr(0, slash);
+        std::size_t colon = host_port.rfind(':');
+        if (colon != std::string::npos) {
+            endpoint.host = host_port.substr(0, colon);
+            endpoint.port = std::atoi(host_port.substr(colon + 1).c_str());
+        }
+        endpoint.configured = true;
+    }
+    const char* session = std::getenv("RK_PIPE_DEBUG_SESSION_ID");
+    if (session && session[0] != '\0') {
+        endpoint.session = session;
+    }
+    return endpoint;
+}
+
+const DebugEndpoint& debugEndpoint() {
+    static const DebugEndpoint endpoint = loadDebugEndpoint();
+    return endpoint;
+}
+
+void reportDebugEvent(const char* hypothesis_id,
+                      const char* location,
+                      const std::string& msg,
+                      const std::string& data_json) {
+    const DebugEndpoint& endpoint = debugEndpoint();
+    if (!endpoint.configured) {
+        return;
+    }
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(endpoint.port));
+    if (::inet_pton(AF_INET, endpoint.host.c_str(), &addr.sin_addr) != 1) {
+        ::close(fd);
+        return;
+    }
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return;
+    }
+
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+    std::ostringstream body;
+    body << "{\"sessionId\":\"" << jsonEscape(endpoint.session)
+         << "\",\"runId\":\"pre-fix\""
+         << ",\"hypothesisId\":\"" << jsonEscape(hypothesis_id)
+         << "\",\"location\":\"" << jsonEscape(location)
+         << "\",\"msg\":\"" << jsonEscape(msg)
+         << "\",\"data\":" << data_json
+         << ",\"ts\":" << now_ms << "}";
+    const std::string body_str = body.str();
+
+    std::ostringstream request;
+    request << "POST " << endpoint.path << " HTTP/1.1\r\n"
+            << "Host: " << endpoint.host << ":" << endpoint.port << "\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body_str.size() << "\r\n"
+            << "Connection: close\r\n\r\n"
+            << body_str;
+    const std::string request_str = request.str();
+    ::send(fd, request_str.data(), request_str.size(), MSG_NOSIGNAL);
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+}
+// #endregion
 
 bool envFlagEnabled(const char* name) {
     const char* value = std::getenv(name);
@@ -113,7 +238,7 @@ bool publishWebPreviewFrame(WebPreviewServer* web_preview,
             // 优先 RGA 硬件转换（省 CPU cvtColor），失败回退 CPU
             // preview_scale<1.0 时 RGA 一次完成 NV12→BGR+降采样，编码线程不再二次缩放
             const double scale = web_preview->previewScale();
-            static std::atomic<bool> rga_nv12_disabled{false};  // 失败一次后锁定 CPU，避免 librga 每帧刷屏
+            static bool rga_nv12_disabled = false;  // 失败一次后锁定 CPU，避免 librga 每帧刷屏
             if (!rga_nv12_disabled && rga_nv12_to_bgr(frame, bgr, scale) == 0) {
                 pre_scaled = (bgr.cols != frame.width || bgr.rows != frame.height);
                 break;
@@ -201,6 +326,8 @@ bool OutputRouter::init(const FrameInfo& info, const AppConfig& options) {
         video_config.preset = options.output_preset;
         video_config.lowLatency = options.output_low_latency;
         video_config.dropFramesOnOverflow = options.drop_frames_on_overflow;
+        video_config.recordSegmentS = options.record_segment_s;
+        video_config.recordKeep = options.record_keep;
 
         auto output_type = backend_is_opencv ? VideoOutputFactory::OutputType::OPENCV
                                              : VideoOutputFactory::OutputType::FFMPEG;
@@ -255,11 +382,39 @@ bool OutputRouter::init(const FrameInfo& info, const AppConfig& options) {
             }
         }
     }
-        return true;
+    // #region debug-point A:init-router
+    reportDebugEvent("A",
+                     "output_router.cc:init",
+                     "[DEBUG] OutputRouter initialized",
+                     std::string("{\"enable_display\":") + (enable_display ? "true" : "false") +
+                         ",\"enable_write\":" + (enable_write ? "true" : "false") +
+                         ",\"enable_web_preview\":" + (enable_web_preview ? "true" : "false") +
+                         ",\"video_present\":" + (video_ ? "true" : "false") +
+                         ",\"web_present\":" + (web_preview_ ? "true" : "false") +
+                         ",\"web_preview_mode\":\"" + web_preview_mode + "\"" +
+                         ",\"zero_copy_video_enabled\":" + (zero_copy_video_enabled_ ? "true" : "false") +
+                         ",\"legacy_output_fps\":" + std::to_string(legacy_output_fps) + "}");
+    // #endregion
+    return true;
 }
 
 void OutputRouter::write(int frame_index, cv::Mat frame) {
-        if (web_preview_ && !benchModeEnabled() && !frame.empty()) {
+    // #region debug-point B:mat-write
+    static std::atomic<int> mat_write_count{0};
+    const int mat_count = ++mat_write_count;
+    if ((mat_count % 60) == 1) {
+        reportDebugEvent("B",
+                         "output_router.cc:write-mat",
+                         "[DEBUG] OutputRouter mat path observed",
+                         std::string("{\"frame_index\":") + std::to_string(frame_index) +
+                             ",\"mat_write_count\":" + std::to_string(mat_count) +
+                             ",\"video_present\":" + (video_ ? "true" : "false") +
+                             ",\"web_present\":" + (web_preview_ ? "true" : "false") +
+                             ",\"reported_write_fps\":" + std::to_string(video_ ? video_->getWriteFPS() : 0.0) +
+                             "}");
+    }
+    // #endregion
+    if (web_preview_ && !benchModeEnabled() && !frame.empty()) {
         web_preview_->publishFrame(frame);
     }
     if (video_) {
@@ -272,7 +427,24 @@ bool OutputRouter::write(int frame_index, const image_buffer_t& frame) {
     if (web_preview_ && !benchModeEnabled()) {
         web_written = publishWebPreviewFrame(web_preview_.get(), frame, nullptr);
     }
-        if (video_ && video_->pushFrame(frame_index, frame)) {
+    // #region debug-point A:buffer-write
+    static std::atomic<int> buffer_write_count{0};
+    const int buffer_count = ++buffer_write_count;
+    if ((buffer_count % 30) == 1) {
+        reportDebugEvent("A",
+                         "output_router.cc:write-buffer",
+                         "[DEBUG] OutputRouter buffer path observed",
+                         std::string("{\"frame_index\":") + std::to_string(frame_index) +
+                             ",\"buffer_write_count\":" + std::to_string(buffer_count) +
+                             ",\"frame_format\":" + std::to_string(frame.format) +
+                             ",\"web_written\":" + (web_written ? "true" : "false") +
+                             ",\"video_present\":" + (video_ ? "true" : "false") +
+                             ",\"web_present\":" + (web_preview_ ? "true" : "false") +
+                             ",\"reported_write_fps\":" + std::to_string(video_ ? video_->getWriteFPS() : 0.0) +
+                             "}");
+    }
+    // #endregion
+    if (video_ && video_->pushFrame(frame_index, frame)) {
         return true;
     }
     if (!video_) {
@@ -327,6 +499,18 @@ void OutputRouter::stop() {
 
 bool OutputRouter::enabled() const {
     return video_ != nullptr || web_preview_ != nullptr;
+}
+
+void OutputRouter::setThermalStatsSource(std::function<std::string()> source) {
+    if (web_preview_) {
+        web_preview_->setThermalStatsSource(std::move(source));
+    }
+}
+
+void OutputRouter::setEventStatsSource(EventStatsSource source) {
+    if (web_preview_) {
+        web_preview_->setEventStatsSource(std::move(source));
+    }
 }
 
 void OutputRouter::setInputStatSource(InputStatSource source) {

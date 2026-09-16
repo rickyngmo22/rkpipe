@@ -194,6 +194,76 @@ std::string buildFrameResultJson(const PipelineFrame& frame,
         oss << ",\"type\":\"depth\",\"depth\":{\"roi\":[" << depth->roi.x << "," << depth->roi.y
             << "," << depth->roi.width << "," << depth->roi.height << "],\"range\":["
             << jsonNum(depth->depth_lo) << "," << jsonNum(depth->depth_hi) << "]}";
+    } else if (const auto* cc = std::get_if<CompositeClsTaskResult>(&frame.result)) {
+        // M0 两阶级联:一级检测框 + 二级 top-1(sub 字段,与 cls_ids/cls_labels 一一对应)
+        oss << ",\"type\":\"composite_cls\",\"dets\":[";
+        const int count = cc->data.count < OBJ_NUMB_MAX_SIZE ? cc->data.count : OBJ_NUMB_MAX_SIZE;
+        for (int i = 0; i < count; ++i) {
+            const object_detect_result& o = cc->data.results[i];
+            if (i) {
+                oss << ",";
+            }
+            oss << "{\"bbox\":";
+            writeBoxXYWH(oss, o.box);
+            oss << ",\"score\":" << jsonNum(o.prop)
+                << ",\"cls\":" << o.cls_id
+                << ",\"label\":\"" << jsonEscape(classLabel(o.cls_id)) << "\"";
+            if (i < static_cast<int>(cc->cls_ids.size()) && cc->cls_ids[i] >= 0) {
+                const std::string lbl =
+                    i < static_cast<int>(cc->cls_labels.size()) ? cc->cls_labels[i] : std::string();
+                oss << ",\"sub\":{\"cls\":" << cc->cls_ids[i]
+                    << ",\"score\":" << jsonNum(cc->cls_scores[i])
+                    << ",\"label\":\"" << jsonEscape(lbl) << "\"}";
+            }
+            oss << "}";
+        }
+        oss << "]";
+    } else if (const auto* face = std::get_if<FaceTaskResult>(&frame.result)) {
+        // M8 人脸检测:框 + 5 点 landmark
+        oss << ",\"type\":\"face\",\"faces\":[";
+        for (size_t i = 0; i < face->faces.size(); ++i) {
+            const FaceItem& f = face->faces[i];
+            if (i) {
+                oss << ",";
+            }
+            oss << "{\"bbox\":";
+            writeBoxXYWH(oss, f.box);
+            oss << ",\"score\":" << jsonNum(f.score) << ",\"kpts\":[";
+            for (int k = 0; k < 5; ++k) {
+                if (k) {
+                    oss << ",";
+                }
+                oss << "[" << jsonNum(f.landmarks[k].x) << "," << jsonNum(f.landmarks[k].y) << "]";
+            }
+            oss << "]}";
+        }
+        oss << "]";
+    } else if (const auto* act = std::get_if<ActionTaskResult>(&frame.result)) {
+        // M13 动作识别:pose 主结果原样保留 + 本帧新鲜动作项
+        oss << ",\"type\":\"action\",\"poses\":[";
+        const int count = act->data.count < OBJ_NUMB_MAX_SIZE ? act->data.count : OBJ_NUMB_MAX_SIZE;
+        for (int i = 0; i < count; ++i) {
+            const pose_detect_result& p = act->data.results[i];
+            if (i) {
+                oss << ",";
+            }
+            oss << "{\"bbox\":";
+            writeBoxXYWH(oss, p.box);
+            oss << ",\"score\":" << jsonNum(p.box_conf)
+                << ",\"cls\":" << p.cls_id
+                << ",\"track_id\":" << p.track_id << "}";
+        }
+        oss << "],\"actions\":[";
+        for (size_t i = 0; i < act->actions.size(); ++i) {
+            const ActionItem& a = act->actions[i];
+            if (i) {
+                oss << ",";
+            }
+            oss << "{\"track_id\":" << a.track_id
+                << ",\"action\":" << a.action_id
+                << ",\"score\":" << jsonNum(a.score) << "}";
+        }
+        oss << "]";
     } else {
         oss << ",\"type\":\"none\"";
         oss << "}";

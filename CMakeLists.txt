@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(rkpipe-open VERSION 0.2.0 LANGUAGES C CXX)
+project(rkpipe-open VERSION 0.3.0 LANGUAGES C CXX)
 
 # ===========================================================================
 # rkpipe 构建
@@ -105,6 +105,28 @@ if(RK_PIPE_CI_BUILD)
         src/io/result_sink.cc
         src/postprocess/postprocess.cc
         src/postprocess/postprocess_common.cc
+        src/postprocess/cls_top1.cc
+        src/postprocess/ctc_decode.cc
+        src/postprocess/pose_sequence.cc
+        src/postprocess/retinaface_decode.cc
+        src/io/output_tuning.cpp
+        src/llm/llm_config.cc
+        src/llm/llm_analyzer.cc
+        src/llm/detection_json.cc
+        src/llm/provider_mock.cc
+        src/io/http_request.cc
+        src/daemon/daemon_api.cc
+        src/utils/http_post.cc
+        src/daemon/daemon_prometheus.cc
+        src/daemon/flywheel.cc
+        src/core/thermal_governor.cc
+        src/llm/provider_cloud.cc
+        src/daemon/daemon_http.cc
+        src/daemon/daemon_pages.cc
+        src/daemon/daemon_sysinfo.cc
+        src/daemon/llm_review.cc
+        src/daemon/events_store.cc
+        src/daemon/daemon_supervision.cc
     )
     add_executable(rk_pipe_unit_tests ${CI_PURE_SOURCES})
     target_compile_definitions(rk_pipe_unit_tests PRIVATE RK_PIPE_CI=1)
@@ -118,16 +140,21 @@ if(RK_PIPE_CI_BUILD)
         ${CMAKE_CURRENT_SOURCE_DIR}/include/postprocess
         ${CMAKE_CURRENT_SOURCE_DIR}/include/detection
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/rknn
+        ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
         ${TURBOJPEG_INCLUDE_DIR}
     )
     if(OPENCV_ROOT)
         target_include_directories(rk_pipe_unit_tests PRIVATE ${OPENCV_ROOT}/include/opencv4)
         target_link_libraries(rk_pipe_unit_tests PRIVATE Threads::Threads
             ${OPENCV_ROOT}/lib/libopencv_core.so ${OPENCV_ROOT}/lib/libopencv_imgproc.so
-            ${TURBOJPEG_LIB})
+            ${TURBOJPEG_LIB} ${LLM_CURL_LIB})
     else()
         find_package(OpenCV REQUIRED COMPONENTS core imgproc)
         target_link_libraries(rk_pipe_unit_tests PRIVATE Threads::Threads ${OpenCV_LIBS} ${TURBOJPEG_LIB})
+    endif()
+    find_library(LLM_CURL_LIB_CI NAMES curl)
+    if(LLM_CURL_LIB_CI)
+        target_link_libraries(rk_pipe_unit_tests PRIVATE ${LLM_CURL_LIB_CI})
     endif()
     enable_testing()
     foreach(_name IN LISTS RK_PIPE_CI_TEST_NAMES)
@@ -198,6 +225,12 @@ list(APPEND RKPIPE_MODULE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core/detection_filter.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core/event_engine.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core/task_result_json.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core/thermal_governor.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm/llm_analyzer.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm/detection_json.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm/llm_config.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm/provider_mock.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm/provider_cloud.cc
 )
 
 # FFmpeg 的 chromaprint 封装桩: 必须是独立命名 .so(libavformat 运行期按名打开)
@@ -220,6 +253,7 @@ target_include_directories(rkpipe_modules PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include/postprocess
     ${CMAKE_CURRENT_SOURCE_DIR}/include/detection
     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/rknn
+        ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
     ${RGA_INCLUDE_DIR}
     ${TURBOJPEG_INCLUDE_DIR}
     ${OPENCV_INC}
@@ -244,6 +278,7 @@ set(RKPIPE_LINK_DEPS
     ${ROCKCHIP_MPP_LIB}
     chromaprint_compat
     ${AVFORMAT_LIB} ${AVCODEC_LIB} ${AVUTIL_LIB} ${SWSCALE_LIB}
+    ${LLM_CURL_LIB}
 )
 # console_detector: 通过 C ABI(rkpipe.h)驱动完整流水线的板端控制台应用,
 # 同时是 ABI 的验收测试
@@ -297,7 +332,9 @@ set(RK_PIPE_DAEMON_SOURCES
     src/core/thermal_governor.cc
 )
 add_executable(rk_pipe_daemon ${RK_PIPE_DAEMON_SOURCES}
+    src/llm/llm_config.cc
     src/llm/provider_mock.cc
+    src/llm/provider_cloud.cc
 )
 if(RK_PIPE_HAVE_CURL)
     list(APPEND RK_PIPE_DAEMON_SOURCES src/llm/provider_cloud.cc)
@@ -315,7 +352,9 @@ target_include_directories(rk_pipe_daemon PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/3rdparty
     ${LLM_CURL_INCLUDE_DIR}
+    ${OPENCV_INC}
 )
+target_link_libraries(rk_pipe_daemon ${OPENCV_LIBS})
 set_target_properties(rk_pipe_daemon PROPERTIES
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN"

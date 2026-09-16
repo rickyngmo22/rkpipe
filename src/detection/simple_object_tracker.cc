@@ -1,5 +1,5 @@
-#include "../../include/detection/simple_object_tracker.h"
-#include "../../include/utils/draw_utils.h"
+#include "detection/simple_object_tracker.h"
+#include "utils/draw_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -210,11 +210,20 @@ std::vector<TrackedDetection> SimpleObjectTracker::update(const object_detect_re
         }
     }
 
-    tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(), [this](const TrackState& t) {
-        if (!t.confirmed && t.missed > 1) {
-            return true;
+    // 丢弃统计（RK_PIPE_DEBUG_DROP=1）：诊断"跟丢重建"时区分未确认/超龄删除
+    static const bool dbg_drop = []() {
+        const char* v = getenv("RK_PIPE_DEBUG_DROP");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(), [this, &dbg_drop](const TrackState& t) {
+        const bool drop_unconfirmed = !t.confirmed && t.missed > 1;
+        const bool drop_aged = t.missed > max_missed_;
+        if (dbg_drop && (drop_unconfirmed || drop_aged)) {
+            std::fprintf(stderr, "[track-drop] id=%d conf=%d hits=%d missed=%d prop=%.2f reason=%s\n",
+                         t.track_id, t.confirmed ? 1 : 0, t.hits, t.missed, t.last_prop,
+                         drop_unconfirmed ? "unconfirmed" : "aged");
         }
-        return t.missed > max_missed_;
+        return drop_unconfirmed || drop_aged;
     }), tracks_.end());
 
     // 仅未匹配的高分检测创建新轨迹；低分检测不建新轨迹（ByteTrack 策略，抑制噪声轨迹）

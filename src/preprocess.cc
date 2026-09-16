@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cmath>
 #include <fcntl.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <linux/dma-heap.h>
@@ -494,12 +495,21 @@ static int rga_resize_then_cpu_letterbox(image_buffer_t* src_image, image_buffer
     return 0;
 }
 
+static std::atomic<bool> g_rga_disabled{false};
+
+void setPreprocessRgaDisabled(bool disable) {
+    g_rga_disabled.store(disable);
+}
+
 int preprocess_image(image_buffer_t* src_image, image_buffer_t* dst_image, letterbox_t* letterbox, char color)
 {
     if (!src_image || !dst_image || !letterbox) {
         return -1;
     }
-    int ret = rga_resize_then_cpu_letterbox(src_image, dst_image, letterbox, color);
+    int ret = -1;
+    if (!g_rga_disabled.load()) {
+        ret = rga_resize_then_cpu_letterbox(src_image, dst_image, letterbox, color);
+    }
     if (ret == 0) {
         return 0;
     }

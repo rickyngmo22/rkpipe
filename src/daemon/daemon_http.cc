@@ -1,4 +1,4 @@
-// HTTP 收发原语（自 daemon_main.cc 拆出）：服务端响应与轻量客户端（代理子进程状态/转发事件）。
+// HTTP 收发原语（自 daemon 主模块拆出）：服务端响应与轻量客户端（代理子进程状态/转发事件）。
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <cstring>

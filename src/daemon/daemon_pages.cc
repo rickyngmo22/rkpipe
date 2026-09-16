@@ -1,4 +1,4 @@
-// 监控页与事件时间线页（自 daemon_main.cc 拆出）：纯 HTML 字符串，无全局状态依赖。
+// 监控页与事件时间线页（自 daemon 主模块拆出）：纯 HTML 字符串，无全局状态依赖。
 #include <string>
 
 #include "daemon/daemon_internal.h"

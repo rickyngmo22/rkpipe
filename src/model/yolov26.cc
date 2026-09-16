@@ -4,9 +4,9 @@
 #include <math.h>
 #include <vector>
 
-#include "yolov26.h"
-#include "common.h"
-#include "utils.h"
+#include "model/yolov26.h"
+#include "utils/common.h"
+#include "utils/utils.h"
 #include "core/rknn_model.h"
 
 int init_yolov26_model(const char *model_path, rknn_app_context_t *app_ctx)
@@ -246,3 +246,77 @@ int inference_yolov26_depth_model(rknn_app_context_t *app_ctx, image_buffer_t *p
                               });
 }
 
+int init_yolov26_sem_model(const char *model_path, rknn_app_context_t *app_ctx)
+{
+    int ret = init_rknn_model(model_path, app_ctx);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    if (app_ctx->io_num.n_output >= 1 && app_ctx->output_attrs)
+    {
+        // 语义分割头：单输出 [1, C, H, W]，C = 类别数（Cityscapes 19）
+        const rknn_tensor_attr &attr = app_ctx->output_attrs[0];
+        int channels = (attr.fmt == RKNN_TENSOR_NCHW) ? attr.dims[1] : attr.dims[3];
+        int h = (attr.fmt == RKNN_TENSOR_NCHW) ? attr.dims[2] : attr.dims[1];
+        int w = (attr.fmt == RKNN_TENSOR_NCHW) ? attr.dims[3] : attr.dims[2];
+        if (channels <= 0) {
+            channels = 19;
+        }
+        app_ctx->class_num = channels;
+        printf("Model type: Sem (YOLO26)\n");
+        printf("Model actual class number: %d, output: %dx%d\n", channels, w, h);
+        printf("Defined class number in code: %d\n", get_obj_class_num());
+    }
+    else
+    {
+        printf("WARNING: Model has no output, cannot determine class number!\n");
+        app_ctx->class_num = 19;
+    }
+
+    return ret;
+}
+
+int inference_yolov26_sem_model(rknn_app_context_t *app_ctx, image_buffer_t *preprocessed_img, letterbox_t *letter_box, cv::Mat *class_map_out, float conf_threshold, float nms_threshold)
+{
+    return run_rknn_inference(app_ctx, preprocessed_img, letter_box, conf_threshold, nms_threshold, class_map_out,
+                              [](rknn_app_context_t *ctx, void *outputs, letterbox_t *lb, float conf, float nms, void *results) {
+                                  return post_process_yolov26_sem(ctx, outputs, lb, conf, nms, static_cast<cv::Mat *>(results));
+                              });
+}
+
+int init_yolov26_detect3d_model(const char *model_path, rknn_app_context_t *app_ctx)
+{
+    int ret = init_rknn_model(model_path, app_ctx);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    // 后处理 readRow 支持 fp16 直读：跳过 runtime 的 fp16→fp32 转换拷贝
+    app_ctx->out_native_fp16 = true;
+
+    // Detect3D 头：单输出 [1, 300, 14]（end2end 已解码）。KITTI 3 类：Car/Pedestrian/Cyclist，
+    // 输出张量本身不含类别维度，直接固定，避免配置自检误告警
+    app_ctx->class_num = 3;
+    printf("Model type: Detect3D (YOLO26, KITTI Car/Pedestrian/Cyclist)\n");
+    if (app_ctx->io_num.n_output >= 1 && app_ctx->output_attrs)
+    {
+        const rknn_tensor_attr &attr = app_ctx->output_attrs[0];
+        if (attr.n_dims >= 2)
+        {
+            printf("Detect3D output: [%d x %d] (rows x cols, expect 300 x 14)\n",
+                   attr.dims[attr.n_dims - 2], attr.dims[attr.n_dims - 1]);
+        }
+    }
+    return ret;
+}
+
+int inference_yolov26_detect3d_model(rknn_app_context_t *app_ctx, image_buffer_t *preprocessed_img, letterbox_t *letter_box, Detect3DTaskResult *d3_out, float conf_threshold, float nms_threshold)
+{
+    return run_rknn_inference(app_ctx, preprocessed_img, letter_box, conf_threshold, nms_threshold, d3_out,
+                              [](rknn_app_context_t *ctx, void *outputs, letterbox_t *lb, float conf, float nms, void *results) {
+                                  return post_process_yolov26_detect3d(ctx, outputs, lb, conf, static_cast<Detect3DTaskResult *>(results));
+                              });
+}

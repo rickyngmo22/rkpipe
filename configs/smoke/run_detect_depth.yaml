@@ -1,0 +1,38 @@
+%YAML:1.0
+---
+# 多任务组合（Y5）：主任务 detect（框/类/跟踪）+ 辅助任务 depth（JET 伪彩）
+# D3 检测+单目测距：每个检测框标注估计距离（米），近距目标红框 + near_distance 告警
+model_path: "/userdata/rkpipe/model/yolo26n.rknn"
+input_path: "/userdata/rk_pipe/test_videos/baseline17.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 1
+web_preview_bind: "0.0.0.0"
+web_preview_port: 8090
+web_preview_quality: 75
+web_preview_mode: "replay"
+web_preview_eof_linger_ms: 1500
+web_preview_replay_pace: 0
+web_preview_scale: 0.9
+task: "detect"
+aux_model_path: "/userdata/rkpipe/model/yolo26n_depth.rknn"
+aux_task: "depth"
+mode: "pipeline"
+thread_count: 9
+gui: 0
+local: 0
+label_path: "/userdata/rkpipe/model/coco_80_labels_list.txt"
+obj_class_num: 80
+
+# ---- D3 检测+单目测距 ----
+depth_dist_text: 1        # 检测框左上角标注估计距离（米）
+depth_dist_near_m: 5.0    # 近距阈值（米）：≤该距离的目标红框高亮；0=只标注不告警
+depth_dist_scale: 1.0     # 距离标定系数（实测米数/模型输出米数），按现场标定调整
+
+# ---- 近距告警（可选）：满足阈值时向 webhook POST {"event":"near_distance",...}，
+#      并在 alert_snapshot_dir 保存现场抓图；alert_interval_s 与计数告警共用去抖窗口
+#alert_enabled: 1
+#alert_webhook_url: "http://192.168.1.10:9000/alert"
+#alert_interval_s: 5.0
+#alert_snapshot_dir: "/userdata/rk_pipe/snapshots"
+

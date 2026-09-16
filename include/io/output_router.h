@@ -6,11 +6,11 @@
 
 #include <opencv2/opencv.hpp>
 
-#include "../utils/common.h"
-#include "io_defs.h"
+#include "utils/common.h"
+#include "io/io_defs.h"
 #include "postprocess/postprocess.h"
-#include "video_output.h"
-#include "web_preview_server.h"
+#include "io/video_output.h"
+#include "io/web_preview_server.h"
 
 class AppConfig;
 
@@ -33,6 +33,9 @@ public:
     // 输入侧统计源（丢帧数 / 重连次数），转发到 WebPreviewServer /status.json
     using InputStatSource = WebPreviewServer::InputStatSource;
     void setInputStatSource(InputStatSource source);
+    using EventStatsSource = WebPreviewServer::EventStatsSource;
+    void setEventStatsSource(EventStatsSource source);
+    void setThermalStatsSource(std::function<std::string()> source);
 
     // 输出量化指标（转发到 WebPreviewServer / VideoOutput）
     std::uint64_t webPublishedFrames() const;

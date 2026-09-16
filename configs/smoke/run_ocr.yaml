@@ -1,0 +1,31 @@
+%YAML:1.0
+---
+# M6 OCR 文字识别 demo：ocr_det（检测 480x480）+ rec（识别 320x48）二级级联
+# 2026-09-03 板端验收通过：合成图 "HELLO 123"/"RK3588 2026" 两行文本正确检出并识别。
+# 模型与字典：model/board_model/交付说明.md；调试：RK_PIPE_DEBUG_OCR_DET=1
+model_path: "/userdata/rkpipe/model/ppocrv4_det.rknn"
+input_path: "/userdata/rk_pipe/test_videos/baseline.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 1
+web_preview_bind: "0.0.0.0"
+web_preview_port: 8090
+web_preview_quality: 92
+task: "ocr_det"
+mode: "pipeline"
+thread_count: 4
+gui: 0
+local: 0
+
+# ---- stage2 文字识别（M6）：注释掉即纯文字检测 ----
+ocr_rec_model_path: "/userdata/rkpipe/model/ppocrv4_rec_fp16.rknn"
+ocr_dict_path: "/userdata/rkpipe/model/ppocr_keys_v1.txt"
+# CTC blank 索引（PaddleOCR 约定 0=blank、末位=空格）；rec 输出图内已 Softmax，
+# 分数=概率（板端首行求和≈1 自动识别，无需配置）
+ocr_rec_blank_index: 0
+
+# ---- LPRNet 车牌识别（M7）：同一管道换三行即用（车牌检测源另配） ----
+# 输出 [B,C,T] 布局已自动识别转置；blank=67（末位 '-'）
+#ocr_rec_model_path: "/userdata/rkpipe/model/lprnet_fp16.rknn"
+#ocr_dict_path: "/userdata/rkpipe/model/lprnet_dict.txt"
+#ocr_rec_blank_index: 67

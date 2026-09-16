@@ -1,33 +1,10 @@
 #include "detection/detection.h"
 #include "core/performance.h"
 #include "core/thread_local_memory_pool.h"
-#include "yolov8.h"
-#include "common.h"
-#include "utils.h"
+#include "model/yolov8.h"
+#include "utils/common.h"
+#include "utils/utils.h"
 #include "preprocess.h"
-
-#include <cstdlib>
-
-// priv_data 哨兵：标记 preprocess 的 malloc 回退分配。真实指针（含 rknn input_mem、
-// 线程本地池返回值）不可能等于该值，释放侧据此选择 free() 而非内存池 deallocate()。
-namespace {
-void *const kPreprocessMallocTag = reinterpret_cast<void *>(1);
-}
-
-void releasePreprocessBuffer(image_buffer_t &buf) {
-    if (!buf.virt_addr) {
-        return;
-    }
-    if (buf.priv_data == kPreprocessMallocTag) {
-        free(buf.virt_addr);
-    } else if (!buf.priv_data) {
-        ThreadLocalMemoryManager::deallocate(buf.virt_addr);
-    }
-    // 其余情况 priv_data 指向 rknn input_mem（零拷贝），归 RKNN 上下文所有，不在此释放
-    buf.virt_addr = nullptr;
-    buf.priv_data = nullptr;
-}
-
 
 
 
@@ -71,7 +48,6 @@ bool Detection::runDetection(image_buffer_t *processedImage, letterbox_t *letter
     } catch (const std::exception& e) {
         printf("Inference failed: %s\n", e.what());
         performance->stopInference();
-        performance->stopTotal();
         return false;
     }
 
@@ -131,7 +107,6 @@ bool Detection::runPoseDetection(image_buffer_t *processedImage, letterbox_t *le
     } catch (const std::exception& e) {
         printf("Pose inference failed: %s\n", e.what());
         performance->stopInference();
-        performance->stopTotal();
         return false;
     }
 
@@ -247,7 +222,6 @@ bool Detection::preprocess(const cv::Mat &image, image_buffer_t &processedImage,
 
     if (!processedImage.virt_addr) {
         processedImage.virt_addr = (unsigned char *)malloc(processedImage.size);
-        processedImage.priv_data = kPreprocessMallocTag;
     }
 
     if (processedImage.virt_addr == NULL) {
@@ -284,7 +258,11 @@ bool Detection::preprocess(const image_buffer_t &src_image, image_buffer_t &dst_
 
     // Check if source image is valid
     if (src_image.width == 0 || src_image.height == 0) {
-        printf("Source image empty\n");
+        if (logger) {
+            printf("Source image empty\n");
+        } else {
+            printf("Source image empty\n");
+        }
         performance->stopPreprocessing();
         return false;
     }
@@ -299,7 +277,26 @@ bool Detection::preprocess(const image_buffer_t &src_image, image_buffer_t &dst_
     dst_image.size = model_width * model_height * 3;
     dst_image.priv_data = nullptr;
 
-    if (rknn_app_ctx && rknn_app_ctx->input_mem) {
+    // 零拷贝直写 input_mem 要求 RGA 输出（UINT8 RGB888）与 NPU 输入张量类型一致：
+    // 仅 UINT8/INT8 输入模型可直写；FP16 输入模型写 UINT8 字节会被 NPU 按 FP16
+    // 解释成垃圾（应走下方普通缓冲，由 rknn_inputs_set 做类型转换）
+    bool input_mem_direct = false;
+    if (rknn_app_ctx && rknn_app_ctx->input_mem && rknn_app_ctx->input_attrs) {
+        const rknn_tensor_type in_type = rknn_app_ctx->input_attrs[0].type;
+        input_mem_direct =
+            (in_type == RKNN_TENSOR_UINT8 || in_type == RKNN_TENSOR_INT8);
+    }
+    if (const char* dbg = std::getenv("RK_PIPE_DEBUG_FACE")) {
+        if (dbg[0] != '\0' && std::strcmp(dbg, "0") != 0) {
+            std::fprintf(stderr, "[rk_pipe][face][pre] input_mem_direct=%d type=%d mem=%p\n",
+                         input_mem_direct ? 1 : 0,
+                         rknn_app_ctx && rknn_app_ctx->input_attrs
+                             ? static_cast<int>(rknn_app_ctx->input_attrs[0].type)
+                             : -1,
+                         rknn_app_ctx ? static_cast<void*>(rknn_app_ctx->input_mem) : nullptr);
+        }
+    }
+    if (input_mem_direct) {
         rknn_app_ctx->input_mem_synced = false;
         uint32_t w_stride = rknn_app_ctx->input_attrs ? rknn_app_ctx->input_attrs[0].w_stride : 0;
         uint32_t h_stride = rknn_app_ctx->input_attrs ? rknn_app_ctx->input_attrs[0].h_stride : 0;
@@ -325,7 +322,6 @@ bool Detection::preprocess(const image_buffer_t &src_image, image_buffer_t &dst_
 
     if (!dst_image.virt_addr) {
         dst_image.virt_addr = (unsigned char *)malloc(dst_image.size);
-        dst_image.priv_data = kPreprocessMallocTag;
     }
 
     if (dst_image.virt_addr == NULL) {

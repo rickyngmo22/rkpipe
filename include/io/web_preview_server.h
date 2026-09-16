@@ -58,6 +58,13 @@ public:
     // 输入侧统计源（丢帧数, 重连次数）——由主流程注入，/status.json 实时展示
     using InputStatSource = std::function<std::pair<std::uint64_t, std::uint64_t>()>;
     void setInputStatSource(InputStatSource source) { input_stat_source_ = std::move(source); }
+    // 事件规则统计源——返回 JSON 数组片段（RuleStat 序列化，含方括号），
+    // 注入 /status.json 的 event_rules 字段；空返回 = 不注入
+    using EventStatsSource = std::function<std::string()>;
+    void setEventStatsSource(EventStatsSource source) { event_stats_source_ = std::move(source); }
+    // 热降档状态 JSON 片段（/status.json 的 thermal 块；空回调=不输出）
+    using ThermalStatsSource = std::function<std::string()>;
+    void setThermalStatsSource(ThermalStatsSource source) { thermal_stats_source_ = std::move(source); }
 
 private:
     // 异步 JPEG 编码的队列元素：BGR(3ch) 帧 + 是否已由生产端完成 preview_scale 降采样
@@ -66,14 +73,14 @@ private:
         bool pre_scaled = false;
     };
 
-    // 客户端连接线程句柄：done 由线程函数最后一动作置位，reap 据此 join 并回收,
-    // 保证 stop() 返回后没有任何线程再引用 this(可安全析构)
+    void acceptLoop();
+    // 客户端连接线程句柄：done 由线程函数最后一动作置位，reap 据此 join 并回收，
+    // 保证 stop() 返回后没有任何线程再引用 this（可安全析构）。
     struct ClientThread {
         std::thread th;
         std::shared_ptr<std::atomic<bool>> done;
     };
 
-    void acceptLoop();
     void spawnClientThread(int client_fd);
     void reapClientThreads();
     void handleClient(int client_fd);
@@ -83,7 +90,7 @@ private:
     void encodeAndPublish(cv::Mat bgr, bool pre_scaled);
     std::string makeStatusJson() const;
 
-    // 并发客户端上限：超过则直接拒绝新连接,防止线程无限增长
+    // 并发客户端上限：超过则直接拒绝新连接，防止 detached 线程无限增长
     static constexpr int kMaxClients = 8;
 
     bool sendAll(int fd, const void* data, std::size_t size);
@@ -111,6 +118,8 @@ private:
     std::condition_variable queue_cv_;
     std::deque<PendingFrame> pending_frames_;
     std::thread encode_thread_;
+    std::mutex client_threads_mutex_;
+    std::vector<ClientThread> client_threads_;
     static constexpr std::size_t kMaxPendingFrames = 2;
 
     // turbojpeg 压缩器 handle（encodeLoop 线程内复用）；nullptr 时回退 cv::imencode
@@ -118,11 +127,6 @@ private:
 
     mutable std::mutex clients_mutex_;
     std::unordered_set<int> client_fds_;
-
-    // 客户端连接线程登记(stop/join 依据);由 spawnClientThread 压入、reapClientThreads 回收
-    std::mutex client_threads_mutex_;
-    std::vector<ClientThread> client_threads_;
-
     std::mutex fps_mutex_;
     std::chrono::steady_clock::time_point fps_window_start_{};
     int fps_window_count_ = 0;
@@ -135,6 +139,8 @@ private:
 
     // 输入侧统计源（丢帧数 / 重连次数），由主流程在 start 后注入
     InputStatSource input_stat_source_;
+    EventStatsSource event_stats_source_;
+    ThermalStatsSource thermal_stats_source_;
 
     bool replay_pace_enabled_ = false;
     bool replay_started_ = false;

@@ -1275,30 +1275,82 @@ void drawDetectionResults(image_buffer_t& frame, const object_detect_result_list
     }
 }
 
-bool drawDetectionResultsZeroCopy(image_buffer_t& frame, const object_detect_result_list& results) {
-    if (hideBoxesEnabled()) {
-        return true;  // 隐藏所有框：不画也不触发 BGR 回退
-    }
-    bool rga_ok = true;
-    int box_thickness = calcOverlaySize(frame, 2);
-    int text_scale = calcOverlayTextScale(frame);
-    int text_offset = calcOverlaySize(frame, 12);
+// ---- OverlayPrim：任务逻辑与绘制后端分离（draw_utils 重构阶段1）----
+// 任务逻辑（遍历检出/裁剪/配色/标签文本）只写一份，产出 Prim 列表；
+// BGR 与 NV12 后端各自按原有语义回放。像素行为不变（回归工具护航）。
+struct OverlayPrim {
+    enum class Kind : unsigned char { Box, Line, Point, Label };
+    int radius = 0;  // Point 半径（filled）
+    Kind kind;
+    int x1 = 0, y1 = 0, x2 = 0, y2 = 0;  // Box/Line（Line=线段端点）
+    int anchor_x = 0, anchor_y = 0;      // Label 锚点
+    std::string text;                     // Label
+    cv::Scalar color;                     // 框/线色或标签主色（类别色）
+};
+
+static std::vector<OverlayPrim> buildDetectionOverlayPrims(const object_detect_result_list& results,
+                                                           int frame_w, int frame_h) {
+    std::vector<OverlayPrim> prims;
+    prims.reserve(static_cast<size_t>(results.count) * 2);
     for (int i = 0; i < results.count; ++i) {
-        const object_detect_result* det_result = &(results.results[i]);
-        if (det_result->prop < DISPLAY_THRESH) {
+        const object_detect_result* det = &(results.results[i]);
+        if (det->prop < DISPLAY_THRESH) {
             continue;
         }
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
+        OverlayPrim box;
+        box.kind = OverlayPrim::Kind::Box;
+        box.x1 = std::max(0, det->box.left);
+        box.y1 = std::max(0, det->box.top);
+        box.x2 = std::min(frame_w - 1, det->box.right);
+        box.y2 = std::min(frame_h - 1, det->box.bottom);
+        box.color = classColor(det->cls_id);
+        prims.push_back(std::move(box));
 
-        x1 = std::max(0, x1);
-        y1 = std::max(0, y1);
-        x2 = std::min(frame.width - 1, x2);
-        y2 = std::min(frame.height - 1, y2);
+        OverlayPrim label;
+        label.kind = OverlayPrim::Kind::Label;
+        label.anchor_x = box.x1;
+        label.anchor_y = box.y1;
+        label.text = std::string(coco_cls_to_name(det->cls_id)) + " " + fmtConf(det->prop);
+        label.color = box.color;
+        prims.push_back(std::move(label));
+    }
+    return prims;
+}
 
-        rga_ok = rga_ok && rgaDrawRectangleNV12(frame, x1, y1, x2, y2, box_thickness, classColor(det_result->cls_id));
+// BGR 后端：按 Prim 序回放（与原 drawDetectionResultsBGR 逐调用一致）
+static void renderOverlayPrimsBgr(cv::Mat& frame, const std::vector<OverlayPrim>& prims,
+                                  int thickness_div = 320, double text_scale_div = 900.0,
+                                  bool box_anti_aliased = true) {
+    const int thickness = std::max(1, std::min(frame.cols, frame.rows) / thickness_div);
+    const double text_scale = std::max(0.4, std::min(frame.cols, frame.rows) / text_scale_div);
+    for (const auto& p : prims) {
+        if (p.kind == OverlayPrim::Kind::Box) {
+            cv::rectangle(frame, cv::Rect(cv::Point(p.x1, p.y1), cv::Point(p.x2, p.y2)),
+                          p.color, thickness, box_anti_aliased ? cv::LINE_AA : 0);
+        } else if (p.kind == OverlayPrim::Kind::Line) {
+            cv::line(frame, cv::Point(p.x1, p.y1), cv::Point(p.x2, p.y2), p.color,
+                     p.radius > 0 ? p.radius : thickness, cv::LINE_AA);
+        } else if (p.kind == OverlayPrim::Kind::Point) {
+            cv::circle(frame, cv::Point(p.x1, p.y1), p.radius, p.color, cv::FILLED, cv::LINE_AA);
+        } else {
+            putClassLabelBGR(frame, p.text, p.anchor_x, p.anchor_y, p.color, text_scale, thickness);
+        }
+    }
+}
+
+// NV12 后端：保持原三阶段语义——RGA 框 →（fd-only 且 RGA 失败时）mmap CPU
+// 框+文本 →（RGA 成功时）virt_addr 文本；返回 rga_ok 供上层 BGR 回退判断
+static bool renderOverlayPrimsNv12(image_buffer_t& frame, const std::vector<OverlayPrim>& prims) {
+    const int box_thickness = calcOverlaySize(frame, 2);
+    const int text_scale = calcOverlayTextScale(frame);
+    const int text_offset = calcOverlaySize(frame, 12);
+
+    bool rga_ok = true;
+    for (const auto& p : prims) {
+        if (p.kind != OverlayPrim::Kind::Box) {
+            continue;
+        }
+        rga_ok = rga_ok && rgaDrawRectangleNV12(frame, p.x1, p.y1, p.x2, p.y2, box_thickness, p.color);
     }
 
     if (!rga_ok && frame.virt_addr == nullptr && frame.fd > 0 &&
@@ -1308,53 +1360,89 @@ bool drawDetectionResultsZeroCopy(image_buffer_t& frame, const object_detect_res
         if (!mapNv12FrameForCpu(frame, addr, bytes)) {
             return false;
         }
-
         image_buffer_t mapped = frame;
         mapped.virt_addr = static_cast<unsigned char*>(addr);
-
-        for (int i = 0; i < results.count; ++i) {
-            const object_detect_result* det_result = &(results.results[i]);
-            if (det_result->prop < DISPLAY_THRESH) {
+        for (const auto& p : prims) {
+            if (p.kind == OverlayPrim::Kind::Box) {
+                drawRectangleNV12CPU(mapped, p.x1, p.y1, p.x2, p.y2, box_thickness, p.color);
+            } else if (p.kind == OverlayPrim::Kind::Line) {
+                drawLineNV12CPU(mapped, p.x1, p.y1, p.x2, p.y2, box_thickness, p.color);
+            }
+        }
+        for (const auto& p : prims) {
+            if (p.kind != OverlayPrim::Kind::Label) {
                 continue;
             }
-            int x1 = std::max(0, det_result->box.left);
-            int y1 = std::max(0, det_result->box.top);
-            int x2 = std::min(frame.width - 1, det_result->box.right);
-            int y2 = std::min(frame.height - 1, det_result->box.bottom);
-            drawRectangleNV12CPU(mapped, x1, y1, x2, y2, box_thickness, classColor(det_result->cls_id));
+            drawOverlayText(mapped, p.text, p.anchor_x, std::max(0, p.anchor_y - text_offset),
+                            cv::Scalar(255, 255, 255), text_scale, p.color);
         }
-
-        for (int i = 0; i < results.count; ++i) {
-            const object_detect_result* det_result = &(results.results[i]);
-            if (det_result->prop < DISPLAY_THRESH) {
-                continue;
-            }
-            int x1 = std::max(0, det_result->box.left);
-            int y1 = std::max(0, det_result->box.top);
-            std::string label = std::string(coco_cls_to_name(det_result->cls_id)) + " " + fmtConf(det_result->prop);
-            drawOverlayText(mapped, label, x1, std::max(0, y1 - text_offset), cv::Scalar(255, 255, 255), text_scale,
-                            classColor(det_result->cls_id));
-        }
-
         unmapNv12FrameForCpu(frame.fd, addr, bytes);
         return true;
     }
 
     if (rga_ok) {
-        for (int i = 0; i < results.count; ++i) {
-            const object_detect_result* det_result = &(results.results[i]);
-            if (det_result->prop < DISPLAY_THRESH) {
+        for (const auto& p : prims) {
+            if (p.kind != OverlayPrim::Kind::Label) {
                 continue;
             }
-            int x1 = std::max(0, det_result->box.left);
-            int y1 = std::max(0, det_result->box.top);
-            std::string label = std::string(coco_cls_to_name(det_result->cls_id)) + " " + fmtConf(det_result->prop);
-            drawOverlayText(frame, label, x1, std::max(0, y1 - text_offset), cv::Scalar(255, 255, 255), text_scale,
-                            classColor(det_result->cls_id));
+            drawOverlayText(frame, p.text, p.anchor_x, std::max(0, p.anchor_y - text_offset),
+                            cv::Scalar(255, 255, 255), text_scale, p.color);
         }
     }
-
     return rga_ok;
+}
+
+bool drawDetectionResultsZeroCopy(image_buffer_t& frame, const object_detect_result_list& results) {
+    if (hideBoxesEnabled()) {
+        return true;  // 隐藏所有框：不画也不触发 BGR 回退
+    }
+    return renderOverlayPrimsNv12(frame, buildDetectionOverlayPrims(results, frame.width, frame.height));
+}
+
+static std::vector<OverlayPrim> buildOBBOverlayPrims(const obb_detect_result_list& results) {
+    std::vector<OverlayPrim> prims;
+    prims.reserve(static_cast<size_t>(results.count) * 5);
+    for (int i = 0; i < results.count; ++i) {
+        const obb_detect_result* det = &(results.results[i]);
+        if (det->prop < DISPLAY_THRESH) {
+            continue;
+        }
+        const auto& box = det->box;
+        const float cx = box.x + box.w * 0.5f;
+        const float cy = box.y + box.h * 0.5f;
+        cv::RotatedRect rect(cv::Point2f(cx, cy), cv::Size2f(box.w, box.h),
+                             box.angle * 57.2957795f);
+        cv::Point2f pts[4];
+        rect.points(pts);
+        const cv::Scalar color = classColor(det->cls_id);
+
+        float min_x = pts[0].x;
+        float min_y = pts[0].y;
+        for (int k = 1; k < 4; ++k) {
+            min_x = std::min(min_x, pts[k].x);
+            min_y = std::min(min_y, pts[k].y);
+        }
+
+        for (int k = 0; k < 4; ++k) {
+            OverlayPrim line;
+            line.kind = OverlayPrim::Kind::Line;
+            line.x1 = static_cast<int>(pts[k].x);
+            line.y1 = static_cast<int>(pts[k].y);
+            line.x2 = static_cast<int>(pts[(k + 1) % 4].x);
+            line.y2 = static_cast<int>(pts[(k + 1) % 4].y);
+            line.color = color;
+            prims.push_back(std::move(line));
+        }
+
+        OverlayPrim label;
+        label.kind = OverlayPrim::Kind::Label;
+        label.anchor_x = std::max(0, static_cast<int>(min_x));
+        label.anchor_y = std::max(0, static_cast<int>(min_y));
+        label.text = std::string(coco_cls_to_name(det->cls_id)) + " " + fmtConf(det->prop);
+        label.color = color;
+        prims.push_back(std::move(label));
+    }
+    return prims;
 }
 
 bool drawOBBResultsZeroCopy(image_buffer_t& frame, const obb_detect_result_list& results) {
@@ -1371,73 +1459,34 @@ bool drawOBBResultsZeroCopy(image_buffer_t& frame, const obb_detect_result_list&
         return false;
     }
 
+    // OBB 的 Prim 全部为 CPU 绘制（线段/文本）：fd-only 时懒 mmap
     void* cpu_addr = nullptr;
     size_t cpu_bytes = 0;
-    bool mapped_for_cpu = false;
     image_buffer_t cpu_frame = frame;
-    auto ensureCpuFrame = [&]() -> image_buffer_t* {
-        if (frame.virt_addr != nullptr) {
-            return &frame;
+    if (frame.virt_addr == nullptr) {
+        if (!mapNv12FrameForCpu(frame, cpu_addr, cpu_bytes)) {
+            return false;
         }
-        if (frame.fd <= 0) {
-            return nullptr;
-        }
-        if (!mapped_for_cpu) {
-            if (!mapNv12FrameForCpu(frame, cpu_addr, cpu_bytes)) {
-                return nullptr;
-            }
-            cpu_frame.virt_addr = static_cast<unsigned char*>(cpu_addr);
-            mapped_for_cpu = true;
-        }
-        return &cpu_frame;
-    };
-
-    image_buffer_t* target = ensureCpuFrame();
-    if (!target) {
-        return false;
+        cpu_frame.virt_addr = static_cast<unsigned char*>(cpu_addr);
     }
 
     bool ok = true;
-    int line_thickness = calcOverlaySize(frame, 2);
-    int text_scale = calcOverlayTextScale(frame);
-    int text_offset = calcOverlaySize(frame, 12);
-    for (int i = 0; i < results.count; ++i) {
-        const obb_detect_result* det_result = &(results.results[i]);
-        if (det_result->prop < DISPLAY_THRESH) {
-            continue;
+    const int line_thickness = calcOverlaySize(frame, 2);
+    const int text_scale = calcOverlayTextScale(frame);
+    const int text_offset = calcOverlaySize(frame, 12);
+    image_buffer_t* target = frame.virt_addr ? &frame : &cpu_frame;
+    for (const auto& p : buildOBBOverlayPrims(results)) {
+        if (p.kind == OverlayPrim::Kind::Line) {
+            ok = ok && drawLineNV12CPU(*target, p.x1, p.y1, p.x2, p.y2, line_thickness, p.color);
+        } else if (p.kind == OverlayPrim::Kind::Label) {
+            const int lx = std::min(frame.width - 1, p.anchor_x);
+            const int ly = std::min(frame.height - 1, p.anchor_y - text_offset);
+            drawOverlayText(*target, p.text, std::max(0, lx), std::max(0, ly),
+                            cv::Scalar(255, 255, 255), text_scale, p.color);
         }
-        const auto& box = det_result->box;
-        float cx = box.x + box.w * 0.5f;
-        float cy = box.y + box.h * 0.5f;
-        float angle_deg = box.angle * 57.2957795f;
-        cv::RotatedRect rect(cv::Point2f(cx, cy), cv::Size2f(box.w, box.h), angle_deg);
-        cv::Point2f pts[4];
-        rect.points(pts);
-
-        for (int k = 0; k < 4; ++k) {
-            int x0 = static_cast<int>(pts[k].x);
-            int y0 = static_cast<int>(pts[k].y);
-            int x1 = static_cast<int>(pts[(k + 1) % 4].x);
-            int y1 = static_cast<int>(pts[(k + 1) % 4].y);
-            ok = ok && drawLineNV12CPU(*target, x0, y0, x1, y1, line_thickness, classColor(det_result->cls_id));
-        }
-
-        float min_x = pts[0].x;
-        float min_y = pts[0].y;
-        for (int k = 1; k < 4; ++k) {
-            min_x = std::min(min_x, pts[k].x);
-            min_y = std::min(min_y, pts[k].y);
-        }
-
-        std::string className = coco_cls_to_name(det_result->cls_id);
-        std::string label = className + " " + fmtConf(det_result->prop);
-        int label_x = std::max(0, std::min(frame.width - 1, static_cast<int>(min_x)));
-        int label_y = std::max(0, std::min(frame.height - 1, static_cast<int>(min_y) - text_offset));
-        drawOverlayText(*target, label, label_x, label_y, cv::Scalar(255, 255, 255), text_scale,
-                        classColor(det_result->cls_id));
     }
 
-    if (mapped_for_cpu) {
+    if (cpu_addr) {
         unmapNv12FrameForCpu(frame.fd, cpu_addr, cpu_bytes);
     }
     return ok;
@@ -1571,7 +1620,79 @@ bool drawSegResultsZeroCopy(image_buffer_t& frame, const seg_detect_result_list&
     return true;
 }
 
+bool drawOCRResultsZeroCopy(image_buffer_t& frame, const OCRDetectTaskResult& results) {
+    if (frame.virt_addr == nullptr && frame.fd <= 0) {
+        return false;
+    }
+    if (frame.width <= 0 || frame.height <= 0) {
+        return false;
+    }
+    if (frame.format != IMAGE_FORMAT_YUV420SP_NV12 && frame.format != IMAGE_FORMAT_YUV420SP_NV21) {
+        return false;
+    }
 
+    void* cpu_addr = nullptr;
+    size_t cpu_bytes = 0;
+    bool mapped_for_cpu = false;
+    image_buffer_t cpu_frame = frame;
+    auto ensureCpuFrame = [&]() -> image_buffer_t* {
+        if (frame.virt_addr != nullptr) {
+            return &frame;
+        }
+        if (frame.fd <= 0) {
+            return nullptr;
+        }
+        if (!mapped_for_cpu) {
+            if (!mapNv12FrameForCpu(frame, cpu_addr, cpu_bytes)) {
+                return nullptr;
+            }
+            cpu_frame.virt_addr = static_cast<unsigned char*>(cpu_addr);
+            mapped_for_cpu = true;
+        }
+        return &cpu_frame;
+    };
+
+    image_buffer_t* target = ensureCpuFrame();
+    if (!target) {
+        return false;
+    }
+
+    bool ok = true;
+    int line_thickness = calcOverlaySize(frame, 2);
+    int text_scale = calcOverlayTextScale(frame);
+    int text_offset = calcOverlaySize(frame, 12);
+    for (const OCRPolygon& polygon : results.polygons) {
+        if (polygon.score < DISPLAY_THRESH) {
+            continue;
+        }
+
+        float min_x = polygon.points[0].x;
+        float min_y = polygon.points[0].y;
+        for (size_t idx = 0; idx < polygon.points.size(); ++idx) {
+            const cv::Point2f& start = polygon.points[idx];
+            const cv::Point2f& end = polygon.points[(idx + 1) % polygon.points.size()];
+            ok = ok && drawLineNV12CPU(*target,
+                                       static_cast<int>(std::round(start.x)),
+                                       static_cast<int>(std::round(start.y)),
+                                       static_cast<int>(std::round(end.x)),
+                                       static_cast<int>(std::round(end.y)),
+                                       line_thickness,
+                                       cv::Scalar(0, 255, 255));
+            min_x = std::min(min_x, start.x);
+            min_y = std::min(min_y, start.y);
+        }
+
+        std::string label = "TEXT " + std::to_string(static_cast<int>(polygon.score * 100)) + "%";
+        int label_x = std::max(0, std::min(frame.width - 1, static_cast<int>(min_x)));
+        int label_y = std::max(0, std::min(frame.height - 1, static_cast<int>(min_y) - text_offset));
+        drawOverlayText(*target, label, label_x, label_y, cv::Scalar(0, 255, 255), text_scale);
+    }
+
+    if (mapped_for_cpu) {
+        unmapNv12FrameForCpu(frame.fd, cpu_addr, cpu_bytes);
+    }
+    return ok;
+}
 
 void drawPoseResults(image_buffer_t& frame, const pose_detect_result_list& results) {
     bool rga_ok = true;
@@ -1731,111 +1852,97 @@ bool drawPoseResultsZeroCopy(image_buffer_t& frame, const pose_detect_result_lis
     return ok;
 }
 
+static std::vector<OverlayPrim> buildPoseOverlayPrims(const pose_detect_result_list& results,
+                                                      bool draw_box, int frame_cols, int frame_rows) {
+    static const int kSkeleton[][2] = {
+        {0, 1}, {0, 2},  {1, 3},  {2, 4},   {5, 6},   {5, 11}, {6, 12}, {11, 12},
+        {6, 8}, {8, 10}, {5, 7},  {7, 9},   {12, 14}, {14, 16}, {11, 13}, {13, 15}};
+    std::vector<OverlayPrim> prims;
+    prims.reserve(static_cast<size_t>(results.count) * 60);
+    const int thickness = std::max(1, std::min(frame_cols, frame_rows) / 320);
+    const int keypoint_radius = std::max(2, std::min(frame_cols, frame_rows) / 160);
+    const double text_scale = std::max(0.4, std::min(frame_cols, frame_rows) / 900.0);
+
+    for (int i = 0; i < results.count; ++i) {
+        const pose_detect_result* det = &(results.results[i]);
+        if (det->box_conf < DISPLAY_THRESH) {
+            continue;
+        }
+        const int x1 = std::max(0, std::min(frame_cols - 1, det->box.left));
+        const int y1 = std::max(0, std::min(frame_rows - 1, det->box.top));
+        const int x2 = std::max(0, std::min(frame_cols - 1, det->box.right));
+        const int y2 = std::max(0, std::min(frame_rows - 1, det->box.bottom));
+        // 每人一色(黄金角调色板),框/骨架/标签条同色便于多人辨识
+        const cv::Scalar person_color =
+            classColor(det->track_id > 0 ? det->track_id : (i + 1));
+        if (draw_box && !hideBoxesEnabled()) {
+            OverlayPrim box;
+            box.kind = OverlayPrim::Kind::Box;
+            box.x1 = x1; box.y1 = y1; box.x2 = x2; box.y2 = y2;
+            box.color = person_color;
+            prims.push_back(std::move(box));
+        }
+        for (const auto& bone : kSkeleton) {
+            const pose_keypoint& kp1 = det->keypoints[bone[0]];
+            const pose_keypoint& kp2 = det->keypoints[bone[1]];
+            if (kp1.conf > KEYPOINT_THRESH && kp2.conf > KEYPOINT_THRESH) {
+                OverlayPrim line;
+                line.kind = OverlayPrim::Kind::Line;
+                line.x1 = static_cast<int>(kp1.x);
+                line.y1 = static_cast<int>(kp1.y);
+                line.x2 = static_cast<int>(kp2.x);
+                line.y2 = static_cast<int>(kp2.y);
+                line.color = person_color;
+                line.radius = thickness + 1;  // Line 复用 radius 字段带线宽
+                prims.push_back(std::move(line));
+            }
+        }
+        for (int k = 0; k < KEYPOINT_NUM; ++k) {
+            const pose_keypoint& kp = det->keypoints[k];
+            if (kp.conf > KEYPOINT_THRESH) {
+                // 白心 + 人色描边,层次清晰：先人色大圆(filled)，后白心小圆
+                OverlayPrim halo;
+                halo.kind = OverlayPrim::Kind::Point;
+                halo.x1 = static_cast<int>(kp.x);
+                halo.y1 = static_cast<int>(kp.y);
+                halo.radius = keypoint_radius + 1;
+                halo.color = person_color;
+                prims.push_back(std::move(halo));
+                OverlayPrim core;
+                core.kind = OverlayPrim::Kind::Point;
+                core.x1 = static_cast<int>(kp.x);
+                core.y1 = static_cast<int>(kp.y);
+                core.radius = keypoint_radius;
+                core.color = cv::Scalar(255, 255, 255);
+                prims.push_back(std::move(core));
+            }
+        }
+        if (draw_box && !hideBoxesEnabled()) {
+            OverlayPrim label;
+            label.kind = OverlayPrim::Kind::Label;
+            label.anchor_x = x1;
+            label.anchor_y = y1;
+            label.text = fmtConf(det->box_conf);
+            label.color = classColor(det->track_id > 0 ? det->track_id : (i + 1));
+            prims.push_back(std::move(label));
+        }
+    }
+    return prims;
+}
+
 void drawPoseResultsBGR(cv::Mat& frame, const pose_detect_result_list& results, bool draw_box) {
     if (frame.empty()) {
         return;
     }
-    int thickness = std::max(1, std::min(frame.cols, frame.rows) / 320);
-    int keypoint_radius = std::max(2, std::min(frame.cols, frame.rows) / 160);
-    const int skeleton[][2] = {
-        {0, 1}, {0, 2},
-        {1, 3}, {2, 4},
-        {5, 6},
-        {5, 11}, {6, 12},
-        {11, 12},
-        {6, 8}, {8, 10},
-        {5, 7}, {7, 9},
-        {12, 14}, {14, 16},
-        {11, 13}, {13, 15}
-    };
-
-    for (int i = 0; i < results.count; ++i) {
-        const pose_detect_result* det_result = &(results.results[i]);
-        if (det_result->box_conf < DISPLAY_THRESH) {
-            continue;
-        }
-        int x1 = std::max(0, std::min(frame.cols - 1, det_result->box.left));
-        int y1 = std::max(0, std::min(frame.rows - 1, det_result->box.top));
-        int x2 = std::max(0, std::min(frame.cols - 1, det_result->box.right));
-        int y2 = std::max(0, std::min(frame.rows - 1, det_result->box.bottom));
-        // 每人一色(黄金角调色板),框/骨架/标签条同色便于多人辨识
-        const cv::Scalar person_color = classColor(det_result->track_id > 0 ? det_result->track_id : (i + 1));
-        const double text_scale = std::max(0.4, std::min(frame.cols, frame.rows) / 900.0);
-        if (draw_box && !hideBoxesEnabled()) {
-            cv::rectangle(frame, cv::Rect(cv::Point(x1, y1), cv::Point(x2, y2)), person_color, thickness);
-        }
-
-        for (size_t k = 0; k < sizeof(skeleton) / sizeof(skeleton[0]); k++) {
-            const pose_keypoint& kp1 = det_result->keypoints[skeleton[k][0]];
-            const pose_keypoint& kp2 = det_result->keypoints[skeleton[k][1]];
-            if (kp1.conf > KEYPOINT_THRESH && kp2.conf > KEYPOINT_THRESH) {
-                cv::line(frame,
-                         cv::Point(static_cast<int>(kp1.x), static_cast<int>(kp1.y)),
-                         cv::Point(static_cast<int>(kp2.x), static_cast<int>(kp2.y)),
-                         person_color, thickness + 1, cv::LINE_AA);
-            }
-        }
-
-        for (int k = 0; k < KEYPOINT_NUM; k++) {
-            const pose_keypoint& kp = det_result->keypoints[k];
-            if (kp.conf > KEYPOINT_THRESH) {
-                // 白心 + 人色描边,层次清晰
-                cv::circle(frame,
-                           cv::Point(static_cast<int>(kp.x), static_cast<int>(kp.y)),
-                           keypoint_radius + 1, person_color, -1, cv::LINE_AA);
-                cv::circle(frame,
-                           cv::Point(static_cast<int>(kp.x), static_cast<int>(kp.y)),
-                           keypoint_radius, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
-            }
-        }
-
-        if (draw_box && !hideBoxesEnabled()) {
-            std::string confText = fmtConf(det_result->box_conf);
-            putClassLabelBGR(frame, confText, x1, y1, classColor(det_result->track_id > 0 ? det_result->track_id : (i + 1)), text_scale, thickness);
-        }
-    }
+    renderOverlayPrimsBgr(frame, buildPoseOverlayPrims(results, draw_box, frame.cols, frame.rows),
+                          320, 900.0, false);
 }
 
 void drawOBBResultsBGR(cv::Mat& frame, const obb_detect_result_list& results) {
     if (frame.empty() || hideBoxesEnabled()) {
         return;
     }
-    int thickness = std::max(1, std::min(frame.cols, frame.rows) / 320);
-    double text_scale = std::max(0.4, std::min(frame.cols, frame.rows) / 900.0);
-
-    for (int i = 0; i < results.count; ++i) {
-        const obb_detect_result* det_result = &(results.results[i]);
-        if (det_result->prop < DISPLAY_THRESH) {
-            continue;
-        }
-        const auto& box = det_result->box;
-        float cx = box.x + box.w * 0.5f;
-        float cy = box.y + box.h * 0.5f;
-        float angle_deg = box.angle * 57.2957795f;
-        cv::RotatedRect rect(cv::Point2f(cx, cy), cv::Size2f(box.w, box.h), angle_deg);
-        cv::Point2f pts[4];
-        rect.points(pts);
-
-        const cv::Scalar color = classColor(det_result->cls_id);
-        for (int k = 0; k < 4; ++k) {
-            cv::line(frame,
-                     cv::Point(static_cast<int>(pts[k].x), static_cast<int>(pts[k].y)),
-                     cv::Point(static_cast<int>(pts[(k + 1) % 4].x), static_cast<int>(pts[(k + 1) % 4].y)),
-                     color, thickness, cv::LINE_AA);
-        }
-
-        float min_x = pts[0].x;
-        float min_y = pts[0].y;
-        for (int k = 1; k < 4; ++k) {
-            min_x = std::min(min_x, pts[k].x);
-            min_y = std::min(min_y, pts[k].y);
-        }
-
-        std::string label = std::string(coco_cls_to_name(det_result->cls_id)) + " " +
-                            fmtConf(det_result->prop);
-        putClassLabelBGR(frame, label, std::max(0, static_cast<int>(min_x)), static_cast<int>(min_y),
-                         classColor(det_result->cls_id), text_scale, thickness);
-    }
+    renderOverlayPrimsBgr(frame, buildOBBOverlayPrims(results));
 }
 
 void drawSegResultsBGR(cv::Mat& frame, const seg_detect_result_list& results, double scale, bool draw_box) {
@@ -1990,29 +2097,460 @@ void drawDepthResultsBGR(cv::Mat& frame, const cv::Mat& depth, double alpha, con
     }
 }
 
+std::vector<DepthDistanceTarget> drawDepthDistanceOverlayBGR(
+    cv::Mat& frame, const cv::Mat& depth, const cv::Rect* roi,
+    float depth_lo, float depth_hi, const object_detect_result_list& dets,
+    float near_m, float scale, bool draw_text) {
+    std::vector<DepthDistanceTarget> near_targets;
+    if (frame.empty() || depth.empty() || !roi || roi->width <= 0 || roi->height <= 0 ||
+        depth_hi <= depth_lo || dets.count <= 0) {
+        return near_targets;
+    }
+    const double frame_w = static_cast<double>(frame.cols);
+    for (int i = 0; i < dets.count; ++i) {
+        const object_detect_result& d = dets.results[i];
+        const int bx1 = std::max(0, std::min(d.box.left, frame.cols - 1));
+        const int by1 = std::max(0, std::min(d.box.top, frame.rows - 1));
+        const int bx2 = std::max(0, std::min(d.box.right, frame.cols - 1));
+        const int by2 = std::max(0, std::min(d.box.bottom, frame.rows - 1));
+        if (bx2 <= bx1 || by2 <= by1) {
+            continue;
+        }
+        // 框内深度中值 → 米（纯函数见 depth_distance.h）
+        float meters = 0.0f;
+        if (!boxDepthMeters(depth, *roi, d.box, depth_lo, depth_hi, scale, &meters)) {
+            continue;
+        }
+        const bool near = near_m > 0.0f && meters <= near_m;
+        if (near) {
+            near_targets.push_back({d.cls_id, meters});
+        }
+        if (!draw_text) {
+            continue;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1fm", meters);
+        const double label_scale = frame_w > 1280.0 ? 0.6 : 0.5;
+        const int thickness = frame_w > 1280.0 ? 2 : 1;
+        // 近距目标红框 + 红字；普通目标黄字
+        if (near) {
+            cv::rectangle(frame, cv::Rect(bx1, by1, bx2 - bx1, by2 - by1),
+                          cv::Scalar(0, 0, 255), frame_w > 1280.0 ? 3 : 2);
+        }
+        // 深色底增强可读性
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, label_scale, thickness, &baseline);
+        const int tx = std::max(0, std::min(bx1, frame.cols - text_size.width - 4));
+        const int ty = std::max(text_size.height + 4, by1);
+        cv::rectangle(frame, cv::Rect(tx - 2, ty - text_size.height - 2, text_size.width + 4, text_size.height + 4),
+                      cv::Scalar(0, 0, 0), cv::FILLED);
+        cv::putText(frame, buf, cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, label_scale,
+                    near ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 255), thickness, cv::LINE_AA);
+    }
+    return near_targets;
+}
+
+// Detect3D 线框投影的 P2 矩阵（启动时 set_detect3d_p2 一次性设置，绘制线程只读）
+static float g_detect3d_p2[12] = {0};
+static bool g_detect3d_p2_valid = false;
+static float g_detect3d_depth_scale = 1.0f;  // 模型深度全局缩放（场景尺度校准）
+
+void set_detect3d_depth_scale(float scale) {
+    g_detect3d_depth_scale = scale > 0.0f ? scale : 1.0f;
+}
+
+void set_detect3d_p2(const std::string& p2_spec) {
+    g_detect3d_p2_valid = false;
+    if (p2_spec.empty()) {
+        return;
+    }
+    // 分隔符兼容逗号/空格/tab，数值支持科学计数法——KITTI calib 文件的 P2 行可直接粘贴
+    float vals[12] = {0};
+    int count = 0;
+    std::string token;
+    auto flush = [&]() {
+        if (!token.empty() && count < 12) {
+            vals[count++] = static_cast<float>(std::atof(token.c_str()));
+            token.clear();
+        }
+    };
+    for (const char ch : p2_spec) {
+        if (ch == ',' || ch == ' ' || ch == '\t') {
+            flush();
+        } else {
+            token.push_back(ch);
+        }
+    }
+    flush();
+    if (count != 12) {
+        std::fprintf(stderr, "[rk_pipe][d3d] detect3d_p2 需要 12 个值（3x4 行主序），实际 %d 个，线框不启用\n", count);
+        return;
+    }
+    if (!(vals[0] > 0.0f && vals[5] > 0.0f)) {
+        std::fprintf(stderr, "[rk_pipe][d3d] detect3d_p2 的 fx/fy 非正，线框不启用\n");
+        return;
+    }
+    std::memcpy(g_detect3d_p2, vals, sizeof(vals));
+    g_detect3d_p2_valid = true;
+    std::printf("[rk_pipe][d3d] P2 已配置，启用 3D 线框投影\n");
+}
+
+namespace {
+
+// 12 条边：底面 4 + 顶面 4 + 立柱 4（角点序与 computeDetect3DCorners2D 一致）
+void drawDetect3DWireframe(cv::Mat& frame, const float corners[8][2]) {
+    const int thickness = std::max(1, std::min(frame.cols, frame.rows) / 400);
+    auto edge = [&](int a, int b) {
+        cv::Point p1(static_cast<int>(std::lround(corners[a][0])),
+                     static_cast<int>(std::lround(corners[a][1])));
+        cv::Point p2(static_cast<int>(std::lround(corners[b][0])),
+                     static_cast<int>(std::lround(corners[b][1])));
+        cv::clipLine(cv::Rect(0, 0, frame.cols, frame.rows), p1, p2);
+        cv::line(frame, p1, p2, cv::Scalar(255, 200, 0), thickness, cv::LINE_AA);
+    };
+    for (int i = 0; i < 4; ++i) {
+        edge(i, (i + 1) % 4);          // 底面
+        edge(i + 4, (i + 1) % 4 + 4);  // 顶面
+        edge(i, i + 4);                // 立柱
+    }
+}
+
+}  // namespace
+
+void drawDetect3DResultsBGR(cv::Mat& frame, const Detect3DTaskResult& results) {
+    static const bool dbg = []() {
+        const char* e = getenv("RK_PIPE_DEBUG_D3D");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
+    if (dbg) {
+        std::printf("[d3d-draw] items=%zu frame=%dx%d\n", results.items.size(), frame.cols, frame.rows);
+        for (const auto& it : results.items) {
+            std::printf("[d3d-draw]   cls=%d conf=%.3f box=(%d,%d,%d,%d) d=%.1fm hwl=(%.2f,%.2f,%.2f)\n",
+                        it.cls_id, (double)it.conf, it.box.left, it.box.top, it.box.right, it.box.bottom,
+                        (double)it.depth_m, (double)it.h3, (double)it.w3, (double)it.l3);
+        }
+    }
+    if (frame.empty() || results.items.empty() || hideBoxesEnabled()) {
+        return;
+    }
+    const int thickness = std::max(1, std::min(frame.cols, frame.rows) / 400);
+    const double text_scale = std::max(0.4, std::min(frame.cols, frame.rows) / 1000.0);
+    const int text_thickness = std::max(1, thickness);
+    for (const auto& it : results.items) {
+        if (it.conf < DISPLAY_THRESH) {
+            continue;
+        }
+        const int x1 = std::max(0, std::min(static_cast<int>(it.box.left), frame.cols - 1));
+        const int y1 = std::max(0, std::min(static_cast<int>(it.box.top), frame.rows - 1));
+        const int x2 = std::max(0, std::min(static_cast<int>(it.box.right), frame.cols - 1));
+        const int y2 = std::max(0, std::min(static_cast<int>(it.box.bottom), frame.rows - 1));
+        if (x2 <= x1 || y2 <= y1) {
+            continue;
+        }
+        const cv::Scalar color = getSegColor(it.cls_id);
+        cv::rectangle(frame, cv::Rect(x1, y1, x2 - x1, y2 - y1), color, thickness);
+
+        // 标签：类别+置信度。模型输出的深度/尺寸在未标定相机上为场景级粗估，默认不显示；
+        // 需要时打开 RK_PIPE_DEBUG_D3D 或配置 detect3d_p2（线框）查看
+        const std::string label = std::string(coco_cls_to_name(it.cls_id)) + " " +
+                                  std::to_string(static_cast<int>(it.conf * 100)) + "%";
+
+        int baseline = 0;
+        const cv::Size s1 = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, text_scale, text_thickness, &baseline);
+        const int label_w = s1.width + 8;
+        const int label_h = s1.height + 8;
+        const int lx = std::max(0, std::min(x1, frame.cols - label_w - 1));
+        const int ly = std::max(label_h + 2, y1);
+        cv::rectangle(frame, cv::Rect(lx, ly - label_h, label_w, label_h), cv::Scalar(0, 0, 0), cv::FILLED);
+        cv::putText(frame, label, cv::Point(lx + 4, ly - 4),
+                    cv::FONT_HERSHEY_SIMPLEX, text_scale, color, text_thickness, cv::LINE_AA);
+
+        // 3D 线框投影（仅在显式配置 detect3d_p2，即相机已标定时绘制）。
+        // 深度乘 detect3d_depth_scale 做场景尺度校准（单目模型在非训练场景上深度常有整体偏差）
+        if (g_detect3d_p2_valid) {
+            Detect3DItem it_scaled = it;
+            it_scaled.depth_m *= g_detect3d_depth_scale;
+            float corners[8][2];
+            if (computeDetect3DCorners2D(it_scaled, g_detect3d_p2, corners)) {
+                drawDetect3DWireframe(frame, corners);
+            }
+        }
+    }
+}
+
+namespace {
+
+// Cityscapes 19 类标准色（RGB，绘制时转 BGR）；前 19 类与之对应
+const int kCityscapesColors[19][3] = {
+    {128, 64, 128},   // 0 road
+    {244, 35, 232},   // 1 sidewalk
+    {70, 70, 70},     // 2 building
+    {102, 102, 156},  // 3 wall
+    {190, 153, 153},  // 4 fence
+    {153, 153, 153},  // 5 pole
+    {250, 170, 30},   // 6 traffic light
+    {220, 220, 0},    // 7 traffic sign
+    {107, 142, 35},   // 8 vegetation
+    {152, 251, 152},  // 9 terrain
+    {70, 130, 180},   // 10 sky
+    {220, 20, 60},    // 11 person
+    {255, 0, 0},      // 12 rider
+    {0, 0, 142},      // 13 car
+    {0, 0, 70},       // 14 truck
+    {0, 60, 100},     // 15 bus
+    {0, 80, 100},     // 16 train
+    {0, 0, 230},      // 17 motorcycle
+    {119, 11, 32},    // 18 bicycle
+};
+
+inline void hsvToRgb(float h, float s, float v, int& r, int& g, int& b) {
+    const float hh = std::fmod(h, 360.0f);
+    const int i = static_cast<int>(hh / 60.0f) % 6;
+    const float f = hh / 60.0f - static_cast<float>(i);
+    const float p = v * (1.0f - s);
+    const float q = v * (1.0f - f * s);
+    const float t = v * (1.0f - (1.0f - f) * s);
+    float rr = 0, gg = 0, bb = 0;
+    switch (i) {
+        case 0: rr = v; gg = t; bb = p; break;
+        case 1: rr = q; gg = v; bb = p; break;
+        case 2: rr = p; gg = v; bb = t; break;
+        case 3: rr = p; gg = q; bb = v; break;
+        case 4: rr = t; gg = p; bb = v; break;
+        default: rr = v; gg = p; bb = q; break;
+    }
+    r = static_cast<int>(rr * 255.0f + 0.5f);
+    g = static_cast<int>(gg * 255.0f + 0.5f);
+    b = static_cast<int>(bb * 255.0f + 0.5f);
+}
+
+// 语义分割色表：前 19 类 Cityscapes 标准色，其余按黄金角 HSV 生成（避免相邻类同色）。
+// cv::LUT 要求色表固定 256 项（CV_8U 输入），超出 class_num 的类别用中性色（深灰）占位。
+cv::Mat buildSemColorLut(int class_num) {
+    cv::Mat lut(1, 256, CV_8UC3);
+    for (int c = 0; c < 256; ++c) {
+        int r, g, b;
+        if (c < class_num && c < 19) {
+            r = kCityscapesColors[c][0];
+            g = kCityscapesColors[c][1];
+            b = kCityscapesColors[c][2];
+        } else if (c < class_num) {
+            hsvToRgb(c * 137.508f, 0.7f, 0.9f, r, g, b);
+        } else {
+            r = g = b = 45;  // 越界类别索引不会出现，置深灰占位
+        }
+        lut.at<cv::Vec3b>(0, c) = cv::Vec3b(b, g, r);  // 转 BGR
+    }
+    return lut;
+}
+
+}  // namespace
+
+void drawSemResultsBGR(cv::Mat& frame, const cv::Mat& class_map, int class_num, const cv::Rect* roi, double alpha) {
+    if (frame.empty() || class_map.empty()) {
+        return;
+    }
+    cv::Rect target;
+    if (roi && roi->width > 0 && roi->height > 0) {
+        target = *roi & cv::Rect(0, 0, frame.cols, frame.rows);
+        if (target.width <= 0 || target.height <= 0) {
+            return;
+        }
+    } else {
+        target = cv::Rect(0, 0, frame.cols, frame.rows);
+    }
+    // 混合透明度：RK_PIPE_SEM_ALPHA 覆盖（0~1），默认 0.5（越透出原画面，色块越不明显）
+    static const double env_alpha = []() {
+        const char* v = std::getenv("RK_PIPE_SEM_ALPHA");
+        if (v && *v && strcmp(v, "0") != 0) {
+            const double a = strtod(v, nullptr);
+            if (a > 0.0 && a <= 1.0) return a;
+        }
+        return 0.5;
+    }();
+    if (env_alpha > 0.0) {
+        alpha = env_alpha;
+    }
+    // 在低分辨率上先着色（cv::LUT 要求 3 通道 LUT 配 3 通道输入，先 GRAY2BGR），
+    // 再放大到目标区域：彩色图用 INTER_LINEAR 产生过渡色 + 轻高斯模糊消除块状硬边，
+    // 避免 80x80 最近邻放大成"大片马赛克"。
+    const cv::Mat lut = buildSemColorLut(class_num);
+    cv::Mat map3;
+    cv::cvtColor(class_map, map3, cv::COLOR_GRAY2BGR);
+    cv::Mat color_low;
+    cv::LUT(map3, lut, color_low);
+    cv::Mat color;
+    if (color_low.size() != cv::Size(target.width, target.height)) {
+        cv::resize(color_low, color, cv::Size(target.width, target.height), 0, 0, cv::INTER_LINEAR);
+    } else {
+        color = color_low;
+    }
+    cv::GaussianBlur(color, color, cv::Size(3, 3), 0.8);
+    cv::addWeighted(frame(target), 1.0 - alpha, color, alpha, 0, frame(target));
+}
 
 void drawDetectionResultsBGR(cv::Mat& frame, const object_detect_result_list& results) {
     if (frame.empty() || hideBoxesEnabled()) {
         return;
     }
-    int thickness = std::max(1, std::min(frame.cols, frame.rows) / 320);
-    double text_scale = std::max(0.4, std::min(frame.cols, frame.rows) / 900.0);
+    renderOverlayPrimsBgr(frame, buildDetectionOverlayPrims(results, frame.cols, frame.rows));
+}
 
-    for (int i = 0; i < results.count; ++i) {
-        const object_detect_result* det_result = &(results.results[i]);
-        if (det_result->prop < DISPLAY_THRESH) {
+// M6 文字识别结果：多边形描边（青色）+ 识别文本标签（多边形左上角实底条白字）。
+// cv::putText 不支持 CJK：非 ASCII 字符以 '?' 占位（文本仍完整进 webhook/事件链路）。
+void drawOCRTextBGR(cv::Mat& frame, const OCRDetectTaskResult& results) {
+    if (frame.empty()) {
+        return;
+    }
+    const cv::Scalar cyan(255, 200, 0);
+    const int thickness = std::max(1, frame.cols / 800);
+    const double text_scale = std::max(0.4, frame.cols / 1600.0);
+    const size_t n = results.polygons.size();
+    for (size_t i = 0; i < n; ++i) {
+        const OCRPolygon& polygon = results.polygons[i];
+        std::vector<std::vector<cv::Point>> outline;
+        outline.emplace_back();
+        for (const auto& p : polygon.points) {
+            outline.back().emplace_back(static_cast<int>(p.x), static_cast<int>(p.y));
+        }
+        cv::polylines(frame, outline, true, cyan, thickness, cv::LINE_AA);
+
+        std::string text;
+        float score = polygon.score;
+        if (i < results.lines.size()) {
+            const OCRTextLine& line = results.lines[i];
+            score = line.score > 0.0f ? line.score : score;
+            for (const char c : line.text) {
+                text += (static_cast<unsigned char>(c) >= 0x20 && static_cast<unsigned char>(c) < 0x7F)
+                            ? std::string(1, c)
+                            : "?";
+            }
+        }
+        if (text.empty()) {
             continue;
         }
-        int x1 = std::max(0, std::min(frame.cols - 1, det_result->box.left));
-        int y1 = std::max(0, std::min(frame.rows - 1, det_result->box.top));
-        int x2 = std::max(0, std::min(frame.cols - 1, det_result->box.right));
-        int y2 = std::max(0, std::min(frame.rows - 1, det_result->box.bottom));
-        // 框与标签条按类别配色:同类别同色,跨类别一眼可分
-        const cv::Scalar color = classColor(det_result->cls_id);
-        cv::rectangle(frame, cv::Rect(cv::Point(x1, y1), cv::Point(x2, y2)), color, thickness, cv::LINE_AA);
-
-        std::string label = std::string(coco_cls_to_name(det_result->cls_id)) + " " +
-                            fmtConf(det_result->prop);
-        putClassLabelBGR(frame, label, x1, y1, classColor(det_result->cls_id), text_scale, thickness);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), " %.2f", score);
+        const std::string label = text + buf;
+        int top_y = frame.rows;
+        int left_x = frame.cols;
+        for (const auto& p : polygon.points) {
+            top_y = std::min(top_y, static_cast<int>(p.y));
+            left_x = std::min(left_x, static_cast<int>(p.x));
+        }
+        putClassLabelBGR(frame, label, left_x, top_y, cv::Scalar(40, 40, 40), text_scale,
+                         thickness + 1);
     }
+}
+
+// M0 两阶级联：检测框沿用原类别配色，二级 top-1 标签画在检测框标签下方一行
+void drawCompositeClsBGR(cv::Mat& frame, const CompositeClsTaskResult& results) {
+    if (frame.empty() || results.data.count <= 0) {
+        return;
+    }
+    const int thickness = std::max(1, frame.cols / 800);
+    const double text_scale = std::max(0.4, frame.cols / 1600.0);
+    const int n = std::min<int>(results.data.count,
+                                static_cast<int>(results.cls_labels.size()));
+    for (int i = 0; i < results.data.count; ++i) {
+        const auto& det = results.data.results[i];
+        const int x1 = std::max(0, det.box.left);
+        const int y1 = std::max(0, det.box.top);
+        const cv::Scalar color = classColor(det.cls_id);
+        cv::rectangle(frame, cv::Rect(x1, y1, det.box.right - x1, det.box.bottom - y1), color,
+                      thickness, cv::LINE_AA);
+        const int label_count = i < n && !results.cls_labels[i].empty() ? 2 : 1;
+        // 第一行：一级检测类名+分数；第二行：二级 top-1
+        putClassLabelBGR(frame,
+                         std::string(coco_cls_to_name(det.cls_id)) + " " +
+                             fmtConf(det.prop),
+                         x1, y1, color, text_scale, thickness);
+        if (label_count == 2) {
+            putClassLabelBGR(frame, results.cls_labels[i], x1,
+                             y1 + static_cast<int>(text_scale * 22) + 4,
+                             cv::Scalar(40, 40, 200), text_scale, thickness);
+        }
+    }
+}
+
+// M13 动作识别：新鲜动作标签标注在对应 track 框上方（第二行，青色与一级类名区分）
+void drawActionLabelsBGR(cv::Mat& frame, const ActionTaskResult& results,
+                         const std::vector<std::string>& labels) {
+    if (frame.empty() || results.actions.empty() || results.data.count <= 0) {
+        return;
+    }
+    const double text_scale = std::max(0.4, frame.cols / 1600.0);
+    const int thickness = std::max(1, frame.cols / 800);
+    const cv::Scalar action_color(200, 180, 20);  // 青绿色
+    for (const ActionItem& act : results.actions) {
+        // 按 track_id 找锚点框（跟踪平滑后的位置）
+        bool anchored = false;
+        for (int i = 0; i < results.data.count; ++i) {
+            if (results.data.results[i].track_id != act.track_id) {
+                continue;
+            }
+            const auto& box = results.data.results[i].box;
+            std::string label =
+                act.action_id >= 0 && static_cast<size_t>(act.action_id) < labels.size() &&
+                        !labels[act.action_id].empty()
+                    ? labels[act.action_id]
+                    : "action " + std::to_string(act.action_id);
+            char score_buf[16];
+            std::snprintf(score_buf, sizeof(score_buf), " %.2f", act.score);
+            label += score_buf;
+            putClassLabelBGR(frame, label, std::max(0, box.left),
+                             std::max(0, box.top) + static_cast<int>(text_scale * 22) + 4,
+                             action_color, text_scale, thickness);
+            anchored = true;
+            break;
+        }
+        if (!anchored) {
+            // 框已消失（轨迹刚老化/缺检）：标签落到画面左侧固定行，避免静默丢弃
+            putClassLabelBGR(frame, "track " + std::to_string(act.track_id), 8,
+                             static_cast<int>(text_scale * 44) + 8, action_color, text_scale,
+                             thickness);
+        }
+    }
+}
+
+// M8 人脸：绿色框 + 5 点 landmark（红点，眉眼鼻嘴顺序）+ 左上角分数
+static std::vector<OverlayPrim> buildFaceOverlayPrims(const FaceTaskResult& results, int frame_cols) {
+    std::vector<OverlayPrim> prims;
+    prims.reserve(results.faces.size() * 7);
+    const cv::Scalar green(0, 255, 0);
+    const int thickness = std::max(1, frame_cols / 800);
+    for (const FaceItem& face : results.faces) {
+        OverlayPrim box;
+        box.kind = OverlayPrim::Kind::Box;
+        box.x1 = face.box.left;
+        box.y1 = face.box.top;
+        box.x2 = face.box.right;
+        box.y2 = face.box.bottom;
+        box.color = green;
+        prims.push_back(std::move(box));
+        for (const auto& pt : face.landmarks) {
+            OverlayPrim dot;
+            dot.kind = OverlayPrim::Kind::Point;
+            dot.x1 = static_cast<int>(pt.x);
+            dot.y1 = static_cast<int>(pt.y);
+            dot.radius = std::max(2, thickness * 2);
+            dot.color = cv::Scalar(0, 0, 255);
+            prims.push_back(std::move(dot));
+        }
+        OverlayPrim label;
+        label.kind = OverlayPrim::Kind::Label;
+        label.anchor_x = face.box.left;
+        label.anchor_y = face.box.top;
+        label.text = "face " + fmtConf(face.score);
+        label.color = cv::Scalar(30, 90, 30);
+        prims.push_back(std::move(label));
+    }
+    return prims;
+}
+
+void drawFaceResultsBGR(cv::Mat& frame, const FaceTaskResult& results) {
+    if (frame.empty()) {
+        return;
+    }
+    renderOverlayPrimsBgr(frame, buildFaceOverlayPrims(results, frame.cols), 800, 1600.0);
 }

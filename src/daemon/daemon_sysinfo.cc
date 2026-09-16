@@ -1,4 +1,4 @@
-// 板载负载采集与文件尾部读取（自 daemon_main.cc 拆出）：只读 /proc、/sys 与普通文件。
+// 板载负载采集与文件尾部读取（自 daemon 主模块拆出）：只读 /proc、/sys 与普通文件。
 #include <algorithm>
 #include <sys/statvfs.h>
 #include <cstdio>

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <string>
 #include <memory>
 #include <atomic>
@@ -8,7 +9,7 @@
 #include <condition_variable>
 #include <queue>
 #include <opencv2/opencv.hpp>
-#include "common.h"
+#include "utils/common.h"
 
 class VideoOutput {
 public:
@@ -33,6 +34,11 @@ public:
         int maxMemoryMB = 100;
         bool useRkMpp = false;
         int dropFramesOnOverflow = -1;  // -1=自动(网络输出才丢帧)；0=队列满阻塞(背压)；1=队满丢帧
+        // 本地录像分段滚动（仅本地文件；网络推流不适用）：
+        //   recordSegmentS>0 时每段时长到即封段重开，文件名 <stem>_<YYYYmmdd_HHMMSS><ext>
+        //   recordKeep>0 时仅保留最近 N 段（按文件名时间戳排序删除最旧）
+        int recordSegmentS = 0;
+        int recordKeep = 0;
     };
 
     explicit VideoOutput(Config config);
@@ -63,6 +69,16 @@ public:
 
 private:
     struct RKMPPWriter;
+    // 本地录像分段滚动
+    std::string buildSegmentPath() const;
+    bool openLocalWriter(const std::string& path, int apiPreference);
+    void maybeRotateRecording();
+    void pruneOldSegments();
+    void setupRecordingSegments();
+    std::string record_dir_;
+    std::string record_stem_;
+    std::string record_ext_;
+    std::chrono::steady_clock::time_point segment_start_{};
 
     struct QueuedFrame {
         int index = -1;
