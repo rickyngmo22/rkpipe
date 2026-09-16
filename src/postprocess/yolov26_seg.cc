@@ -8,13 +8,19 @@
 #include <cmath>
 #include <opencv2/opencv.hpp>
 
-// YOLO26 seg 后处理（非 end2end 原始头，one2one 头）
+// YOLO26 seg 后处理（非 end2end 原始头，one2one 头），双布局自适应：
 //
-// 输出（板端探针实测布局）：3 x [1, 116, H, W] + proto [1, 32, 160, 160]，NCHW（int8/fp16/fp32）
+// 融合布局（旧，4 输出）：3 x [1, 116, H, W] + proto [1, 32, 160, 160]，NCHW（int8/fp16/fp32）
 //   116 = 4(box 直接距离, 网格单位) + 80(cls logit) + 32(mask 系数)
+//
+// 拆分布局（split10，新，10 输出）：3 尺度 × (box_i[1,4,H,W] + cls_i[1,80,H,W] + mask_i[1,32,H,W]) + proto
+//   box/cls/mask 各用各的 zp/scale（cls 极值不再撑爆 box/mask 的量化步长，与 detect/obb split 同理）
+//
+// 共同点：
 //   box: 无 DFL，直接距离回归（reg_max=1）→ x1=(j+0.5-l)*stride（与 yolo26 detect 一致）
 //   cls: logit → sigmoid，one2one 头 + 分数塌缩 → 排序 topk + 框 NMS 抑制重叠
 //   mask: mask = sigmoid(proto @ coeff) → 阈值 → resize 到检测框
+// ⚠ 融合布局下 4 通道 box 张量会被误当"框+类"读（cls 从 ch4 起）→ 必须按布局分支解码。
 
 namespace {
 
@@ -92,6 +98,84 @@ static int process_y26_seg_scale(const void* tensor, Y26TensorType ttype, int32_
     return valid;
 }
 
+// 拆分布局（split10）每尺度解码：box_i[1,4,H,W] / cls_i[1,nc,H,W] / mask_i[1,32,H,W] 三个独立张量。
+// 与 detect/obb split 同理：box/cls/mask 各用各的 zp/scale，int8 域 argmax 保留（与融合版一致）。
+static int process_y26_seg_scale_split(const void* box_t, const void* cls_t, const void* mask_t,
+                                       Y26TensorType ttype_box, Y26TensorType ttype_cls, Y26TensorType ttype_mask,
+                                       int32_t zp_box, float sc_box,
+                                       int32_t zp_cls, float sc_cls,
+                                       int32_t zp_mask, float sc_mask,
+                                       bool nhwc, int grid_h, int grid_w, int stride,
+                                       int class_num, int mask_dim, float logit_threshold, bool cls_sigmoided,
+                                       std::vector<float>& boxes, std::vector<float>& scores,
+                                       std::vector<int>& classIds, std::vector<float>& maskCoeffs)
+{
+    const int grid_len = grid_h * grid_w;
+    const int box_ch = 4;
+    const int cls_ch = class_num;
+    const int mask_ch = mask_dim;
+    int valid = 0;
+
+    auto read_of = [&](const void* tensor, Y26TensorType ttype, int32_t zp, float sc,
+                       int ch, int ci, int off) -> float {
+        const int idx = nhwc ? off * ch + ci : ci * grid_len + off;
+        if (ttype == Y26TensorType::kInt8) {
+            return (static_cast<const int8_t*>(tensor)[idx] - zp) * sc;
+        }
+        return y26_tensor_at(tensor, ttype, idx);
+    };
+
+    for (int i = 0; i < grid_h; ++i) {
+        for (int j = 0; j < grid_w; ++j) {
+            const int off = i * grid_w + j;
+            int bestc = -1;
+            float best_logit = -1e9f;
+
+            if (ttype_cls == Y26TensorType::kInt8) {
+                const int8_t* qptr = static_cast<const int8_t*>(cls_t);
+                int8_t max_q = -128;
+                for (int c = 0; c < class_num; ++c) {
+                    const int8_t q = nhwc ? qptr[off * cls_ch + c] : qptr[c * grid_len + off];
+                    if (q > max_q) { max_q = q; bestc = c; }
+                }
+                if (bestc < 0) continue;
+                best_logit = (max_q - zp_cls) * sc_cls;
+            } else {
+                for (int c = 0; c < class_num; ++c) {
+                    const float v = y26_tensor_at(cls_t, ttype_cls, nhwc ? off * cls_ch + c : c * grid_len + off);
+                    if (v > best_logit) { best_logit = v; bestc = c; }
+                }
+                if (bestc < 0) continue;
+            }
+
+            if (best_logit < logit_threshold) continue;
+
+            const float l = read_of(box_t, ttype_box, zp_box, sc_box, box_ch, 0, off);
+            const float t = read_of(box_t, ttype_box, zp_box, sc_box, box_ch, 1, off);
+            const float r = read_of(box_t, ttype_box, zp_box, sc_box, box_ch, 2, off);
+            const float b = read_of(box_t, ttype_box, zp_box, sc_box, box_ch, 3, off);
+
+            const float x1 = (j + 0.5f - l) * stride;
+            const float y1 = (i + 0.5f - t) * stride;
+            const float x2 = (j + 0.5f + r) * stride;
+            const float y2 = (i + 0.5f + b) * stride;
+
+            boxes.push_back(x1);
+            boxes.push_back(y1);
+            boxes.push_back(x2 - x1);
+            boxes.push_back(y2 - y1);
+            scores.push_back(cls_sigmoided ? best_logit : sigmoidf(best_logit));
+            classIds.push_back(bestc);
+
+            for (int m = 0; m < mask_dim; ++m) {
+                maskCoeffs.push_back(read_of(mask_t, ttype_mask, zp_mask, sc_mask, mask_ch, m, off));
+            }
+            ++valid;
+        }
+    }
+    return valid;
+}
+
 // 提取 proto 到 (mask_h*mask_w) x mask_dim 的 float Mat（每行一个像素的系数）
 static bool build_y26_proto(rknn_app_context_t* app_ctx, rknn_output* outputs, int proto_index,
                             cv::Mat& proto, int& mask_dim, int& mask_h, int& mask_w)
@@ -159,6 +243,10 @@ int post_process_yolov26_seg(rknn_app_context_t* app_ctx, void* outputs, letterb
     if (output_count < 2) return 0;
     const int proto_index = output_count - 1;
 
+    // 拆分布局（split10）：3 尺度 × (box_i[4] + cls_i[nc] + mask_i[32]) + proto，共 10 输出；
+    // 融合布局为 3 × [4+nc+32] + proto，共 4 输出。与 detect/obb 的拆分方案同根源同配置。
+    const bool split_layout = (output_count >= 7 && output_count % 3 == 1);
+
     const bool keep_mask = get_seg_mask_enabled();
     cv::Mat proto;
     int mask_dim = 0, mask_h = 0, mask_w = 0;
@@ -183,9 +271,12 @@ int post_process_yolov26_seg(rknn_app_context_t* app_ctx, void* outputs, letterb
     const int class_count = app_ctx->class_num > 0 ? app_ctx->class_num : get_obj_class_num();
 
     // 方案2 自适应：首帧扫描 cls 值域判定语义（proto 输出已由共享函数排除）
+    // 拆分布局下 cls 张量独占输出（cls_start=0），box/mask/proto 通道数 < class_count 自动被排除
     if (app_ctx->cls_is_sigmoided == 0) {
-        app_ctx->cls_is_sigmoided = y26_scan_cls_sigmoided(app_ctx, _outputs, class_count, 4);
-        printf("[yolo26-seg] cls 输出判定: %s\n",
+        const int scan_cls_start = split_layout ? 0 : 4;
+        app_ctx->cls_is_sigmoided = y26_scan_cls_sigmoided(app_ctx, _outputs, class_count, scan_cls_start);
+        printf("[yolo26-seg] 布局: %s | cls 输出判定: %s\n",
+               split_layout ? "拆分 box/cls/mask" : "融合 box+cls+mask",
                app_ctx->cls_is_sigmoided == 1 ? "已 sigmoid（概率域，跳过二次 sigmoid）" : "logits（需 sigmoid）");
     }
     const bool cls_sigmoided = (app_ctx->cls_is_sigmoided == 1);
@@ -193,20 +284,44 @@ int post_process_yolov26_seg(rknn_app_context_t* app_ctx, void* outputs, letterb
     // 置信度阈值：已 sigmoid → 概率域直接用 conf；logits → 转 logit 域 ln(conf/(1-conf))
     const float logit_thr = y26_conf_to_logit_threshold(cls_sigmoided, conf_threshold);
 
-    for (int i = 0; i < proto_index; ++i) {
-        const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
-        const bool nhwc = attr.fmt != RKNN_TENSOR_NCHW;
-        const int grid_h = nhwc ? attr.dims[1] : attr.dims[2];
-        const int grid_w = nhwc ? attr.dims[2] : attr.dims[3];
-        const int channels = nhwc ? attr.dims[3] : attr.dims[1];
-        if (channels <= 4 + class_count || grid_h <= 0 || grid_w <= 0) continue;
-        const int cur_mask_dim = std::min(channels - 4 - class_count, mask_dim);
-        if (cur_mask_dim <= 0) continue;
-        const int stride = model_in_h / grid_h;
-        const Y26TensorType ttype = y26_tensor_type_from_attr(app_ctx->is_quant, attr.type);
-        process_y26_seg_scale(_outputs[i].buf, ttype, attr.zp, attr.scale, nhwc,
-                              grid_h, grid_w, stride, class_count, cur_mask_dim, logit_thr, cls_sigmoided,
-                              boxes, scores, classIds, maskCoeffs);
+    if (split_layout) {
+        // 拆分布局：每尺度 3 个输出（box/cls/mask），proto 为最后一个
+        const int nl = proto_index / 3;
+        for (int i = 0; i < nl; ++i) {
+            const rknn_tensor_attr& ab = app_ctx->output_attrs[3 * i];
+            const rknn_tensor_attr& ac = app_ctx->output_attrs[3 * i + 1];
+            const rknn_tensor_attr& am = app_ctx->output_attrs[3 * i + 2];
+            const bool nhwc = ab.fmt != RKNN_TENSOR_NCHW;
+            const int grid_h = nhwc ? ab.dims[1] : ab.dims[2];
+            const int grid_w = nhwc ? ab.dims[2] : ab.dims[3];
+            if (grid_h <= 0 || grid_w <= 0) continue;
+            const int stride = model_in_h / grid_h;
+            process_y26_seg_scale_split(
+                _outputs[3 * i].buf, _outputs[3 * i + 1].buf, _outputs[3 * i + 2].buf,
+                y26_tensor_type_from_attr(app_ctx->is_quant, ab.type),
+                y26_tensor_type_from_attr(app_ctx->is_quant, ac.type),
+                y26_tensor_type_from_attr(app_ctx->is_quant, am.type),
+                ab.zp, ab.scale, ac.zp, ac.scale, am.zp, am.scale,
+                nhwc, grid_h, grid_w, stride,
+                class_count, mask_dim, logit_thr, cls_sigmoided,
+                boxes, scores, classIds, maskCoeffs);
+        }
+    } else {
+        for (int i = 0; i < proto_index; ++i) {
+            const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
+            const bool nhwc = attr.fmt != RKNN_TENSOR_NCHW;
+            const int grid_h = nhwc ? attr.dims[1] : attr.dims[2];
+            const int grid_w = nhwc ? attr.dims[2] : attr.dims[3];
+            const int channels = nhwc ? attr.dims[3] : attr.dims[1];
+            if (channels <= 4 + class_count || grid_h <= 0 || grid_w <= 0) continue;
+            const int cur_mask_dim = std::min(channels - 4 - class_count, mask_dim);
+            if (cur_mask_dim <= 0) continue;
+            const int stride = model_in_h / grid_h;
+            const Y26TensorType ttype = y26_tensor_type_from_attr(app_ctx->is_quant, attr.type);
+            process_y26_seg_scale(_outputs[i].buf, ttype, attr.zp, attr.scale, nhwc,
+                                  grid_h, grid_w, stride, class_count, cur_mask_dim, logit_thr, cls_sigmoided,
+                                  boxes, scores, classIds, maskCoeffs);
+        }
     }
 
     const int validCount = static_cast<int>(scores.size());

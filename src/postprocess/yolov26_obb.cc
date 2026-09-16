@@ -8,18 +8,24 @@
 #include <math.h>
 #include <opencv2/imgproc.hpp>
 
-// YOLO26 OBB 后处理（非 end2end 原始头，one2one 头）
+// YOLO26 OBB 后处理（非 end2end 原始头，one2one 头），双布局自适应：
 //
-// 输出布局：3 x [1, 4+1+nc, H, W]（NCHW）或 [1, H, W, 4+1+nc]（NHWC），每尺度独立 zp/scale。
-// **通道序（板端探针实测）：4 box + 1 angle + nc cls**
-//   0-3: box 直接距离 l,t,r,b（reg_max=1，网格单位），解码按 ultralytics dist2rbox:
-//       dx=(r-l)/2, dy=(b-t)/2；cx = dx*cos(angle) - dy*sin(angle) + (j+0.5)
-//       cy = dx*sin(angle) + dy*cos(angle) + (i+0.5)；w=l+r, h=t+b；再 ×stride
-//   4:   angle —— **原始弧度**（探针实测值域约 [-0.9, 0.9]；OBB26 头无 sigmoid，
-//       训练损失直接与弧度目标比较并按 π 周期包裹）
-//   5..4+nc: cls logit（未 sigmoid）
-//   ⚠ 布局坑：不是 [box, cls, angle]！若按 [box, cls, angle] 读会把 angle 当 cls
-//     （score 恒≈0.7、类全错）且把负 cls logit 当 angle（旋转乱飞）。
+// 1) 融合布局（旧）：每尺度一个张量
+//      [1, 4+1+nc, H, W]（NCHW）或 [1, H, W, 4+1+nc]（NHWC）
+//    通道序（板端探针实测）：4 box + 1 angle + nc cls
+//      0-3: box 直接距离 l,t,r,b（reg_max=1，网格单位），解码按 ultralytics dist2rbox:
+//          dx=(r-l)/2, dy=(b-t)/2；cx = dx*cos(angle) - dy*sin(angle) + (j+0.5)
+//          cy = dx*sin(angle) + dy*cos(angle) + (i+0.5)；w=l+r, h=t+b；再 ×stride
+//      4:   angle —— **原始弧度**（探针实测值域约 [-0.9, 0.9]；OBB26 头无 sigmoid，
+//          训练损失直接与弧度目标比较并按 π 周期包裹）
+//      5..4+nc: cls logit（未 sigmoid）
+//      ⚠ 布局坑：不是 [box, cls, angle]！若按 [box, cls, angle] 读会把 angle 当 cls
+//        （score 恒≈0.7、类全错）且把负 cls logit 当 angle（旋转乱飞）。
+//
+// 2) 拆分布局（split6，新，量化友好）：每尺度两个张量成对出现
+//      boxangle [1, 5, H, W]（4 box + 1 angle，值域接近共享 scale）
+//      cls      [1, nc, H, W] 独立张量独占 scale —— 结构性避免 cls 极端负 logits 撑爆共享步长
+//
 // one2one 头本应免 NMS，但分数塌缩让相邻 cell 同时命中 → 加旋转 IoU NMS 抑制重叠
 
 namespace {
@@ -30,6 +36,7 @@ struct Y26OBBCandidate {
     int cls;
 };
 
+// ---- 融合布局：单尺度解码（box+angle+cls 同一张量）----
 static int process_y26_obb_scale(const void* tensor, Y26TensorType ttype, int32_t zp, float scale,
                                  bool nhwc, int grid_h, int grid_w, int stride,
                                  int class_num, float logit_threshold, bool cls_sigmoided,
@@ -101,6 +108,87 @@ static int process_y26_obb_scale(const void* tensor, Y26TensorType ttype, int32_
     }
     return valid;
 }
+
+// ---- 拆分布局（split6）：单尺度解码（boxangle 与 cls 是两个独立张量，各带 zp/scale）----
+static int process_y26_obb_scale_split(const void* ba_tensor, Y26TensorType ba_ttype,
+                                       int32_t ba_zp, float ba_scale, bool ba_nhwc,
+                                       const void* cls_tensor, Y26TensorType cls_ttype,
+                                       int32_t cls_zp, float cls_scale, bool cls_nhwc,
+                                       int grid_h, int grid_w, int stride,
+                                       int class_num, float logit_threshold, bool cls_sigmoided,
+                                       std::vector<Y26OBBCandidate>& cands)
+{
+    const int grid_len = grid_h * grid_w;
+    const int ba_channels = 5;  // box(4) + angle(1)
+    int valid = 0;
+
+    auto read_ba = [&](int ci, int off) -> float {
+        const int idx = ba_nhwc ? off * ba_channels + ci : ci * grid_len + off;
+        if (ba_ttype == Y26TensorType::kInt8) {
+            return (static_cast<const int8_t*>(ba_tensor)[idx] - ba_zp) * ba_scale;
+        }
+        return y26_tensor_at(ba_tensor, ba_ttype, idx);
+    };
+    auto read_cls = [&](int c, int off) -> float {
+        const int idx = cls_nhwc ? off * class_num + c : c * grid_len + off;
+        if (cls_ttype == Y26TensorType::kInt8) {
+            return (static_cast<const int8_t*>(cls_tensor)[idx] - cls_zp) * cls_scale;
+        }
+        return y26_tensor_at(cls_tensor, cls_ttype, idx);
+    };
+
+    for (int i = 0; i < grid_h; ++i) {
+        for (int j = 0; j < grid_w; ++j) {
+            const int off = i * grid_w + j;
+            int bestc = -1;
+            float best_logit = -1e9f;
+
+            if (cls_ttype == Y26TensorType::kInt8) {
+                // int8 域内找最大（反量化单调），避免逐类反量化
+                const int8_t* qptr = static_cast<const int8_t*>(cls_tensor);
+                int8_t max_q = -128;
+                for (int c = 0; c < class_num; ++c) {
+                    const int8_t q = cls_nhwc ? qptr[off * class_num + c] : qptr[c * grid_len + off];
+                    if (q > max_q) { max_q = q; bestc = c; }
+                }
+                if (bestc < 0) continue;
+                best_logit = (max_q - cls_zp) * cls_scale;
+            } else {
+                for (int c = 0; c < class_num; ++c) {
+                    const float v = read_cls(c, off);
+                    if (v > best_logit) { best_logit = v; bestc = c; }
+                }
+                if (bestc < 0) continue;
+            }
+
+            if (best_logit < logit_threshold) continue;
+
+            const float l = read_ba(0, off);
+            const float t = read_ba(1, off);
+            const float r = read_ba(2, off);
+            const float b = read_ba(3, off);
+            const float angle = read_ba(4, off);
+
+            const float dx = (r - l) * 0.5f;
+            const float dy = (b - t) * 0.5f;
+            const float cos_a = cosf(angle);
+            const float sin_a = sinf(angle);
+
+            Y26OBBCandidate c;
+            c.cx = (dx * cos_a - dy * sin_a + j + 0.5f) * stride;
+            c.cy = (dx * sin_a + dy * cos_a + i + 0.5f) * stride;
+            c.w = (l + r) * stride;
+            c.h = (t + b) * stride;
+            c.angle = angle;
+            c.score = cls_sigmoided ? best_logit : sigmoidf(best_logit);
+            c.cls = bestc;
+            cands.push_back(c);
+            ++valid;
+        }
+    }
+    return valid;
+}
+
 // 旋转框 NMS（OpenCV rotatedRectangleIntersection 算旋转 IoU）。
 // one2one 头在 INT8 分数塌缩下会让目标周围多个相邻 cell 同时命中（score≈0.5），
 // 不抑制会产生大量重叠旋转框（量化角度各异 → 视觉上"乱飞"）。
@@ -157,10 +245,20 @@ int post_process_yolov26_obb(rknn_app_context_t* app_ctx, void* outputs, letterb
     const int model_in_h = app_ctx->model_height;
     const int class_count = app_ctx->class_num > 0 ? app_ctx->class_num : get_obj_class_num();
 
-    // 方案2 自适应：首帧扫描 cls 值域判定语义（OBB cls 在 ch5 起，ch4 是 angle）
+    // 布局自适应：存在 channels==5 的输出 → 拆分布局（boxangle/cls 成对独立张量）
+    bool split_layout = false;
+    for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i) {
+        const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
+        const int ch = (attr.fmt == RKNN_TENSOR_NCHW) ? attr.dims[1] : attr.dims[3];
+        if (ch == 5) { split_layout = true; break; }
+    }
+
+    // 方案2 自适应：首帧扫描 cls 值域判定语义（融合布局 cls 在 ch5 起；拆分布局 cls 张量独占、从 ch0 起）
     if (app_ctx->cls_is_sigmoided == 0) {
-        app_ctx->cls_is_sigmoided = y26_scan_cls_sigmoided(app_ctx, _outputs, class_count, 5);
-        printf("[yolo26-obb] cls 输出判定: %s\n",
+        app_ctx->cls_is_sigmoided = y26_scan_cls_sigmoided(app_ctx, _outputs, class_count,
+                                                           split_layout ? 0 : 5);
+        printf("[yolo26-obb] 布局: %s | cls 输出判定: %s\n",
+               split_layout ? "拆分 boxangle/cls" : "融合 box+angle+cls",
                app_ctx->cls_is_sigmoided == 1 ? "已 sigmoid（概率域，跳过二次 sigmoid）" : "logits（需 sigmoid）");
     }
     const bool cls_sigmoided = (app_ctx->cls_is_sigmoided == 1);
@@ -168,19 +266,60 @@ int post_process_yolov26_obb(rknn_app_context_t* app_ctx, void* outputs, letterb
     // 置信度阈值：已 sigmoid → 概率域直接用 conf；logits → 转 logit 域 ln(conf/(1-conf))
     const float logit_thr = y26_conf_to_logit_threshold(cls_sigmoided, conf_threshold);
 
-    for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i) {
-        const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
-        const bool nhwc = attr.fmt != RKNN_TENSOR_NCHW;
-        const int grid_h = nhwc ? attr.dims[1] : attr.dims[2];
-        const int grid_w = nhwc ? attr.dims[2] : attr.dims[3];
-        const int channels = nhwc ? attr.dims[3] : attr.dims[1];
-        if (channels <= 5 || grid_h <= 0 || grid_w <= 0) continue;
-        const int cls_num = std::min(channels - 5, class_count);
-        if (cls_num <= 0) continue;
-        const int stride = model_in_h / grid_h;
-        const Y26TensorType ttype = y26_tensor_type_from_attr(app_ctx->is_quant, attr.type);
-        process_y26_obb_scale(_outputs[i].buf, ttype, attr.zp, attr.scale, nhwc,
-                              grid_h, grid_w, stride, cls_num, logit_thr, cls_sigmoided, cands);
+    if (split_layout) {
+        // 拆分布局：按网格尺寸把 boxangle(5ch) 与 cls(nc ch) 成对配对
+        std::vector<int> ba_idx, cls_idx;
+        for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i) {
+            const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
+            const bool nhwc = attr.fmt != RKNN_TENSOR_NCHW;
+            const int ch = nhwc ? attr.dims[3] : attr.dims[1];
+            (ch == 5 ? ba_idx : cls_idx).push_back(static_cast<int>(i));
+        }
+        for (int bi : ba_idx) {
+            const rknn_tensor_attr& ba = app_ctx->output_attrs[bi];
+            const bool ba_nhwc = ba.fmt != RKNN_TENSOR_NCHW;
+            const int grid_h = ba_nhwc ? ba.dims[1] : ba.dims[2];
+            const int grid_w = ba_nhwc ? ba.dims[2] : ba.dims[3];
+            if (grid_h <= 0 || grid_w <= 0) continue;
+            // 找同网格的 cls 张量
+            int ci = -1;
+            for (int cj : cls_idx) {
+                const rknn_tensor_attr& ca = app_ctx->output_attrs[cj];
+                const bool c_nhwc = ca.fmt != RKNN_TENSOR_NCHW;
+                const int ch2 = c_nhwc ? ca.dims[3] : ca.dims[1];
+                const int gh2 = c_nhwc ? ca.dims[1] : ca.dims[2];
+                const int gw2 = c_nhwc ? ca.dims[2] : ca.dims[3];
+                if (ch2 != 5 && gh2 == grid_h && gw2 == grid_w) { ci = cj; break; }
+            }
+            if (ci < 0) continue;
+            const rknn_tensor_attr& ca = app_ctx->output_attrs[ci];
+            const bool c_nhwc = ca.fmt != RKNN_TENSOR_NCHW;
+            const int c_ch = c_nhwc ? ca.dims[3] : ca.dims[1];
+            const int cls_num = std::min(c_ch, class_count);
+            if (cls_num <= 0) continue;
+            const int stride = model_in_h / grid_h;
+            process_y26_obb_scale_split(
+                _outputs[bi].buf, y26_tensor_type_from_attr(app_ctx->is_quant, ba.type),
+                ba.zp, ba.scale, ba_nhwc,
+                _outputs[ci].buf, y26_tensor_type_from_attr(app_ctx->is_quant, ca.type),
+                ca.zp, ca.scale, c_nhwc,
+                grid_h, grid_w, stride, cls_num, logit_thr, cls_sigmoided, cands);
+        }
+    } else {
+        for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i) {
+            const rknn_tensor_attr& attr = app_ctx->output_attrs[i];
+            const bool nhwc = attr.fmt != RKNN_TENSOR_NCHW;
+            const int grid_h = nhwc ? attr.dims[1] : attr.dims[2];
+            const int grid_w = nhwc ? attr.dims[2] : attr.dims[3];
+            const int channels = nhwc ? attr.dims[3] : attr.dims[1];
+            if (channels <= 5 || grid_h <= 0 || grid_w <= 0) continue;
+            const int cls_num = std::min(channels - 5, class_count);
+            if (cls_num <= 0) continue;
+            const int stride = model_in_h / grid_h;
+            const Y26TensorType ttype = y26_tensor_type_from_attr(app_ctx->is_quant, attr.type);
+            process_y26_obb_scale(_outputs[i].buf, ttype, attr.zp, attr.scale, nhwc,
+                                  grid_h, grid_w, stride, cls_num, logit_thr, cls_sigmoided, cands);
+        }
     }
 
     if (cands.empty()) {
