@@ -18,7 +18,7 @@ jobs:
       matrix:
         compiler: [gcc, clang]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af68
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install deps
         run: |
           sudo apt-get update
@@ -42,7 +42,7 @@ jobs:
     # CMake 已保证 prebuilt 检查先于所有第三方依赖,runner 无需预装任何包。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af68
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Configure without prebuilt (expect clear failure)
         run: |
           if cmake -B build-full 2>err.log; then
