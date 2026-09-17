@@ -32,7 +32,7 @@ depth_dist_scale: 1.0     # 距离标定系数（实测米数/模型输出米数
 # ---- 近距告警（可选）：满足阈值时向 webhook POST {"event":"near_distance",...}，
 #      并在 alert_snapshot_dir 保存现场抓图；alert_interval_s 与计数告警共用去抖窗口
 #alert_enabled: 1
-#alert_webhook_url: "http://192.168.1.10:9000/alert"
+#alert_webhook_url: "http://192.0.2.10:9000/alert"
 #alert_interval_s: 5.0
-#alert_snapshot_dir: "/userdata/rk_pipe/snapshots"
+#alert_snapshot_dir: "/userdata/rkpipe/snapshots"
 
