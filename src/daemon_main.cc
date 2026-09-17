@@ -316,7 +316,7 @@ static void printUsage(const char* prog) {
         "  --bind <addr>          API/预览 bind 地址 (default: 0.0.0.0)\n"
         "  --base-port <n>        预览端口起始 (default: 8090)\n"
         "  --quality <1-100>      MJPEG 质量 (default: 60，内嵌监控画面够用)\n"
-        "  --dump-dir <path>      生成的 yaml/log 目录 (default: /tmp/rk_pipe_daemon)\n"
+        "  --dump-dir <path>      生成的 yaml/log 目录 (default: <root>/daemon_runs)\n"
         "  --bin <path>           console_detector 路径\n"
         "  --root <path>          rk_pipe 根目录（模型/label 查找）\n"
         "  --metrics-file <path>  给每个子进程注入 RK_PIPE_METRICS_FILE=<path>.<id>\n"
@@ -448,6 +448,9 @@ int main(int argc, char** argv) {
     if (const char* env = std::getenv("RK_PIPE_ROOT_DIR"); env && env[0]) {
         g_opt.root_dir = env;
     }
+    if (const char* env = std::getenv("RK_PIPE_DUMP_DIR"); env && env[0]) {
+        g_opt.dump_dir = env;
+    }
     if (g_opt.api_token.empty()) {
         if (const char* env = std::getenv("RK_PIPE_API_TOKEN"); env && env[0]) {
             g_opt.api_token = env;
@@ -459,6 +462,33 @@ int main(int argc, char** argv) {
             g_opt.housekeep_s = v;
         }
     }
+    // 路径默认值：空值由可执行文件位置反推（<repo>/build/rk_pipe_daemon -> <repo>），
+    // 避免把某一仓的绝对路径写死进源码（开源仓默认指向私有仓是错的）。
+    if (g_opt.root_dir.empty() || g_opt.bin_path.empty() || g_opt.dump_dir.empty()) {
+        std::string repo;
+        std::error_code ex_ec;
+        const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ex_ec);
+        if (!ex_ec && !self.empty()) {
+            const std::filesystem::path cand = self.parent_path().parent_path();
+            std::error_code dir_ec;
+            if (std::filesystem::is_directory(cand, dir_ec) && !dir_ec) {
+                repo = cand.string();
+            }
+        }
+        if (repo.empty()) {
+            repo = "/userdata/rkpipe";  // /proc 不可用时的传统部署位置
+        }
+        if (g_opt.root_dir.empty()) {
+            g_opt.root_dir = repo;
+        }
+        if (g_opt.bin_path.empty()) {
+            g_opt.bin_path = g_opt.root_dir + "/build/console_detector";
+        }
+        if (g_opt.dump_dir.empty()) {
+            g_opt.dump_dir = g_opt.root_dir + "/daemon_runs";
+        }
+    }
+
     std::error_code ec;
     std::filesystem::create_directories(g_opt.dump_dir, ec);
 

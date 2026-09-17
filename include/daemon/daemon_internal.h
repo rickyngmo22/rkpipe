@@ -101,9 +101,12 @@ struct DaemonOptions {
     int api_port = 8099;
     int base_port = 8090;
     int quality = 60;  // 监控面板内嵌多路 MJPEG，画质不需太高，省带宽
-    std::string dump_dir = "/tmp/rk_pipe_daemon";
-    std::string bin_path = "/userdata/rk_pipe/build/console_detector";
-    std::string root_dir = "/userdata/rk_pipe";
+    // 运行目录：子进程 yaml/log、events.jsonl、dynamic_tasks.json 都落在此。
+    // 空 = <root_dir>/daemon_runs（即 /userdata 下，而非 /tmp）——/tmp 会被系统
+    // 清理，REST 热加的任务与事件历史会随之丢失。
+    std::string dump_dir;
+    std::string bin_path;   // 空 = <root_dir>/build/console_detector
+    std::string root_dir;   // 空 = 由 /proc/self/exe 反推仓根
     std::string metrics_file;
     double watch_s = 2.0;
     bool restart_on_failure = false;

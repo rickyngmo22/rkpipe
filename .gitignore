@@ -59,3 +59,5 @@ tools/eval/远程评测与数据集框架设计.md
 
 # 线框诊断用证据数据（dump + 截图，体积大且非源码）
 tools/evidence/
+
+*.bak
