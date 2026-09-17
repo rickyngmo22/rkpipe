@@ -19,6 +19,7 @@
 
 ### 修复
 - **完整构建模式 `rk_pipe_unit_tests` 链接失败**：`RKPIPE_MODULE_SOURCES` 的 GLOB 列表不含 `src/daemon/`，而 `rk_pipe_daemon` 是自包含目标，单测因此缺 daemon 符号（`g_tasks` / `g_opt` / `allocPort` 未定义）；已为完整构建单测补齐 daemon 实现源（不含 `daemon_main.cc`）
+- **daemon 运行目录落在 `/tmp`**：`--dump-dir` 默认 `/tmp/rk_pipe_daemon`，系统清理后 REST 热加的任务（`dynamic_tasks.json`）与事件历史（`events.jsonl`）随之丢失、重启无法恢复；默认改为 `<repo>/daemon_runs`（`/userdata` 下）。同时 `root_dir`/`bin_path` 不再硬编码（此前默认指向另一仓的 `console_detector`，克隆后必然起不来），改由 `/proc/self/exe` 反推仓根，并新增 `RK_PIPE_DUMP_DIR` 环境变量
 
 ### 变更
 - **预编译核心库 `prebuilt/aarch64/librkpipe_core.a` 重发布**：私有仓 `RK_PIPE_CORE_DIST=ON` 重建（`AppConfig` 成员布局变更，需与核心库同步发布）
