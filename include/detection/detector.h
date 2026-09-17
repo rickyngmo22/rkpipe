@@ -102,7 +102,6 @@ protected:
     virtual bool modelIsOCRDet() const { return false; }
     virtual bool modelIsDepth() const { return false; }
     virtual bool modelIsSem() const { return false; }
-    virtual bool modelIsDetect3D() const { return false; }
 
     rknn_app_context_t appCtx_{};
     ModelInfo mi_{};
@@ -235,19 +234,6 @@ protected:
     int runInference(image_buffer_t* src, letterbox_t* lb, void* results) override;
     int extractResultCount(void* results) const override;
     bool modelIsSem() const override { return true; }
-};
-
-// YOLO26 Detect3D（单目 3D）：单输出 [1,300,14]（2D 框 + 深度/朝向/3D 尺寸），免 NMS
-class YOLOv26Detect3DDetector : public Detector {
-public:
-    YOLOv26Detect3DDetector();
-    ~YOLOv26Detect3DDetector() override { release(); }
-protected:
-    int initModel(const std::string& path) override;
-    int releaseModel() override;
-    int runInference(image_buffer_t* src, letterbox_t* lb, void* results) override;
-    int extractResultCount(void* results) const override;
-    bool modelIsDetect3D() const override { return true; }
 };
 
 // RTMPose 两阶段姿态（task="rtmpose"）：

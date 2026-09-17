@@ -2,6 +2,28 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/),版本遵循语义化版本。
 
+## [0.3.1] - 2026-09-17
+
+### 移除（BREAKING）
+- **旧 detect3d 任务（YOLO26-Detect3D / KITTI 单目 3D 头）整体下线**：KITTI 权重在自有场景深度泛化差，由 D3 线框（`detect` + `aux depth` 接地采样 + P2 几何反推）取代。
+  - 删除 `TaskType::Detect3D`、`Detect3DTaskResult`、`YOLOv26Detect3DDetector`、`post_process_yolov26_detect3d`、`inference_yolov26_detect3d_model`、`detect3dDecodeRow*` / `detect3dMapToFrame`、`drawDetect3DResultsBGR`、`set_detect3d_depth_scale` 与 `detect3d_depth_scale` 配置键
+  - `--task` 不再接受 `detect3d`；控制台「新增任务」下拉移除该选项
+  - `postprocess/detect3d_decode.h` 精简为仅保留投影纯函数 `Detect3DItem` + `computeDetect3DCorners2D`（D3 线框复用）；`task_result.h` 结果变体移除 `Detect3DTaskResult`
+
+### 新增（D3 3D 线框 / 路线 B）
+- **`detect` + `aux_task: depth` 组合新增 3D 包围盒线框**：框底接地带深度中值（避开遮挡/背景）→ 几何反推（`h=ph·Z/fy`、`l=pw·Z/fx`、`w=l×宽长比`）→ 8 角点经 P2 投影画 12 条棱。纯函数在 `include/utils/detect3d_from_depth.h`，进 CI 单测
+- **距离门限 `detect3d_min_depth_m`（默认 8.0）**：单目 + 单个 2D 框无法约束 3D 长方体沿车长方向的延伸，近距车线框必然溢出画面（信息量极限，非参数可调）；板端实测 8m 起「线框宽/2D框宽」比值 1.08、溢出率 0，故默认 8.0，近距车仅保留 2D 框 + 距离文字
+- **绘制开关 `depth_pseudo` / `detect_box_draw`**：可输出只含 3D 线框的干净画面；`tracking_runtime` 增加 `draw_boxes` 参数支持「只跟踪不画框」
+- 配置键 `detect3d_p2` / `detect3d_alpha_deg`（朝向先验）/ `detect3d_ground_band`（接地采样带）保持不变，现服务 D3 组合；`detect3d_p2` 默认主点由图像中心修正为道路消失点
+- 示例配置 `configs/run_yolo26_detect_depth3d.yaml`；文档 `docs/demo_detect3d.md`（实现 + P2 标定）、`docs/depth_accuracy.md`（深度精度评估与已排除方案）；诊断工具 `tools/diagnose_detect3d.js`（框稳定性 / 几何自洽性 / 溢出 vs 距离）
+
+### 修复
+- **完整构建模式 `rk_pipe_unit_tests` 链接失败**：`RKPIPE_MODULE_SOURCES` 的 GLOB 列表不含 `src/daemon/`，而 `rk_pipe_daemon` 是自包含目标，单测因此缺 daemon 符号（`g_tasks` / `g_opt` / `allocPort` 未定义）；已为完整构建单测补齐 daemon 实现源（不含 `daemon_main.cc`）
+
+### 变更
+- **预编译核心库 `prebuilt/aarch64/librkpipe_core.a` 重发布**：私有仓 `RK_PIPE_CORE_DIST=ON` 重建（`AppConfig` 成员布局变更，需与核心库同步发布）
+- 单测：`testDetect3DDecode`（KITTI 解码）替换为 `testDetect3DProjection`（D3 线框投影）；完整构建 1466 checks / CI 模式 496 checks 全绿，边界自检通过
+
 ## [0.3.0] - 2026-09-16
 
 ### 恢复（二级流水线全量回归）

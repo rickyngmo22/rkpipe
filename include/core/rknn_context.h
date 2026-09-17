@@ -16,7 +16,7 @@ typedef struct {
     int model_height;
     bool is_quant;
     // FP16 模型直接取原始 fp16 输出（want_float=0），省去 runtime 的 fp16→fp32 转换拷贝；
-    // 仅当后处理支持 fp16 直读（如 detect3d readRow）时由 init 函数置 true
+    // 仅当后处理支持 fp16 直读的自研后处理头时由 init 函数置 true
     bool out_native_fp16;
     int class_num;
     // yolo26 detect 的 cls 输出语义：-1=logits（需 sigmoid），1=已 sigmoid（值域[0,1]），0=未判定。

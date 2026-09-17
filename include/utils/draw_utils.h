@@ -46,15 +46,27 @@ std::vector<DepthDistanceTarget> drawDepthDistanceOverlayBGR(
     float depth_lo, float depth_hi, const object_detect_result_list& dets,
     float near_m = 0.0f, float scale = 1.0f, bool draw_text = true);
 
-// BGR(CPU) 帧上的单目 3D 检测绘制（Detect3D）：2D 框 + 类别/置信度 + 深度距离 + 3D 尺寸
-// + 3D 投影中心十字标记；配置 P2（set_detect3d_p2）后追加 3D 线框投影。
-void drawDetect3DResultsBGR(cv::Mat& frame, const Detect3DTaskResult& results);
-
-// 设置 Detect3D 线框投影的 P2 矩阵（3x4 行主序 12 值，逗号分隔，如 KITTI cam2 标定）。
+// 2D 检测框/标签绘制开关（detect_box_draw 配置/CLI，默认开）。启动阶段调用一次；
+// 只影响通用 2D 检测叠加（框+类别标签），不影响 3D 线框/距离文字/骨架/掩膜
+void set_detect_box_draw(bool enabled);
+// 设置 3D 线框投影的 P2 矩阵（3x4 行主序 12 值，逗号分隔，如 KITTI cam2 标定）。
 // 空串/解析失败 = 不绘制线框。运行时启动阶段调用一次。
 void set_detect3d_p2(const std::string& p2_spec);
-// Detect3D 深度全局缩放（场景尺度校准：单目深度在非训练场景上常有整体偏差，线框过大则调大）
-void set_detect3d_depth_scale(float scale);
+
+// D3 3D 线框（路线 B）：2D 检测框 + aux depth 模型接地深度 + P2 几何反推 3D 包围盒。
+// 尺寸 h=ph·Z/fy、l=pw·Z/fx（侧视先验）、w=l×宽长比；朝向用 alpha_deg 先验（0=侧视）。
+// 与 detect3d 任务解耦：本函数供 detect+depth 组合任务调用，P2 复用 set_detect3d_p2 全局。
+// P2 未配置时静默跳过（不绘制）。depth 为 CV_8UC1 反相深度图（近=亮）。
+// min_depth_m：接地深度小于此值的车**不画线框**（只保留 2D 框/距离文字）。
+//   原因见 app_config.h detect3d_min_depth_m 的实测说明——近距离下 3D 长方体投影
+//   必然溢出画面，属单目信息量极限，非参数可调。<=0 表示不限。
+void drawDetect3DWireframeOverlayBGR(cv::Mat& frame, const cv::Mat& depth, const cv::Rect* roi,
+                                     float depth_lo, float depth_hi,
+                                     const object_detect_result_list& dets,
+                                     float scale = 1.0f, float alpha_deg = 0.0f,
+                                     float ground_band = 0.3f,
+                                     float min_depth_m = 0.0f);
+
 // 语义分割伪彩叠加：class_map 为 CV_8UC1 类别索引图（低分辨率有效区），放大到 roi 并按 alpha 混合。
 // 前 19 类用 Cityscapes 标准色，其余类别用黄金角 HSV 伪彩兜底。
 void drawSemResultsBGR(cv::Mat& frame, const cv::Mat& class_map, int class_num, const cv::Rect* roi = nullptr, double alpha = 0.6);

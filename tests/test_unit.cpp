@@ -698,79 +698,9 @@ static void testEventEngineSpeedRef() {
     CHECK(vcfg.validate(&err));
 }
 
-// Detect3D（单目 3D）：14 列行解码 + letterbox 逆映射（纯函数）
-static void testDetect3DDecode() {
-    std::printf("[test] detect3d decode\n");
-    // 行布局: [x1,y1,x2,y2, conf, cls, cx3d,cy3d, depth, sin,cos, h3,w3,l3]
-    const float row[14] = {100.f, 50.f, 300.f, 200.f, 0.87f, 0.f,
-                           200.f, 190.f, 12.5f, 0.6f, 0.8f, 1.5f, 1.8f, 4.1f};
-    Detect3DItem it = detect3dDecodeRow(row);
-    CHECK(it.box.left == 100 && it.box.top == 50 && it.box.right == 300 && it.box.bottom == 200);
-    CHECK(std::fabs(it.conf - 0.87f) < 1e-6f);
-    CHECK(it.cls_id == 0);
-    CHECK(std::fabs(it.depth_m - 12.5f) < 1e-5f);
-    CHECK(std::fabs(it.h3 - 1.5f) < 1e-6f && std::fabs(it.w3 - 1.8f) < 1e-6f && std::fabs(it.l3 - 4.1f) < 1e-6f);
-
-    // letterbox 逆映射：模型 416x1280，原帧 832x1280（scale=0.5, 无 pad, crop=0）
-    letterbox_t lb{};
-    lb.scale = 0.5f;
-    lb.x_pad = 0.f;
-    lb.y_pad = 0.f;
-    lb.crop_x = 0;
-    lb.crop_y = 0;
-    lb.crop_w = 1280;
-    lb.crop_h = 832;
-    detect3dMapToFrame(it, &lb, 1280, 416, 1280, 832);
-    CHECK(it.box.left == 200 && it.box.top == 100 && it.box.right == 600 && it.box.bottom == 400);
-    CHECK(it.center_u == 400 && it.center_v == 380);
-
-    // 带 pad + crop：模型坐标先减 pad 再除 scale 加 crop，并裁剪到原帧
-    Detect3DItem it2 = detect3dDecodeRow(row);
-    letterbox_t lb2{};
-    lb2.scale = 1.0f;
-    lb2.x_pad = 10.f;
-    lb2.y_pad = 20.f;
-    lb2.crop_x = 5;
-    lb2.crop_y = 6;
-    lb2.crop_w = 100;
-    lb2.crop_h = 100;
-    detect3dMapToFrame(it2, &lb2, 1280, 416, 640, 480);
-    CHECK(it2.box.left == 95 && it2.box.top == 36 && it2.box.right == 295 && it2.box.bottom == 186);
-    CHECK(it2.center_u == 195 && it2.center_v == 176);
-
-    // 无 letterbox（scale<=0）：坐标视为已归一化，仅裁剪
-    Detect3DItem it3 = detect3dDecodeRow(row);
-    detect3dMapToFrame(it3, nullptr, 1280, 416, 150, 100);
-    CHECK(it3.box.right == 149 && it3.box.bottom == 99);
-
-    // 板端布局（38 列）：原始量，解码全在 C++
-    float row38[38] = {0};
-    row38[0] = 10.f; row38[1] = 20.f; row38[2] = 60.f; row38[3] = 80.f;  // 框：中心(35,50) 尺寸(50,60)
-    row38[4] = 0.10f; row38[5] = 0.90f; row38[6] = 0.30f;               // cls=1 (Pedestrian)
-    row38[7] = 0.1f; row38[8] = -0.5f;                                   // 中心偏移
-    row38[9] = std::log(9.5f);                                           // log 深度
-    row38[10] = 0.0f; row38[11] = 0.0f; row38[12] = 0.0f;                // 尺寸残差 0 → 先验原值
-    row38[13] = -3.0f;                                                   // q3d（忽略）
-    row38[14 + 3] = 5.0f;                                                // bin3 胜出
-    row38[26 + 3] = 1.0f;                                                // 残差 tanh(1.0)
-    Detect3DItem b = detect3dDecodeRowCols(row38, 38);
-    CHECK(b.box.left == 10 && b.box.bottom == 80);
-    CHECK(std::fabs(b.conf - 0.90f) < 1e-6f);
-    CHECK(b.cls_id == 1);
-    // 中心 = 框中心 + 偏移×框宽高：(35+0.1*50, 50-0.5*60) = (40, 20)
-    CHECK(std::fabs(b.center_u - 40.0f) < 1e-4f);
-    CHECK(std::fabs(b.center_v - 20.0f) < 1e-4f);
-    CHECK(std::fabs(b.depth_m - 9.5f) < 1e-4f);
-    // 尺寸 = Pedestrian 先验 × exp(0)
-    CHECK(std::fabs(b.h3 - 1.76f) < 1e-4f);
-    CHECK(std::fabs(b.w3 - 0.66f) < 1e-4f);
-    CHECK(std::fabs(b.l3 - 0.84f) < 1e-4f);
-    // multibin：alpha = 3×(2π/12) + tanh(1)×(π/12)
-    const float bin_size = 2.0f * static_cast<float>(M_PI) / 12.0f;
-    const float alpha = 3.0f * bin_size + std::tanh(1.0f) * (bin_size * 0.5f);
-    CHECK(std::fabs(b.sin_alpha - std::sin(alpha)) < 1e-5f);
-    CHECK(std::fabs(b.cos_alpha - std::cos(alpha)) < 1e-5f);
-
+// 3D 线框投影（D3 路线 B 共用：aux depth 接地采样 → Detect3DItem → P2 投影）
+static void testDetect3DProjection() {
+    std::printf("[test] detect3d wireframe projection\n");
     // 3D 线框投影：简单内参 P2（fx=fy=100, cx=cy=50）手算对照
     // 目标：3D 底面中心 (0,0,10)；sin=0,cos=1 → ry=atan2(0,1)=0（车长沿相机 x 轴，
     // 2026-09-02 约定修正：模型 sin/cos 即最终 ry，不再叠加 theta）
@@ -2534,7 +2464,7 @@ int main() {
     testCtcDecode();
     testPoseSequence();
     testRetinafaceDecode();
-    testDetect3DDecode();
+    testDetect3DProjection();
     testPerformanceAverage();
     testDetectionFilter();
     testTurbojpeg();

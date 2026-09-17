@@ -86,3 +86,49 @@ inline bool boxDepthMeters(const cv::Mat& depth, const cv::Rect& roi, const imag
     *meters = depthPixelToMeters(samples[mid], depth_lo, depth_hi, scale);
     return *meters >= 0.0f && *meters <= depth_hi * scale + 1e-3f;
 }
+
+// 框底"接地带"深度中值 → 米：路侧车辆侧视时框底 ≈ 车轮接地，
+// 深度最可靠（整框中值会被车窗/透视背景污染，框顶甚至可能是远处天空）。
+// 采样区 = 框底部 band_ratio 高度 × 水平中部 60%（避开左右遮挡/邻车）。
+// band_ratio<=0 或 >=1 时回退整框高度。
+// 返回 false 表示框无效或框内无有效深度像素。
+inline bool boxGroundDepthMeters(const cv::Mat& depth, const cv::Rect& roi, const image_rect_t& box,
+                                 float depth_lo, float depth_hi, float scale,
+                                 float band_ratio, float* meters) {
+    if (meters == nullptr || depth.empty() || depth_hi <= depth_lo) {
+        return false;
+    }
+    cv::Rect full;
+    if (!mapBoxToDepthRect(box, roi, depth.size(), &full)) {
+        return false;
+    }
+    float br = band_ratio;
+    if (!(br > 0.0f && br < 1.0f)) {
+        br = 1.0f;
+    }
+    const int band_h = std::max(1, static_cast<int>(static_cast<float>(full.height) * br + 0.5f));
+    cv::Rect sub(full.x + full.width * 2 / 10, full.y + full.height - band_h,
+                 std::max(1, full.width * 6 / 10), band_h);
+    sub &= cv::Rect(0, 0, depth.cols, depth.rows);
+    if (sub.width <= 0 || sub.height <= 0) {
+        return false;
+    }
+    // 抽样步长：单框最多约 4k 样本
+    const int step = std::max(1, static_cast<int>(
+                                    std::sqrt(static_cast<double>(sub.width) * sub.height / 4096.0)));
+    std::vector<int> samples;
+    samples.reserve((sub.width / step + 1) * (sub.height / step + 1));
+    for (int y = sub.y; y < sub.y + sub.height; y += step) {
+        const uint8_t* row = depth.ptr<uint8_t>(y);
+        for (int x = sub.x; x < sub.x + sub.width; x += step) {
+            samples.push_back(row[x]);
+        }
+    }
+    if (samples.empty()) {
+        return false;
+    }
+    const size_t mid = samples.size() / 2;
+    std::nth_element(samples.begin(), samples.begin() + mid, samples.end());
+    *meters = depthPixelToMeters(samples[mid], depth_lo, depth_hi, scale);
+    return *meters >= 0.0f && *meters <= depth_hi * scale + 1e-3f;
+}

@@ -31,9 +31,5 @@ int inference_yolov26_depth_model(rknn_app_context_t* app_ctx, image_buffer_t* p
 int init_yolov26_sem_model(const char* model_path, rknn_app_context_t* app_ctx);
 int inference_yolov26_sem_model(rknn_app_context_t* app_ctx, image_buffer_t* preprocessed_img, letterbox_t* letter_box, cv::Mat* class_map_out, float conf_threshold, float nms_threshold);
 
-// YOLO26 Detect3D（单目 3D，Ultralytics feat/detect3d）：单输出 [1,300,14] 已解码免 NMS，
-// 结果写入 Detect3DTaskResult*（模型坐标，Detector 层做 letterbox 逆映射）
-int init_yolov26_detect3d_model(const char* model_path, rknn_app_context_t* app_ctx);
-int inference_yolov26_detect3d_model(rknn_app_context_t* app_ctx, image_buffer_t* preprocessed_img, letterbox_t* letter_box, Detect3DTaskResult* d3_out, float conf_threshold, float nms_threshold);
 
 #endif //_RKNN_DEMO_YOLOV26_H_

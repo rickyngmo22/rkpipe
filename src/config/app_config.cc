@@ -191,11 +191,18 @@ bool AppConfig::loadFromFile(const std::string& filename) {
     readDoubleFromAnyKey(fs, {"action_interval"}, action_interval);
     readStringFromAnyKey(fs, {"action_norm"}, action_norm);
     // D3 检测+单目测距（需 aux_task=depth）
+    readBoolFromAnyKey(fs, {"detect_box_draw"}, detect_box_draw);
+    readBoolFromAnyKey(fs, {"depth_pseudo"}, depth_pseudo);
     readBoolFromAnyKey(fs, {"depth_dist_text"}, depth_dist_text);
     readFloatFromAnyKey(fs, {"depth_dist_near_m", "depth_dist_near"}, depth_dist_near_m);
     readFloatFromAnyKey(fs, {"depth_dist_scale"}, depth_dist_scale);
     readStringFromAnyKey(fs, {"detect3d_p2"}, detect3d_p2);
-    readFloatFromAnyKey(fs, {"detect3d_depth_scale"}, detect3d_depth_scale);
+    // D3 3D 线框（路线 B，需 aux_task=depth + detect3d_p2）
+    readBoolFromAnyKey(fs, {"detect3d_wireframe"}, detect3d_wireframe);
+    readFloatFromAnyKey(fs, {"detect3d_alpha_deg", "detect3d_alpha"}, detect3d_alpha_deg);
+    readFloatFromAnyKey(fs, {"detect3d_ground_band"}, detect3d_ground_band);
+    readFloatFromAnyKey(fs, {"detect3d_min_depth_m", "detect3d_min_depth"},
+                        detect3d_min_depth_m);
     // 事件规则引擎（D1/D2）
     readStringFromAnyKey(fs, {"event_region"}, event_region);
     readStringFromAnyKey(fs, {"event_line"}, event_line);
@@ -579,11 +586,17 @@ void AppConfig::printSummary() const {
     std::printf("  aux_model_path: %s\n", aux_model_path.empty() ? "<empty>" : aux_model_path.c_str());
     std::printf("  person_model_path: %s\n", person_model_path.empty() ? "<empty>" : person_model_path.c_str());
     std::printf("  rtmpose_head_path: %s\n", rtmpose_head_path.empty() ? "<empty>" : rtmpose_head_path.c_str());
+    std::printf("  detect_box_draw: %d\n", detect_box_draw ? 1 : 0);
+    std::printf("  depth_pseudo: %d\n", depth_pseudo ? 1 : 0);
     std::printf("  depth_dist_text: %d\n", depth_dist_text ? 1 : 0);
     std::printf("  depth_dist_near_m: %.2f\n", depth_dist_near_m);
     std::printf("  depth_dist_scale: %.3f\n", depth_dist_scale);
     std::printf("  detect3d_p2: %s\n", detect3d_p2.empty() ? "<empty>" : "configured");
-    std::printf("  detect3d_depth_scale: %.3f\n", detect3d_depth_scale);
+    std::printf("  detect3d_wireframe: %d\n", detect3d_wireframe ? 1 : 0);
+    std::printf("  detect3d_alpha_deg: %.1f\n", detect3d_alpha_deg);
+    std::printf("  detect3d_ground_band: %.2f\n", detect3d_ground_band);
+    std::printf("  detect3d_min_depth_m: %.2f%s\n", detect3d_min_depth_m,
+                detect3d_min_depth_m > 0.0f ? " (近于此距离的车只画 2D 框)" : " (不限)");
     std::printf("  event_region: %s\n", event_region.empty() ? "<empty>" : event_region.c_str());
     std::printf("  event_line: %s\n", event_line.empty() ? "<empty>" : event_line.c_str());
     std::printf("  event_classes: %s\n", event_classes.empty() ? "<all>" : event_classes.c_str());
@@ -759,6 +772,16 @@ void AppConfig::warnConflicts() const {
              "depth_dist_text/depth_dist_near_m 需要 aux_model_path + aux_task=depth 的辅助模型；"
              "当前未启用 depth 辅助任务，距离标注与近距告警不会生效");
     }
+    if (detect3d_wireframe &&
+        (aux_model_path.empty() || lowerAscii(aux_task) != "depth")) {
+        warn("conflict-d3d-wireframe",
+             "detect3d_wireframe 需要 aux_model_path + aux_task=depth 的深度辅助模型；"
+             "当前未启用 depth 辅助任务，3D 线框不会绘制");
+    }
+    if (detect3d_wireframe && detect3d_p2.empty()) {
+        warn("conflict-d3d-wireframe-p2",
+             "detect3d_wireframe 已开启但 detect3d_p2 未配置，3D 线框不会绘制");
+    }
 
     if (any_warning) {
         std::printf("--------------------------------------------------------------------------------\n");
@@ -771,14 +794,20 @@ void AppConfig::printUsage(const char* program_name) {
     std::printf("  --model <path>       Path to model file\n");
     std::printf("  --input/--video <path> Path to input video\n");
     std::printf("  --output-video <path> Path to output video\n");
-    std::printf("  --task <detect/pose/obb/seg/ocr_det/depth/sem/detect3d/rtmpose> Detection task type\n");
+    std::printf("  --task <detect/pose/obb/seg/ocr_det/depth/sem/rtmpose> Detection task type\n");
     std::printf("  --person-model <path> Stage-1 person detection model for task=rtmpose\n");
     std::printf("  --rtmpose-head <path> Split-deploy head model for task=rtmpose (model_path=feat)\n");
     std::printf("  --aux-model <path>  Auxiliary model for multi-task combo (detect+depth/pose etc., Y5)\n");
     std::printf("  --aux-task <task>   Auxiliary task type (default: detect)\n");
     std::printf("  --depth-dist-text   Annotate estimated distance (m) per box (requires --aux-task depth)\n");
+    std::printf("  --depth-pseudo <0|1>   Draw depth auxiliary pseudo-color overlay (default 1)\n");
+    std::printf("  --detect-box-draw <0|1>  Draw 2D detection boxes/labels (default 1; 0 = only 3D wireframe)\n");
     std::printf("  --depth-dist-near <m>   Near-distance threshold in meters: red box + near_distance alert (0=off)\n");
     std::printf("  --depth-dist-scale <f>  Distance calibration factor, applied to model output (default 1.0)\n");
+    std::printf("  --detect3d-wireframe Enable D3 3D wireframe (2D box + aux depth + detect3d_p2, requires --aux-task depth)\n");
+    std::printf("  --detect3d-alpha-deg <f> Vehicle heading prior in degrees: 0=side view (default), 90=front/rear view\n");
+    std::printf("  --detect3d-ground-band <f> Ground sampling band as fraction of box height (default 0.3)\n");
+    std::printf("  --detect3d-min-depth <m> Min distance for 3D wireframe; nearer vehicles get 2D box only (default 8.0, 0=no limit)\n");
     std::printf("  --dump-detections <file> Export per-frame detect results as JSONL (COCO mAP eval)\n");
     std::printf("  --action-model <path>  ST-GCN action model for task=pose cascade (M13)\n");
     std::printf("  --action-labels <path> Action label file, one name per line (aligned with model output)\n");
@@ -910,6 +939,8 @@ AppConfig AppConfig::fromCommandLine(int argc, char** argv) {
         {"person-model", required_argument, 0, 1005},
         {"rtmpose-head", required_argument, 0, 1006},
         {"depth-dist-text", no_argument, 0, 1002},
+        {"detect-box-draw", required_argument, 0, 1017},
+        {"depth-pseudo", required_argument, 0, 1016},
         {"depth-dist-near", required_argument, 0, 1003},
         {"depth-dist-scale", required_argument, 0, 1004},
         {"dump-detections", required_argument, 0, 1007},
@@ -918,6 +949,10 @@ AppConfig AppConfig::fromCommandLine(int argc, char** argv) {
         {"action-window-t", required_argument, 0, 1010},
         {"action-interval", required_argument, 0, 1011},
         {"action-norm", required_argument, 0, 1012},
+        {"detect3d-wireframe", no_argument, 0, 1013},
+        {"detect3d-alpha-deg", required_argument, 0, 1014},
+        {"detect3d-ground-band", required_argument, 0, 1015},
+        {"detect3d-min-depth", required_argument, 0, 1018},
         {0, 0, 0, 0}
     };
 
@@ -976,8 +1011,26 @@ AppConfig AppConfig::fromCommandLine(int argc, char** argv) {
             case 1011:
                 config.action_interval = std::atof(optarg);
                 break;
+            case 1017:
+                config.detect_box_draw = std::atoi(optarg) != 0;
+                break;
+            case 1016:
+                config.depth_pseudo = std::atoi(optarg) != 0;
+                break;
             case 1012:
                 config.action_norm = optarg;
+                break;
+            case 1013:
+                config.detect3d_wireframe = true;
+                break;
+            case 1014:
+                config.detect3d_alpha_deg = parseFloatArg(optarg);
+                break;
+            case 1015:
+                config.detect3d_ground_band = parseFloatArg(optarg);
+                break;
+            case 1018:
+                config.detect3d_min_depth_m = parseFloatArg(optarg);
                 break;
             case 'd':
                 config.mode = optarg;

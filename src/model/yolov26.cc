@@ -19,10 +19,42 @@ int init_yolov26_model(const char *model_path, rknn_app_context_t *app_ctx)
 
     if (app_ctx->io_num.n_output >= 1 && app_ctx->output_attrs)
     {
-        // 非 end2end 头：每尺度一个张量 [1, 4+nc, H, W]，4 通道为直接距离回归（reg_max=1）
-        const rknn_tensor_attr &attr = app_ctx->output_attrs[0];
-        int channels = (attr.fmt == RKNN_TENSOR_NCHW) ? attr.dims[1] : attr.dims[3];
-        int class_num = channels - 4;
+        // 布局自适应：
+        //   融合布局（旧）：每尺度一个张量 [1, 4+nc, H, W]，4 通道为直接距离回归（reg_max=1）
+        //   拆分布局（新）：box [1, 4, H, W] 与 cls [1, nc, H, W] 成对，量化时各张量独立 scale
+        // 判定：存在 channels==4 的输出张量即认为拆分布局（要求 nc != 4）
+        auto y26_ch = [](const rknn_tensor_attr &a) {
+            return (a.fmt == RKNN_TENSOR_NCHW) ? a.dims[1] : a.dims[3];
+        };
+        bool split_layout = false;
+        for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i)
+        {
+            if (y26_ch(app_ctx->output_attrs[i]) == 4)
+            {
+                split_layout = true;
+                break;
+            }
+        }
+
+        int class_num = 0;
+        if (split_layout)
+        {
+            for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i)
+            {
+                const int ch = y26_ch(app_ctx->output_attrs[i]);
+                if (ch != 4)
+                {
+                    class_num = ch;
+                    break;
+                }
+            }
+            printf("YOLO26 detect: split box/cls layout, %u outputs\n", app_ctx->io_num.n_output);
+        }
+        else
+        {
+            class_num = y26_ch(app_ctx->output_attrs[0]) - 4;
+        }
+
         if (class_num <= 0)
         {
             class_num = get_obj_class_num();
@@ -118,10 +150,41 @@ int init_yolov26_obb_model(const char *model_path, rknn_app_context_t *app_ctx)
 
     if (app_ctx->io_num.n_output >= 1 && app_ctx->output_attrs)
     {
-        // 非 end2end OBB 头：channels = 4(box) + nc(cls) + 1(angle)，类数 = channels - 5
-        const rknn_tensor_attr &attr = app_ctx->output_attrs[0];
-        int channels = (attr.fmt == RKNN_TENSOR_NCHW) ? attr.dims[1] : attr.dims[3];
-        int class_num = channels - 5;
+        // 布局自适应：
+        //   融合布局：channels = 4(box) + nc(cls) + 1(angle)，类数 = channels - 5
+        //   拆分布局：boxangle [1,5,H,W] 与 cls [1,nc,H,W] 成对，cls 独立 scale
+        auto y26o_ch = [](const rknn_tensor_attr &a) {
+            return (a.fmt == RKNN_TENSOR_NCHW) ? a.dims[1] : a.dims[3];
+        };
+        bool split_layout = false;
+        for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i)
+        {
+            if (y26o_ch(app_ctx->output_attrs[i]) == 5)
+            {
+                split_layout = true;
+                break;
+            }
+        }
+
+        int class_num = 0;
+        if (split_layout)
+        {
+            for (uint32_t i = 0; i < app_ctx->io_num.n_output; ++i)
+            {
+                const int ch = y26o_ch(app_ctx->output_attrs[i]);
+                if (ch != 5)
+                {
+                    class_num = ch;
+                    break;
+                }
+            }
+            printf("YOLO26 OBB: split boxangle/cls layout, %u outputs\n", app_ctx->io_num.n_output);
+        }
+        else
+        {
+            class_num = y26o_ch(app_ctx->output_attrs[0]) - 5;
+        }
+
         if (class_num <= 0)
         {
             class_num = get_obj_class_num();
@@ -170,14 +233,29 @@ int init_yolov26_seg_model(const char *model_path, rknn_app_context_t *app_ctx)
 
     if (app_ctx->io_num.n_output >= 2 && app_ctx->output_attrs)
     {
-        // seg 头：3 尺度 [4 box + nc cls + nm mask]，最后输出是 proto [nm, H, W]
+        // seg 头两种布局（最后输出都是 proto [nm, H, W]）：
+        //   融合:   3 尺度 [4 box + nc cls + nm mask] + proto，共 4 输出
+        //   拆分:   3 尺度 × (box_i[4] + cls_i[nc] + mask_i[nm]) + proto，共 10 输出
         const int proto_idx = app_ctx->io_num.n_output - 1;
         const rknn_tensor_attr &proto_attr = app_ctx->output_attrs[proto_idx];
         int mask_dim = (proto_attr.fmt == RKNN_TENSOR_NCHW) ? proto_attr.dims[1] : proto_attr.dims[3];
 
-        const rknn_tensor_attr &attr = app_ctx->output_attrs[0];
-        int channels = (attr.fmt == RKNN_TENSOR_NCHW) ? attr.dims[1] : attr.dims[3];
-        int class_num = channels - 4 - mask_dim;
+        int class_num;
+        if (app_ctx->io_num.n_output >= 7 && app_ctx->io_num.n_output % 3 == 1)
+        {
+            // 拆分布局：cls 张量独占输出，class_num 直接从 output_attrs[1] 通道数读取
+            // （旧逻辑对 box 的 4 通道推出 0，只能回退 get_obj_class_num()，非 80 类模型会错）
+            const rknn_tensor_attr &cls_attr = app_ctx->output_attrs[1];
+            class_num = (cls_attr.fmt == RKNN_TENSOR_NCHW) ? cls_attr.dims[1] : cls_attr.dims[3];
+            printf("Model layout: Seg split (box/cls/mask per scale)\n");
+        }
+        else
+        {
+            const rknn_tensor_attr &attr = app_ctx->output_attrs[0];
+            int channels = (attr.fmt == RKNN_TENSOR_NCHW) ? attr.dims[1] : attr.dims[3];
+            class_num = channels - 4 - mask_dim;
+            printf("Model layout: Seg fused (box+cls+mask per scale)\n");
+        }
         if (class_num <= 0)
         {
             class_num = get_obj_class_num();
@@ -286,37 +364,3 @@ int inference_yolov26_sem_model(rknn_app_context_t *app_ctx, image_buffer_t *pre
                               });
 }
 
-int init_yolov26_detect3d_model(const char *model_path, rknn_app_context_t *app_ctx)
-{
-    int ret = init_rknn_model(model_path, app_ctx);
-    if (ret < 0)
-    {
-        return ret;
-    }
-
-    // 后处理 readRow 支持 fp16 直读：跳过 runtime 的 fp16→fp32 转换拷贝
-    app_ctx->out_native_fp16 = true;
-
-    // Detect3D 头：单输出 [1, 300, 14]（end2end 已解码）。KITTI 3 类：Car/Pedestrian/Cyclist，
-    // 输出张量本身不含类别维度，直接固定，避免配置自检误告警
-    app_ctx->class_num = 3;
-    printf("Model type: Detect3D (YOLO26, KITTI Car/Pedestrian/Cyclist)\n");
-    if (app_ctx->io_num.n_output >= 1 && app_ctx->output_attrs)
-    {
-        const rknn_tensor_attr &attr = app_ctx->output_attrs[0];
-        if (attr.n_dims >= 2)
-        {
-            printf("Detect3D output: [%d x %d] (rows x cols, expect 300 x 14)\n",
-                   attr.dims[attr.n_dims - 2], attr.dims[attr.n_dims - 1]);
-        }
-    }
-    return ret;
-}
-
-int inference_yolov26_detect3d_model(rknn_app_context_t *app_ctx, image_buffer_t *preprocessed_img, letterbox_t *letter_box, Detect3DTaskResult *d3_out, float conf_threshold, float nms_threshold)
-{
-    return run_rknn_inference(app_ctx, preprocessed_img, letter_box, conf_threshold, nms_threshold, d3_out,
-                              [](rknn_app_context_t *ctx, void *outputs, letterbox_t *lb, float conf, float nms, void *results) {
-                                  return post_process_yolov26_detect3d(ctx, outputs, lb, conf, static_cast<Detect3DTaskResult *>(results));
-                              });
-}

@@ -143,7 +143,8 @@ void renderPipelineTrackingOutput(const AppConfig& options,
                                   PipelineFrame& frame,
                                   SimpleObjectTracker& tracker,
                                   std::unordered_map<int, int>& class_counts,
-                                  std::vector<TrackedDetection>* tracked_out) {
+                                  std::vector<TrackedDetection>* tracked_out,
+                                  bool draw_boxes) {
     if (!frame.hasResult) {
         if (tracked_out) {
             tracked_out->clear();
@@ -163,7 +164,8 @@ void renderPipelineTrackingOutput(const AppConfig& options,
     if (tracked_out) {
         *tracked_out = tracked;  // 无输出叠加时也要回传（事件引擎按帧消费）
     }
-    if (!output_enabled) {
+    // draw_boxes=false：tracking 结果与 class_counts 已回填，仅跳过 2D 框/标签绘制
+    if (!output_enabled || !draw_boxes) {
         return;
     }
 

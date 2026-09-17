@@ -1,0 +1,71 @@
+%YAML:1.0
+---
+# D3 3D 线框（路线 B）：主任务 detect（yolo26n split6）+ aux depth（yolo26n_depth）
+# 每个 2D 框：接地带深度采样 → 几何反推 3D 包围盒 → detect3d_p2 投影画 12 棱线框
+# 深度/尺寸不来自 KITTI 3D 头回归，跨场景泛化优于 detect3d 任务（见 docs/demo_detect3d.md）
+model_path: "/userdata/rkpipe/model/yolo26n.rknn"
+input_path: "/userdata/rk_pipe/test_videos/baseline17.mp4"
+output_video_path: ""
+output_backend: "ffmpeg"
+web_preview: 1
+web_preview_bind: "0.0.0.0"
+web_preview_port: 8095
+web_preview_quality: 85
+web_preview_mode: "replay"
+web_preview_eof_linger_ms: 1500
+web_preview_replay_pace: 0
+web_preview_scale: 0.9
+task: "detect"
+aux_model_path: "/userdata/rkpipe/model/yolo26n_depth.rknn"
+aux_task: "depth"
+mode: "pipeline"
+thread_count: 9
+gui: 0
+local: 0
+label_path: "/userdata/rkpipe/model/coco_80_labels_list.txt"
+obj_class_num: 80
+
+# ---- D3 检测+单目测距 ----
+depth_pseudo: 0           # 不画深度伪彩
+detect_box_draw: 0        # 不画 2D 检测框，只留 3D 线框（+距离文字）
+depth_dist_text: 1        # 检测框左上角标注估计距离（米）
+depth_dist_near_m: 0.0    # 冒烟关闭近距告警
+# 距离标定系数（真实米数 / 模型输出米数）。**当前 1.0 是未标定的默认值。**
+# 2026-09-17 分析（docs/depth_accuracy.md）：该素材上模型输出疑似偏大 2~3 倍，
+# 但不能凭单帧手工框断定，需卷尺实测。标定流程与已排除方案见该文档。
+# ⚠️ 改本值与改 fx 是**耦合**的（k = fx / depth_dist_scale 才是线框等效旋钮）：
+#    改 scale 会同时改变距离文字和 3D 线框。正确顺序：先标 scale（距离可信），再调 fx（线框形状）。
+depth_dist_scale: 1.0
+
+# ---- D3 3D 线框（路线 B）----
+detect3d_wireframe: 1
+detect3d_alpha_deg: 0.0   # 侧视先验：路侧车沿路停放/行驶（像素宽≈车长）
+detect3d_ground_band: 0.3 # 接地采样带 = 框底部 30%
+#
+# P2 = [fx 0 cx 0; 0 fy cy 0; 0 0 1 0]（3x4 行主序，12 值）
+#
+# 2026-09-17 更新：主点从「图像中心」改为**道路消失点**。
+#   旧值 "600 0 960 0 0 600 540 0 0 0 1 0" 中主点是图像中心 (960,540)，
+#   但相机有俯仰角时真实主点低于图像中心 —— 实测该素材低约 95px（俯仰角约 +9°），
+#   用图像中心会让 3D 线框**整体偏低**。
+#   新主点 (990, 634.5) 来源：
+#     - cx=990：docs/demo_detect3d.md 记录的**人工实测道路消失点**；
+#     - cy=634.5：tools/estimate_p2_from_video.py 在 baseline17.mp4 上的自动估计
+#       （多组采样下稳定在 634~635，std_y 62px，与上述人工实测 630 吻合）。
+#   工具：python3 tools/estimate_p2_from_video.py --video <素材> --hfov <视场角> --visualize out.jpg
+#   ⚠️ 该工具横向分量（cx）标准差较大、不完全可信，务必看标注图人工核验后再采信。
+#   fx=fy=599.87 由 hfov≈116° 推算（1920/2 / tan(58°)）。行车记录仪 hfov 110~125°。
+#
+# ⚠️ 仍是估算而非棋盘格标定。有相机时用 tools/calibrate_camera.py 拍棋盘格最准（RMS 可自验）。
+detect3d_p2: "599.8746 0 990.0000 0 0 599.8746 634.4805 0 0 0 1 0"
+
+# ---- 3D 线框最小绘制距离（米）----
+# ★为什么必须设：单目 + 单个 2D 框**无法约束 3D 长方体沿车长方向的延伸**。
+#   4.5m 车长在 2~3m 距离下，长方体投影必然横向摊开远超 2D 框 —— 实测溢出画面
+#   （线框宽可达画面宽 3 倍）。这是单目信息量极限，不是参数可调的问题。
+#   板端实测（baseline17_mid30s，901 帧，3355 个 car 框）「线框宽/2D框宽」比值：
+#     Z 0-5m  → 1.38（33% 溢出画面）      Z 8-12m  → 1.08（0% 溢出）
+#     Z 5-8m  → 1.37（ 2% 溢出）          Z 12-18m → 1.04（0% 溢出）
+#   取 8.0：保留约 50% 车辆线框，溢出率归 0；近距车仍画 2D 框 + 距离文字，信息不丢。
+#   0 = 关闭门限（旧行为，近距车线框会溢出画面）。
+detect3d_min_depth_m: 8.0

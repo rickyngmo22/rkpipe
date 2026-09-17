@@ -95,9 +95,6 @@ std::unique_ptr<Detector> Detector::createForModel(const std::string& model_path
     if (lower_task == "sem") {
         return std::make_unique<YOLOv26SemDetector>();
     }
-    if (lower_task == "detect3d" || lower_task == "detect_3d") {
-        return std::make_unique<YOLOv26Detect3DDetector>();
-    }
     if (lower_task == "yolo26" || lower_task == "yolov26" || is_yolo26) {
         return std::make_unique<YOLOv26Detector>();
     }
@@ -299,9 +296,6 @@ void Detector::warmup(int input_width, int input_height, int times) {
         } else if (modelIsSem()) {
             SemTaskResult sem;
             runInference(&src, &lb, &sem);
-        } else if (modelIsDetect3D()) {
-            Detect3DTaskResult d3;
-            runInference(&src, &lb, &d3);
         } else {
             object_detect_result_list obj_results;
             runInference(&src, &lb, &obj_results);
@@ -550,71 +544,6 @@ int YOLOv26SemDetector::runInference(image_buffer_t* src, letterbox_t* lb, void*
 int YOLOv26SemDetector::extractResultCount(void* results) const {
     auto* res = static_cast<SemTaskResult*>(results);
     return res->class_map.empty() ? 0 : 1;
-}
-
-YOLOv26Detect3DDetector::YOLOv26Detect3DDetector() : Detector(0.25f) {}
-
-int YOLOv26Detect3DDetector::initModel(const std::string& path) {
-    return init_yolov26_detect3d_model(path.c_str(), &appCtx_);
-}
-
-int YOLOv26Detect3DDetector::releaseModel() {
-    return release_yolov26_model(&appCtx_);
-}
-
-int YOLOv26Detect3DDetector::runInference(image_buffer_t* src, letterbox_t* lb, void* results) {
-    auto* res = static_cast<Detect3DTaskResult*>(results);
-    const int ret = inference_yolov26_detect3d_model(&appCtx_, src, lb, res, conf_, nms_);
-    if (ret == 0 && !res->items.empty()) {
-        // 后处理保持模型输入坐标，这里做 letterbox 逆映射。
-        // 注意：src 是预处理后的模型尺寸 buffer，原帧尺寸必须从 letterbox 的 crop 字段取
-        // （crop_x/crop_y 为有效区在原帧中的偏移，crop_w/crop_h 为原帧有效区宽高）
-        const int model_w = mi_.width > 0 ? mi_.width : appCtx_.model_width;
-        const int model_h = mi_.height > 0 ? mi_.height : appCtx_.model_height;
-        int frame_w = model_w;
-        int frame_h = model_h;
-        if (lb && lb->crop_w > 0 && lb->crop_h > 0) {
-            frame_w = lb->crop_x + lb->crop_w;
-            frame_h = lb->crop_y + lb->crop_h;
-        } else if (src && src->width > 0) {
-            frame_w = src->width;
-            frame_h = src->height;
-        }
-        static const bool dbg = []() {
-            const char* e = getenv("RK_PIPE_DEBUG_D3D");
-            return e && *e && strcmp(e, "0") != 0;
-        }();
-        if (dbg) {
-            std::printf("[d3d-map] model=%dx%d frame=%dx%d lb(scale=%.4f pad=%.1f,%.1f crop=%d,%d,%d,%d) items=%zu\n",
-                        model_w, model_h, frame_w, frame_h,
-                        lb ? lb->scale : -1.f, lb ? lb->x_pad : -1.f, lb ? lb->y_pad : -1.f,
-                        lb ? lb->crop_x : -1, lb ? lb->crop_y : -1, lb ? lb->crop_w : -1, lb ? lb->crop_h : -1,
-                        res->items.size());
-            for (size_t k = 0; k < res->items.size() && k < 2; ++k) {
-                const auto& it = res->items[k];
-                std::printf("[d3d-map]   pre : box=(%d,%d,%d,%d) d=%.2f hwl=(%.2f,%.2f,%.2f) conf=%.3f cls=%d\n",
-                            it.box.left, it.box.top, it.box.right, it.box.bottom,
-                            (double)it.depth_m, (double)it.h3, (double)it.w3, (double)it.l3,
-                            (double)it.conf, it.cls_id);
-            }
-        }
-        for (auto& item : res->items) {
-            detect3dMapToFrame(item, lb, model_w, model_h, frame_w, frame_h);
-        }
-        if (dbg) {
-            for (size_t k = 0; k < res->items.size() && k < 2; ++k) {
-                const auto& it = res->items[k];
-                std::printf("[d3d-map]   post: box=(%d,%d,%d,%d)\n",
-                            it.box.left, it.box.top, it.box.right, it.box.bottom);
-            }
-        }
-    }
-    return ret;
-}
-
-int YOLOv26Detect3DDetector::extractResultCount(void* results) const {
-    auto* res = static_cast<Detect3DTaskResult*>(results);
-    return static_cast<int>(res->items.size());
 }
 
 YOLOv8SegDetector::YOLOv8SegDetector() : Detector(0.4f) {}

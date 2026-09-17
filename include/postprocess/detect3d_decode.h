@@ -1,7 +1,8 @@
 #pragma once
 
-// YOLO26-Detect3D（Ultralytics feat/detect3d，MonoCon 风格单目 3D 头）输出解码纯函数。
-// 支持两种布局（strip_detect3d_topk.py 适配细节见脚本头注释）：
+// 3D 线框投影纯函数（D3 路线 B 共用）：Detect3DItem + P2 → 8 角点图像坐标。
+// 数据来源不绑定 detect3d 任务：KITTI 3D 头回归（旧）或 aux depth 接地采样（现）均可填。
+// 支持两种布局：
 //   原版 [1,300,14]：[x1,y1,x2,y2, conf, cls, cx3d,cy3d,depth,sin,cos,h3,w3,l3]（已解码）
 //   板端 [1,N,38]：原始量，解码全部在本头文件完成（图内只留真机验证过的算子）：
 //     [0:4) 框 [4:7) 类别分数 [7:9) 中心偏移 [9] log深度 [10:13) 尺寸残差 [13] q3d
@@ -25,16 +26,6 @@ struct Detect3DItem {
     float h3 = 0.0f;         // 3D 尺寸（米）：高/宽/长
     float w3 = 0.0f;
     float l3 = 0.0f;
-};
-
-// KITTI 尺寸先验 (h,w,l)，与训练 set_dim_priors 的 known 表一致：
-// 顺序按数据集 names：0=Car, 1=Pedestrian, 2=Cyclist。
-// 板端导出（strip_detect3d_topk.py）的尺寸列为 exp(residual)（先验无关），
-// 解码时按 argmax 类别补乘（规避 NPU 小尺寸 GEMM 列损坏）。
-static const float kDetect3DDimPriors[3][3] = {
-    {1.529757f, 1.618807f, 3.892148f},  // Car
-    {1.760000f, 0.660000f, 0.840000f},  // Pedestrian
-    {1.730000f, 0.600000f, 1.760000f},  // Cyclist
 };
 
 // 3D 线框投影：由检测项 + P2（3x4 行主序，12 值）计算包围盒 8 角点的图像坐标。
@@ -79,118 +70,4 @@ inline bool computeDetect3DCorners2D(const Detect3DItem& it, const float* p2, fl
         out[i][1] = (p2[4] * X3 + p2[5] * Y3 + p2[6] * Z3 + p2[7]) / pw;
     }
     return true;
-}
-
-// 38 列板端布局解码（strip_detect3d_topk.py 深裁剪导出，解码全部在 C++ 完成，
-// 图内只留 Conv/Sigmoid/Mul/Concat/Transpose/Slice 等真机验证过的算子）：
-//   [0:4)   2D 框 x1,y1,x2,y2（模型输入像素）
-//   [4:7)   类别分数（sigmoid，已含 quality^0.5 融合）→ conf=最大值，cls=argmax
-//   [7:9)   3D 中心偏移（相对 2D 框中心，×框宽高还原，框宽高 clamp_min 1.0）
-//   [9]     log 深度 → exp(clamp(ln0.1, ln200))
-//   [10:13) 尺寸残差 → KITTI 先验 × exp(clamp(±4))
-//   [13]    q3d logit（quality 已折进类别分数，忽略）
-//   [14:26) 朝向 bin 分数（12）/[26:38) bin 残差（12）
-//       multibin：bin=argmax(bins)，alpha = bin×(2π/12) + tanh(res[bin])×(π/12)
-inline Detect3DItem detect3dDecodeRowCols(const float* row, int cols) {
-    Detect3DItem it;
-    if (row == nullptr) {
-        return it;
-    }
-    it.box.left = row[0];
-    it.box.top = row[1];
-    it.box.right = row[2];
-    it.box.bottom = row[3];
-    if (cols == 14) {
-        // 原版导出（end2end topk 后）：[box4, conf, cls, 8×d3]，尺寸为最终米值
-        it.conf = row[4];
-        it.cls_id = static_cast<int>(row[5] + 0.5f);
-        it.center_u = row[6];
-        it.center_v = row[7];
-        it.depth_m = row[8];
-        it.sin_alpha = row[9];
-        it.cos_alpha = row[10];
-        it.h3 = row[11];
-        it.w3 = row[12];
-        it.l3 = row[13];
-        return it;
-    }
-    if (cols != 38) {
-        return it;
-    }
-    // 类别分数（已含 quality 融合）
-    int best = 0;
-    for (int c = 1; c < 3; ++c) {
-        if (row[4 + c] > row[4 + best]) {
-            best = c;
-        }
-    }
-    it.conf = row[4 + best];
-    it.cls_id = best;
-    // 3D 中心 = 框中心 + 偏移 × 框宽高（clamp_min 1.0，同导出侧 _inference）
-    const float bcx = (row[0] + row[2]) * 0.5f;
-    const float bcy = (row[1] + row[3]) * 0.5f;
-    const float bw = std::max(row[2] - row[0], 1.0f);
-    const float bh = std::max(row[3] - row[1], 1.0f);
-    it.center_u = bcx + row[7] * bw;
-    it.center_v = bcy + row[8] * bh;
-    // 深度：exp(clamp(log 深度, ln0.1, ln200))
-    it.depth_m = std::exp(std::clamp(row[9], std::log(0.1f), std::log(200.0f)));
-    // 尺寸：KITTI 先验 × exp(clamp(残差, ±4))
-    const int pr = (it.cls_id >= 0 && it.cls_id < 3) ? it.cls_id : 0;
-    it.h3 = kDetect3DDimPriors[pr][0] * std::exp(std::clamp(row[10], -4.0f, 4.0f));
-    it.w3 = kDetect3DDimPriors[pr][1] * std::exp(std::clamp(row[11], -4.0f, 4.0f));
-    it.l3 = kDetect3DDimPriors[pr][2] * std::exp(std::clamp(row[12], -4.0f, 4.0f));
-    // multibin 朝向（sin/cos 对角度 wrap 不敏感，无需归一化）
-    int bin = 0;
-    for (int b = 1; b < 12; ++b) {
-        if (row[14 + b] > row[14 + bin]) {
-            bin = b;
-        }
-    }
-    constexpr float kBinSize = 2.0f * static_cast<float>(M_PI) / 12.0f;
-    const float residual = std::tanh(row[26 + bin]) * (kBinSize * 0.5f);
-    const float alpha = static_cast<float>(bin) * kBinSize + residual;
-    it.sin_alpha = std::sin(alpha);
-    it.cos_alpha = std::cos(alpha);
-    return it;
-}
-
-// 一行 14 列 float → 结构化结果（不做 letterbox 逆映射）
-inline Detect3DItem detect3dDecodeRow(const float* row) {
-    return detect3dDecodeRowCols(row, 14);
-}
-
-// letterbox 逆映射：模型输入坐标 → 原帧坐标（与 detect 后处理同约定：
-// orig = (model - pad) / scale + crop），并裁剪到原帧范围
-inline void detect3dMapToFrame(Detect3DItem& it, const letterbox_t* lb,
-                               int model_w, int model_h, int frame_w, int frame_h) {
-    if (lb == nullptr || lb->scale <= 0.0f) {
-        // 无 letterbox：模型坐标即原帧坐标
-        it.box.left = std::max(0, std::min(frame_w - 1, static_cast<int>(it.box.left)));
-        it.box.top = std::max(0, std::min(frame_h - 1, static_cast<int>(it.box.top)));
-        it.box.right = std::max(0, std::min(frame_w - 1, static_cast<int>(it.box.right)));
-        it.box.bottom = std::max(0, std::min(frame_h - 1, static_cast<int>(it.box.bottom)));
-        it.center_u = std::max(0.0f, std::min(static_cast<float>(frame_w - 1), it.center_u));
-        it.center_v = std::max(0.0f, std::min(static_cast<float>(frame_h - 1), it.center_v));
-        return;
-    }
-    const int crop_left = lb->crop_x;
-    const int crop_top = lb->crop_y;
-    // 约定与 detect 后处理一致：orig = clamp(model - pad) / scale + crop
-    auto map_x = [&](float v) {
-        const float c = std::clamp(v - lb->x_pad, 0.0f, static_cast<float>(model_w));
-        return static_cast<int>(c / lb->scale) + crop_left;
-    };
-    auto map_y = [&](float v) {
-        const float c = std::clamp(v - lb->y_pad, 0.0f, static_cast<float>(model_h));
-        return static_cast<int>(c / lb->scale) + crop_top;
-    };
-    it.box.left = std::max(0, std::min(frame_w - 1, map_x(it.box.left)));
-    it.box.top = std::max(0, std::min(frame_h - 1, map_y(it.box.top)));
-    it.box.right = std::max(0, std::min(frame_w - 1, map_x(it.box.right)));
-    it.box.bottom = std::max(0, std::min(frame_h - 1, map_y(it.box.bottom)));
-    it.center_u = std::max(0.0f, std::min(static_cast<float>(frame_w - 1),
-                                          static_cast<float>(map_x(it.center_u))));
-    it.center_v = std::max(0.0f, std::min(static_cast<float>(frame_h - 1),
-                                          static_cast<float>(map_y(it.center_v))));
 }

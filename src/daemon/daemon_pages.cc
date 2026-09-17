@@ -261,7 +261,7 @@ std::string monitorHtml() {
   <div id="editHead"><span class="title" id="editTitle">修改任务</span><div><button onclick="closeEdit()">关闭</button></div></div>
   <form id="editForm">
     <div class="row"><label>任务类型</label>
-      <select name="task"><option value="detect">detect</option><option value="pose">pose</option><option value="obb">obb</option><option value="seg">seg</option><option value="depth">depth</option><option value="sem">sem</option><option value="ocr_det">ocr_det（文本框检测）</option><option value="ocr">ocr（检测+识别）</option><option value="detect3d">detect3d（单目 3D）</option><option value="face">face（人脸检测）</option><option value="composite_cls">composite_cls（检测+二级分类）</option><option value="rtmpose">rtmpose（两阶段姿态）</option></select>
+      <select name="task"><option value="detect">detect</option><option value="pose">pose</option><option value="obb">obb</option><option value="seg">seg</option><option value="depth">depth</option><option value="sem">sem</option><option value="ocr_det">ocr_det（文本框检测）</option><option value="ocr">ocr（检测+识别）</option><option value="face">face（人脸检测）</option><option value="composite_cls">composite_cls（检测+二级分类）</option><option value="rtmpose">rtmpose（两阶段姿态）</option></select>
     </div>
     <div class="row"><label>输入源</label><input name="input" size="40"></div>
     <div class="row"><label>模型</label><input name="model" size="40" placeholder="留空=按任务类型默认"></div>

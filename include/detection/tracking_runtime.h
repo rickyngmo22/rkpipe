@@ -17,7 +17,10 @@ void renderPipelineTrackingOutput(const AppConfig& options,
                                   PipelineFrame& frame,
                                   SimpleObjectTracker& tracker,
                                   std::unordered_map<int, int>& class_counts,
-                                  std::vector<TrackedDetection>* tracked_out = nullptr);
+                                  std::vector<TrackedDetection>* tracked_out = nullptr,
+                                  // draw_boxes=false：只跑 tracking（事件引擎/统计照常），不画 2D 框与标签
+                                  // （例如只要 3D 线框的干净画面）
+                                  bool draw_boxes = true);
 
 void updateAndRenderTracking(const AppConfig& options,
                              bool output_enabled,
@@ -50,7 +53,7 @@ void renderPipelinePoseTrackingOutput(const AppConfig& options,
                                       PipelineFrame& frame,
                                       SimpleObjectTracker& tracker,
                                       std::unordered_map<int, int>& class_counts,
-                                      std::vector<TrackedDetection>* engine_tracked = nullptr);
+                                    std::vector<TrackedDetection>* engine_tracked = nullptr);
 void renderPipelineOBBTrackingOutput(const AppConfig& options,
                                      bool output_enabled,
                                      PipelineFrame& frame,

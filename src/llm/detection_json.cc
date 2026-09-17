@@ -208,8 +208,6 @@ std::string taskResultToJson(const TaskResult& result, const std::vector<std::st
             lines.push_back({{"text", line.text}, {"score", line.score}});
         }
         json = {{"type", "ocr"}, {"count", lines.size()}, {"items", lines}};
-    } else if (const Detect3DTaskResult* d3 = std::get_if<Detect3DTaskResult>(&result)) {
-        json = {{"type", "detect3d"}, {"count", d3->items.size()}};
     } else if (const CompositeClsTaskResult* cc = std::get_if<CompositeClsTaskResult>(&result)) {
         json = compositeClsToJson(*cc, class_names);
     } else if (const FaceTaskResult* f = std::get_if<FaceTaskResult>(&result)) {

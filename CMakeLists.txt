@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(rkpipe-open VERSION 0.3.0 LANGUAGES C CXX)
+project(rkpipe-open VERSION 0.3.1 LANGUAGES C CXX)
 
 # ===========================================================================
 # rkpipe 构建
@@ -367,6 +367,24 @@ if(BUILD_TESTING)
     target_include_directories(rk_pipe_unit_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${TURBOJPEG_INCLUDE_DIR}
+    )
+    # daemon 监督/控制台模块是自包含目标（rk_pipe_daemon），模块库不含其符号；
+    # 完整构建的单测覆盖 daemon 纯逻辑（端口分配等），此处补齐实现源（不含 daemon_main.cc）
+    target_sources(rk_pipe_unit_tests PRIVATE
+        src/daemon/events_store.cc
+        src/daemon/llm_review.cc
+        src/daemon/daemon_pages.cc
+        src/daemon/daemon_sysinfo.cc
+        src/daemon/daemon_http.cc
+        src/daemon/daemon_supervision.cc
+        src/daemon/daemon_api.cc
+        src/daemon/daemon_prometheus.cc
+        src/daemon/flywheel.cc
+    )
+    target_include_directories(rk_pipe_unit_tests PRIVATE
+        ${PROJECT_SOURCE_DIR}/3rdparty
+        ${LLM_CURL_INCLUDE_DIR}
+        ${OPENCV_INC}
     )
     target_link_libraries(rk_pipe_unit_tests PRIVATE ${RKPIPE_LINK_GROUP} ${RKPIPE_LINK_DEPS})
     foreach(_name IN LISTS RK_PIPE_FULL_TEST_NAMES)

@@ -17,6 +17,7 @@
 #include <arm_neon.h>
 #endif
 #include "postprocess/postprocess.h"
+#include "utils/detect3d_from_depth.h"
 
 // 显示阈值：与默认 conf_threshold(0.25) 对齐。原 0.5 会把低分检测(0.25~0.5)全过滤，
 // 导致分数天然偏低/量化的模型(如 yolo26 INT8)几乎不画框。RK_PIPE_DISPLAY_THRESH 可覆盖。
@@ -37,6 +38,16 @@ float displayThreshold() {
 static bool hideBoxesEnabled() {
     const char* v = std::getenv("RK_PIPE_HIDE_BOXES");
     return v && *v && std::string(v) != "0";
+}
+
+// 2D 检测框/标签绘制开关（detect_box_draw 配置，默认开）。只影响通用 2D 检测叠加，
+// 不影响 3D 线框/距离文字/骨架/掩膜等其他绘制
+static bool g_detect_box_draw = true;
+void set_detect_box_draw(bool enabled) {
+    g_detect_box_draw = enabled;
+}
+static bool detectBoxDrawDisabled() {
+    return !g_detect_box_draw;
 }
 
 // seg 黑底视图（RK_PIPE_SEG_BLACK_BG=1）：整帧背景置黑，只显示掩膜区域。
@@ -1393,7 +1404,7 @@ static bool renderOverlayPrimsNv12(image_buffer_t& frame, const std::vector<Over
 }
 
 bool drawDetectionResultsZeroCopy(image_buffer_t& frame, const object_detect_result_list& results) {
-    if (hideBoxesEnabled()) {
+    if (hideBoxesEnabled() || detectBoxDrawDisabled()) {
         return true;  // 隐藏所有框：不画也不触发 BGR 回退
     }
     return renderOverlayPrimsNv12(frame, buildDetectionOverlayPrims(results, frame.width, frame.height));
@@ -2150,14 +2161,9 @@ std::vector<DepthDistanceTarget> drawDepthDistanceOverlayBGR(
     return near_targets;
 }
 
-// Detect3D 线框投影的 P2 矩阵（启动时 set_detect3d_p2 一次性设置，绘制线程只读）
+// 3D 线框投影的 P2 矩阵（启动时 set_detect3d_p2 一次性设置，绘制线程只读）
 static float g_detect3d_p2[12] = {0};
 static bool g_detect3d_p2_valid = false;
-static float g_detect3d_depth_scale = 1.0f;  // 模型深度全局缩放（场景尺度校准）
-
-void set_detect3d_depth_scale(float scale) {
-    g_detect3d_depth_scale = scale > 0.0f ? scale : 1.0f;
-}
 
 void set_detect3d_p2(const std::string& p2_spec) {
     g_detect3d_p2_valid = false;
@@ -2217,63 +2223,39 @@ void drawDetect3DWireframe(cv::Mat& frame, const float corners[8][2]) {
 
 }  // namespace
 
-void drawDetect3DResultsBGR(cv::Mat& frame, const Detect3DTaskResult& results) {
-    static const bool dbg = []() {
-        const char* e = getenv("RK_PIPE_DEBUG_D3D");
-        return e && *e && strcmp(e, "0") != 0;
-    }();
-    if (dbg) {
-        std::printf("[d3d-draw] items=%zu frame=%dx%d\n", results.items.size(), frame.cols, frame.rows);
-        for (const auto& it : results.items) {
-            std::printf("[d3d-draw]   cls=%d conf=%.3f box=(%d,%d,%d,%d) d=%.1fm hwl=(%.2f,%.2f,%.2f)\n",
-                        it.cls_id, (double)it.conf, it.box.left, it.box.top, it.box.right, it.box.bottom,
-                        (double)it.depth_m, (double)it.h3, (double)it.w3, (double)it.l3);
-        }
-    }
-    if (frame.empty() || results.items.empty() || hideBoxesEnabled()) {
+// D3 3D 线框（路线 B）：detect 框 + aux depth 接地深度 + P2 几何反推（见 detect3d_from_depth.h）
+void drawDetect3DWireframeOverlayBGR(cv::Mat& frame, const cv::Mat& depth, const cv::Rect* roi,
+                                     float depth_lo, float depth_hi,
+                                     const object_detect_result_list& dets,
+                                     float scale, float alpha_deg, float ground_band,
+                                     float min_depth_m) {
+    if (frame.empty() || depth.empty() || !roi || roi->width <= 0 || roi->height <= 0 ||
+        depth_hi <= depth_lo || dets.count <= 0 || !g_detect3d_p2_valid) {
         return;
     }
-    const int thickness = std::max(1, std::min(frame.cols, frame.rows) / 400);
-    const double text_scale = std::max(0.4, std::min(frame.cols, frame.rows) / 1000.0);
-    const int text_thickness = std::max(1, thickness);
-    for (const auto& it : results.items) {
-        if (it.conf < DISPLAY_THRESH) {
+    for (int i = 0; i < dets.count; ++i) {
+        const object_detect_result& d = dets.results[i];
+        if (d.box.right <= d.box.left || d.box.bottom <= d.box.top) {
             continue;
         }
-        const int x1 = std::max(0, std::min(static_cast<int>(it.box.left), frame.cols - 1));
-        const int y1 = std::max(0, std::min(static_cast<int>(it.box.top), frame.rows - 1));
-        const int x2 = std::max(0, std::min(static_cast<int>(it.box.right), frame.cols - 1));
-        const int y2 = std::max(0, std::min(static_cast<int>(it.box.bottom), frame.rows - 1));
-        if (x2 <= x1 || y2 <= y1) {
+        // 接地带深度中值 → 米（框底 ≈ 车轮接地，侧视最可靠）
+        float ground_z = 0.0f;
+        if (!boxGroundDepthMeters(depth, *roi, d.box, depth_lo, depth_hi, scale,
+                                  ground_band, &ground_z)) {
             continue;
         }
-        const cv::Scalar color = getSegColor(it.cls_id);
-        cv::rectangle(frame, cv::Rect(x1, y1, x2 - x1, y2 - y1), color, thickness);
-
-        // 标签：类别+置信度。模型输出的深度/尺寸在未标定相机上为场景级粗估，默认不显示；
-        // 需要时打开 RK_PIPE_DEBUG_D3D 或配置 detect3d_p2（线框）查看
-        const std::string label = std::string(coco_cls_to_name(it.cls_id)) + " " +
-                                  std::to_string(static_cast<int>(it.conf * 100)) + "%";
-
-        int baseline = 0;
-        const cv::Size s1 = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, text_scale, text_thickness, &baseline);
-        const int label_w = s1.width + 8;
-        const int label_h = s1.height + 8;
-        const int lx = std::max(0, std::min(x1, frame.cols - label_w - 1));
-        const int ly = std::max(label_h + 2, y1);
-        cv::rectangle(frame, cv::Rect(lx, ly - label_h, label_w, label_h), cv::Scalar(0, 0, 0), cv::FILLED);
-        cv::putText(frame, label, cv::Point(lx + 4, ly - 4),
-                    cv::FONT_HERSHEY_SIMPLEX, text_scale, color, text_thickness, cv::LINE_AA);
-
-        // 3D 线框投影（仅在显式配置 detect3d_p2，即相机已标定时绘制）。
-        // 深度乘 detect3d_depth_scale 做场景尺度校准（单目模型在非训练场景上深度常有整体偏差）
-        if (g_detect3d_p2_valid) {
-            Detect3DItem it_scaled = it;
-            it_scaled.depth_m *= g_detect3d_depth_scale;
-            float corners[8][2];
-            if (computeDetect3DCorners2D(it_scaled, g_detect3d_p2, corners)) {
-                drawDetect3DWireframe(frame, corners);
-            }
+        // 近距离门限：单目 + 单个 2D 框无法约束 3D 长方体沿车长的延伸，
+        // 近距车（< min_depth_m）画线框必然溢出画面，只保留 2D 框/距离文字。
+        if (min_depth_m > 0.0f && ground_z < min_depth_m) {
+            continue;
+        }
+        Detect3DItem item;
+        if (!buildDetect3DItemFromDepth(d.box, ground_z, g_detect3d_p2, alpha_deg, &item)) {
+            continue;
+        }
+        float corners[8][2];
+        if (computeDetect3DCorners2D(item, g_detect3d_p2, corners)) {
+            drawDetect3DWireframe(frame, corners);
         }
     }
 }
@@ -2390,7 +2372,7 @@ void drawSemResultsBGR(cv::Mat& frame, const cv::Mat& class_map, int class_num, 
 }
 
 void drawDetectionResultsBGR(cv::Mat& frame, const object_detect_result_list& results) {
-    if (frame.empty() || hideBoxesEnabled()) {
+    if (frame.empty() || hideBoxesEnabled() || detectBoxDrawDisabled()) {
         return;
     }
     renderOverlayPrimsBgr(frame, buildDetectionOverlayPrims(results, frame.cols, frame.rows));

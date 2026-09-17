@@ -108,10 +108,6 @@ int post_process_yolov26_seg(rknn_app_context_t *app_ctx, void *outputs, letterb
 int post_process_yolov26_depth(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, cv::Mat* depth_out, float* depth_lo = nullptr, float* depth_hi = nullptr);
 // YOLO26 sem（语义分割）：单输出 [1,C,H,W]，逐像素 argmax 得 CV_8UC1 类别索引图（0..C-1）
 int post_process_yolov26_sem(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, cv::Mat* class_map_out);
-// YOLO26 Detect3D（单目 3D）：单输出 [1,300,14] 已解码免 NMS，
-// 行布局见 detect3d_decode.h；坐标经 letterbox 逆映射回原帧，conf 阈值过滤
-struct Detect3DTaskResult;  // 定义在 core/task_result.h（此处仅指针形参，前向声明避免循环包含）
-int post_process_yolov26_detect3d(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, Detect3DTaskResult *d3_results);
 int post_process_pose(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, pose_detect_result_list *pd_results);
 // RTMPose SimCC 解码：simcc_x/simcc_y logits → argmax/split_ratio → 逆仿射映射回原图。
 // results 为 rtmpose_decode_job_t*（定义在 model/rtmpose.h，经 run_rknn_inference 透传）

@@ -29,7 +29,6 @@ class AppConfig {
     // 注意：AppConfig 与闭源核心按成员布局直接耦合（核心按构建期 sizeof 分配并直接访问
     // 成员），公开仓库不得增删字段——新增配置键必须随配套核心库 Release 协同发布。
     // 逐帧结果 JSONL 的过滤配置走环境变量 RK_PIPE_RESULT_JSONL（见 io/result_sink.h）。
-
 public:
     std::string model_path;
     std::string input_path;
@@ -175,11 +174,33 @@ public:
     bool depth_dist_text = false;
     float depth_dist_near_m = 0.0f;  // 近距阈值（米），0=关闭
     float depth_dist_scale = 1.0f;
-    // Detect3D 线框投影的 P2 矩阵（3x4 行主序 12 值，逗号分隔，如 KITTI cam2 标定）。
+    // depth 辅助结果伪彩叠加开关（默认开）。只想要检测框/距离/3D 线框的干净输出时关掉
+    bool depth_pseudo = true;
+    // 2D 检测框/标签绘制开关（默认开）。关掉后只画 3D 线框等其余叠加，画面更干净
+    bool detect_box_draw = true;
+    // 3D 线框投影的 P2 矩阵（3x4 行主序 12 值，逗号分隔，如 KITTI cam2 标定）。
     // 空 = 不绘制 3D 线框；内参需与实际相机一致，否则线框仅示意
     std::string detect3d_p2;
-    // Detect3D 深度全局缩放（场景尺度校准：线框/距离整体偏大调大此值，默认 1.0）
-    float detect3d_depth_scale = 1.0f;
+    // D3 3D 线框（路线 B，aux_task=depth 时生效）：2D 框 + depth 模型接地深度 + detect3d_p2
+    // 几何反推 3D 包围盒（深度来自 aux depth 模型而非 3D 头回归，跨场景泛化好）。
+    // 需同时配置 detect3d_p2 才会绘制。
+    bool detect3d_wireframe = false;
+    // 车辆相对朝向先验（度）：0=侧视（路侧车沿路停放/行驶，像素宽≈车长）；
+    // 90=正视车头/车尾（像素宽≈车宽，长退化为先验比）
+    float detect3d_alpha_deg = 0.0f;
+    // 接地采样带高度占框高比例（0<band<1，默认 0.3 = 框底部 30%）
+    float detect3d_ground_band = 0.3f;
+    // 3D 线框最小绘制距离（米，默认 8.0；<=0 表示不限）。
+    // ★为什么需要：单目 + 单个 2D 框**无法约束 3D 长方体沿车长方向的延伸**。
+    //  一辆 4.5m 车长在 2~3m 距离下，其长方体投影必然横向摊开远超 2D 框（实测溢出画面，
+    //  线框宽可达画面宽的 3 倍），这不是参数问题而是信息量极限。
+    //  板端实测（baseline17_mid30s，901 帧，3355 个 car 框）「线框宽/2D框宽」比值：
+    //    Z 0-5m   → 1.38（33% 溢出画面）
+    //    Z 5-8m   → 1.37（ 2% 溢出）
+    //    Z 8-12m  → 1.08（ 0% 溢出）  ← 8m 起线框与 2D 框基本吻合
+    //    Z 12-18m → 1.04（ 0% 溢出）
+    //  故默认 8.0：保留约 50% 的车辆线框，溢出率降为 0。近距车只画 2D 框+距离文字。
+    float detect3d_min_depth_m = 8.0f;
 
     // 事件规则引擎（detect+tracking，D1/D2）：绊线穿越/区域入侵/滞留/离岗。
     // 规则命中产生 rule_events 告警（走 alert_* 链路）；enable_tracking 未开时自动为 detect 开启

@@ -8,7 +8,6 @@
 #include <opencv2/core.hpp>
 
 #include "postprocess/postprocess.h"
-#include "postprocess/detect3d_decode.h"
 
 struct DetectTaskResult {
     object_detect_result_list data = {};
@@ -69,11 +68,6 @@ struct OCRTaskResult {
     std::vector<OCRTextLine> lines;
 };
 
-// 单目 3D 检测（YOLO26-Detect3D）：每目标 2D 框 + 8 个三维量（Detect3DItem 见 detect3d_decode.h）
-struct Detect3DTaskResult {
-    std::vector<Detect3DItem> items;
-};
-
 // M8 人脸检测（RetinaFace）：人脸框 + 5 点 landmark（模型坐标系，绘制侧已逆映射到原图）
 struct FaceItem {
     image_rect_t box{};
@@ -117,7 +111,6 @@ using TaskResult = std::variant<std::monostate,
                                 SemTaskResult,
                                 OCRDetectTaskResult,
                                 OCRTaskResult,
-                                Detect3DTaskResult,
                                 CompositeClsTaskResult,
                                 FaceTaskResult,
                                 ActionTaskResult>;
@@ -137,10 +130,6 @@ inline const object_detect_result_list* getDetectResultList(const TaskResult& re
 
 inline const SemTaskResult* getSemTaskResult(const TaskResult& result) {
     return std::get_if<SemTaskResult>(&result);
-}
-
-inline const Detect3DTaskResult* getDetect3DTaskResult(const TaskResult& result) {
-    return std::get_if<Detect3DTaskResult>(&result);
 }
 
 // pose 主结果双类型访问：动作级联激活时为 ActionTaskResult（内嵌 pose 数据，M0 惯例），

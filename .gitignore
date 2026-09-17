@@ -56,3 +56,6 @@ daemon_smoke.log
 # 内网板卡清单与内部设计文档不入开源仓
 tools/eval/boards.yaml
 tools/eval/远程评测与数据集框架设计.md
+
+# 线框诊断用证据数据（dump + 截图，体积大且非源码）
+tools/evidence/
