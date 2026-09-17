@@ -1,64 +1,98 @@
 # rkpipe — RK3588 边缘端多任务视觉流水线
 
-rkpipe 是一套面向 Rockchip RK3588 的实时视频理解流水线:多路视频输入 → RGA 零拷贝预处理 → NPU 推理 → 后处理/跟踪 → Web 预览 / 推流 / 结构化事件输出。单进程内支持检测、姿态、OBB、实例分割、深度估计等任务。
+rkpipe 是一套面向 Rockchip RK3588 的实时视频理解流水线：多路视频输入 → RGA 零拷贝预处理 → NPU 推理 → 后处理/跟踪 → Web 预览 / 推流 / 结构化事件输出。单进程内支持检测、姿态、OBB、实例/语义分割、深度估计、OCR、人脸与多阶级联任务，并提供常驻守护进程与多路任务控制台。
 
-仓库包含功能模块源码、稳定 C ABI 契约头与评测工具。**流水线调度核心**(线程编排、任务队列、内存池、零拷贝推理引擎等)以预编译静态库 `librkpipe_core.a` 随 Release 分发。
+仓库包含功能模块源码、稳定 C ABI 契约头、板端模型与评测工具。**流水线调度核心**（线程编排、任务队列、内存池、零拷贝推理引擎等）以预编译静态库 `prebuilt/aarch64/librkpipe_core.a` 随仓库直接分发，与契约头同版本成对发布，许可见 [LEGAL/RKPIPE-CORE-EULA.md](LEGAL/RKPIPE-CORE-EULA.md)；同目录 `sha256sums.txt` 可校验一致性。
 
 ## 任务能力
+
+主任务一次跑一个（`--task` / YAML `task`），可选挂一路辅助任务（`aux_task`）；二级能力由专用配置键驱动。
 
 | task | 说明 |
 |---|---|
 | `detect` | YOLO26 / YOLOv8 / YOLOv5 目标检测 |
-| `pose` | YOLOv8-Pose / YOLO26-Pose 人体关键点检测(多人建议开启 tracking 锁定每人颜色) |
+| `pose` | YOLOv8-Pose / YOLO26-Pose 人体关键点检测（多人建议开启 tracking 锁定每人颜色） |
 | `obb` | 旋转框检测 |
 | `seg` | 实例分割 |
+| `sem` | 语义分割（`model/yolo26n_sem.rknn`；19 类 label 需按数据集自备） |
 | `depth` | 单目深度估计 |
+| `ocr_det` | PPOCRv4 文本检测（别名 `text_det`） |
+| `rtmpose` | 两阶段姿态：一级人体检测 → 框 crop → RTMPose 回归（17 关键点 + 姿态时序缓冲） |
+| `composite_cls` | 两阶段级联：一级检测框 crop → 二级分类（MobileNetV2 top-1，别名 `detect_cls`） |
+| `retinaface` | 人脸检测 + 5 点 landmark（别名 `face`） |
+
+| 二级 / 组合能力 | 配置键 | 说明 |
+|---|---|---|
+| 文本识别 | `ocr_rec_model_path` | PPOCRv4 识别，接在 `ocr_det` 之后（CTC 解码，字典 `model/ppocr_keys_v1.txt`） |
+| 动作识别 | `action_model_path` | 姿态时序动作识别，接在 `pose` 之后（`action_window_t` / `action_interval` / `action_norm`） |
+| 同路组合（Y5） | `aux_model_path` / `aux_task` | 主任务 + `depth` / `pose` / `seg` / `sem` / `ocr_det` 辅助叠加 |
+| 3D 线框（D3） | `detect3d_wireframe` | `detect` + `aux_task: depth` 时启用：框底接地带深度中值 → 几何反推 → 8 角点投影画 12 条棱；近距门限 `detect3d_min_depth_m`（默认 8.0） |
+
+> 0.3.1 起旧的 `detect3d` 任务（KITTI 单目 3D 头）已整体下线，3D 线框改由上面的 `detect` + `aux_task: depth` 组合提供。
 
 ## 仓库结构
 
 ```
 ├── include/rkpipe/          契约层:稳定 C ABI(rkpipe.h)+ 跨层共享数据结构
-├── include/core/            契约头子集(帧数据/任务结果/RKNN 上下文/事件规则…)
-├── include/{io,model,postprocess,detection,config,utils}/
-├── src/                     模块层实现(与头文件一一对应)
+├── include/{core,io,model,postprocess,detection,config,daemon,llm,utils}/
+├── src/                     模块层实现(与头文件一一对应;daemon/ 常驻守护、llm/ 事件复检)
 ├── apps/console_detector/   板端控制台应用:仅用 C ABI 驱动完整流水线(兼作 ABI 验收)
-├── examples/configs/        示例配置
-├── prebuilt/<arch>/         预编译核心库(从 Releases 下载放入)
-├── 3rdparty/rknn/           RKNN SDK 头与运行库(遵循 Rockchip 许可)
+├── examples/configs/        示例配置(最小可跑:detect/pose/obb/seg/depth,开箱即用)
+├── configs/
+│   ├── smoke/               各任务板端冒烟配置(rtmpose/ocr/composite_cls/detect+depth)
+│   ├── streams/             daemon / 多路编排的 streams.json 样例
+│   ├── run_yolo26_detect_depth3d.yaml   D3 3D 线框示例
+│   └── llm.yaml.sample      LLM 复检配置样例(api_key 走环境变量)
+├── prebuilt/aarch64/        预编译核心库 librkpipe_core.a + sha256sums.txt(随仓库分发)
+├── model/                   板端 rknn 模型与 label(来源与许可见 NOTICE)
+├── assets/labels/           评测/示例用 label
+├── 3rdparty/                第三方头与库(rknn、curl;遵循各自许可)
 ├── tools/
-│   ├── eval/                板端精度评测(rknn_eval)
-│   └── convert/             ONNX→RKNN 模型转换辅助脚本
-└── scripts/multistream.py   多路部署编排器(一路一进程,NPU core 轮转/看护重启)
+│   ├── eval/                板端精度评测(rknn_eval + 网页评测控制台)
+│   ├── convert/             ONNX→RKNN 转换与量化脚本(split6/split10/fp16/hybrid)
+│   ├── conversion/          OCR 识别头转换脚本
+│   └── diagnose_detect3d.js D3 线框质量诊断(框稳定性/几何自洽性/溢出 vs 距离)
+├── tests/test_unit.cpp      单元测试(无硬件依赖;CI 模式剔除硬件用例)
+├── docs/                    架构/构建/运行/评测/事件载荷/任务演示文档
+├── scripts/multistream.py   多路部署编排器(一路一进程,NPU core 轮转/看护重启)
+└── .github/workflows/ci.yml CI:纯逻辑单测(gcc + clang)+ 完整构建(缺库报错路径)
 ```
 
 ## 快速开始
 
-### 1. 获取预编译核心库
+### 1. 预编译核心库
 
-从本仓库 **Releases** 页下载对应版本的 `librkpipe_core.a`(目前提供 aarch64/RK3588),放入:
+核心库随仓库分发，clone 后无需额外下载，开箱即可构建：
 
+```bash
+cd prebuilt/aarch64 && sha256sum -c sha256sums.txt && cd ../..
 ```
-prebuilt/aarch64/librkpipe_core.a
-```
 
-下载后建议校验一致性:`sha256sum -c prebuilt/aarch64/sha256sums.txt`。
-
-### 2. 安装依赖(板端 RK3588,Debian/Ubuntu)
+### 2. 安装依赖（板端 RK3588，Debian/Ubuntu）
 
 ```bash
 sudo apt install cmake g++ python3 ffmpeg \
-    libopencv-dev libturbojpeg0-dev \
+    libopencv-dev libturbojpeg0-dev libcurl4-openssl-dev \
     libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
 ```
 
-RGA 与 rockchip-mpp 多数板厂镜像已自带,缺失时安装 `librga-dev`、`librockchip-mpp-dev`。自编 OpenCV 用 `cmake -B build -DOPENCV_ROOT=<prefix>`(或同名环境变量)替代系统包。完整环境说明见 [docs/build.md](docs/build.md)。
+RGA 与 rockchip-mpp 多数板厂镜像已自带，缺失时安装 `librga-dev`、`librockchip-mpp-dev`。自编 OpenCV 用 `cmake -B build -DOPENCV_ROOT=<prefix>`（或同名环境变量）替代系统包。完整环境说明见 [docs/build.md](docs/build.md)。
 
 ### 3. 构建
 
 ```bash
 cmake -B build && cmake --build build -j $(nproc)
 
-# 无硬件环境:纯逻辑单元测试(配置解析/事件规则/ROI 过滤/后处理)
+# 逐个目标构建（按需）
+cmake --build build --target console_detector     # 板端控制台应用
+cmake --build build --target rk_pipe_daemon       # 常驻守护 + 多路控制台
+cmake --build build --target rknn_eval            # 精度/性能评测
+cmake --build build --target rk_pipe_unit_tests   # 单元测试
+```
+
+无硬件环境（PC / CI）跑纯逻辑单测：
+
+```bash
 cmake -B build-ci -DRK_PIPE_CI_BUILD=ON && cmake --build build-ci && ctest --test-dir build-ci
 ```
 
@@ -93,9 +127,26 @@ ffmpeg -y -f lavfi -i testsrc2=duration=60:size=1280x720:rate=30 video/demo.mp4
 # 示例配置默认开启 Web 预览:浏览器打开 http://<板子IP>:8080 查看实时画面
 ```
 
-从构建到多路部署的逐项验收清单(全部命令已在 RK3588 板端实测)见 [docs/run_guide.md](docs/run_guide.md)。
+从构建到多路部署的逐项验收清单（全部命令已在 RK3588 板端实测）见 [docs/run_guide.md](docs/run_guide.md)。
 
-多路部署(一路一进程)用编排器统一管理 NPU core 分配、崩溃重启与优雅停止(每路一个 YAML,以 `examples/configs/` 为模板改输入源):
+### 6. 常驻守护与多路控制台（rk_pipe_daemon）
+
+`rk_pipe_daemon` 是本仓推荐的部署形态：fork 监督 N 个 `console_detector` 子进程，自带 REST API 与网页控制台。
+
+```bash
+./build/rk_pipe_daemon --streams-file configs/streams/daemon.sample.json \
+  --api-port 8099 --watch 2 --restart
+# 浏览器打开 http://<板子IP>:8099/ 进入任务控制台
+```
+
+- **监督与恢复**：子进程崩溃按指数退避（2s→60s，10 分钟窗口最多 5 次）自动拉起；`--watch <s>` 轮询配置热切换
+- **控制台页**：任务卡片 + 各路内嵌 MJPEG 预览 + 板载负载（CPU/内存/温度/NPU 三核）+ 网页端新增/修改/重启/停止任务（表单 `extra_yaml` 可透传 rtmpose 两阶段等二级字段）
+- **REST API**：`/api/health`、`/api/tasks`、`/api/summary`（聚合板载负载 + 全部任务）、`/api/tasks/<id>/{log,restart,status.json}`、`/api/reload`、`/api/events`(+SSE)、`/metrics`（Prometheus）、`/timeline`（事件时间线页）
+- **事件闭环 + LLM 复检**：子进程 `alert_webhook_url` 指向 `http://127.0.0.1:<api-port>/internal/event` 即接入 → 事件 JSONL 落盘 → 可选 VLM 复检（OpenAI 兼容，`RK_PIPE_LLM_BASE_URL`/`RK_PIPE_LLM_MODEL`/`RK_PIPE_LLM_API_KEY` 走环境变量）→ `--forward-url` 转发业务 webhook
+- **事件规则**：绊线穿越/入侵/滞留/离岗/聚集/遗留/跌倒，扁平 `event_*` 键或命名多规则 `event_rules` 列表
+- **动态任务持久化**：REST 创建/修改的任务写入 `<仓库根>/daemon_runs/dynamic_tasks.json`，daemon 重启自动恢复（`--dump-dir` 或 `RK_PIPE_DUMP_DIR` 可改运行目录）
+
+只要多路预览、不需要控制台时，也可用轻量编排器（一路一进程、NPU core 轮转）：
 
 ```bash
 python3 scripts/multistream.py run --config cam_a.yaml cam_b.yaml cam_c.yaml --cores auto
@@ -231,7 +282,7 @@ seg 为 split10（box/cls/mask 拆分 + proto）、pose 为融合布局**。旧 
 > 精度用 `rknn_eval` 全量评测（COCOeval / DOTA 旋转 IoU 标准口径，conf=0.001）。
 > FPS 为 9 线程 pipeline 全量推理速度（非单帧推理耗时）。
 > obb 精度在 DOTA v1.0 val（458 图 → 1024/200 切片 5297 张）上评测；obb/seg 的 640 固定输入
-> 与官方模型页的 1024 原生输入口径不同，绝对值不可直接对标，家族内横向比较有效。
+> 与官方模型页的 1024 原生输入口径不同，绝对值不可直接对标，家族内横向对比有效。
 
 ## C ABI 用法(配置即契约)
 
@@ -249,9 +300,18 @@ rkpipe_destroy(h);
 
 **逐帧结构化结果**:设置环境变量 `RK_PIPE_RESULT_JSONL=<文件路径>` 后,流水线每帧输出一行 schema v1 JSON(字段定义见 [docs/event_payload.md](docs/event_payload.md))。该格式与 `RK_PIPE_EVENT_RESULT` 事件 payload 完全一致;当前核心库即可用文件汇通道(仅 pipeline 模式),事件本身的下发与 YAML 配置键需配套核心库 Release。
 
+## 持续集成
+
+`.github/workflows/ci.yml` 在通用 ubuntu 上跑两个 job（矩阵展开为 gcc / clang / full-build 三项检查），全部不需要 RKNN/RGA/MPP 硬件：
+
+- **unit-tests（gcc 与 clang 两档）**：`-DRK_PIPE_CI_BUILD=ON` 编译配置解析、事件规则、ROI 过滤、后处理纯函数、JSONL 序列化等无硬件依赖的源集并执行 `ctest`
+- **full-build**：不带预编译核心库配置时必须给出明确错误（`预编译核心库不存在`）而非静默失败
+
+板端全量单测（含硬件用例）在板上 `cmake --build build --target rk_pipe_unit_tests && ./build/rk_pipe_unit_tests` 运行。
+
 ## 许可
 
-各部分许可不同,见 [LICENSE](LICENSE)(源码,Apache-2.0)与 [NOTICE](NOTICE)(第三方组件)。
+各部分许可不同，见 [LICENSE](LICENSE)（源码，Apache-2.0）、[NOTICE](NOTICE)（第三方组件与随仓库分发的模型权重）与 [LEGAL/RKPIPE-CORE-EULA.md](LEGAL/RKPIPE-CORE-EULA.md)（`prebuilt/` 下的预编译核心库属专有软件，不在 Apache-2.0 授权范围内）。
 
 ## 给贡献者
 
@@ -263,6 +323,11 @@ rkpipe_destroy(h);
 - [docs/run_guide.md](docs/run_guide.md) — 运行指南:从构建到多路的逐项验收清单
 - [docs/architecture.md](docs/architecture.md) — 数据流与模块职责(行为级描述)
 - [docs/event_payload.md](docs/event_payload.md) — 逐帧结构化结果 JSONL / RESULT 事件 payload 的 schema
+- [docs/demo_detect3d.md](docs/demo_detect3d.md) — D3 3D 线框实现与 P2 标定
+- [docs/demo_d3_depth_distance.md](docs/demo_d3_depth_distance.md) — 深度与距离文字(3D 线框前置步骤)
+- [docs/depth_accuracy.md](docs/depth_accuracy.md) — 深度/距离精度评估与已排除方案
+- [docs/demo_m0_composite.md](docs/demo_m0_composite.md) — 检测 + 二级分类级联
+- [docs/demo_m6_ocr.md](docs/demo_m6_ocr.md) — OCR 检测 + 识别全链路
 - [tools/eval/README.md](tools/eval/README.md) — rknn_eval 评测:四任务标准命令、数据准备、进阶选项
 - [docs/benchmark_dota_obb.md](docs/benchmark_dota_obb.md) — OBB 评测指南(DOTA v1.0:切片/命令行/网页控制台/口径)
 - [docs/faq.md](docs/faq.md) — 常见问题(ABI 兼容、许可)
